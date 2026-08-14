@@ -22,7 +22,6 @@ import { install as installInvariant } from '../src/invariant.ts'
 import {
   acknowledgeRestartRecord, pendingRestartRecord, restartContextText,
 } from '../src/restart-context.ts'
-import { appendFeedback, readFeedback, MAX_FEEDBACK_ENTRIES } from '../src/feedback.ts'
 import { runCli, type CliIo } from '../src/cli.ts'
 import {
   clearCredential, emptyState, loadState, recordCredential, setCheckpoint,
@@ -916,43 +915,6 @@ describe('restart context injection', () => {
   it('renders a failure and stays silent for an empty record', () => {
     expect(restartContextText({ error: 'no listener' }, false)).toContain('失败')
     expect(restartContextText({}, false)).toBe('')
-  })
-})
-
-describe('feedback board', () => {
-  it('appends structured entries and reads them back newest-last', () => {
-    const dir = join(tmpDir('guard-fb-'), 'state')
-    appendFeedback(dir, { ts: 1, command: 'dsh-ankh-guard feedback "x"', description: 'first' })
-    appendFeedback(dir, { ts: 2, command: 'verify', description: 'second', revision: 'abc' })
-    const entries = readFeedback(dir)
-    expect(entries).toHaveLength(2)
-    expect(entries[1]?.description).toBe('second')
-    expect(entries[1]?.revision).toBe('abc')
-    // The file lives in the runtime area (home/feedback), never the repo.
-    expect(existsSync(join(dirname(dir), 'feedback', 'dsh-self-restart-guard.jsonl'))).toBe(true)
-  })
-
-  it('rolls older entries off the cap, keeping the newest', () => {
-    const dir = join(tmpDir('guard-fb-'), 'state')
-    for (let i = 0; i < MAX_FEEDBACK_ENTRIES + 10; i++) {
-      appendFeedback(dir, { ts: i, command: 'c', description: `entry ${i}` })
-    }
-    const entries = readFeedback(dir, 500)
-    expect(entries).toHaveLength(MAX_FEEDBACK_ENTRIES)
-    expect(entries[0]?.description).toBe('entry 10')
-    expect(entries[MAX_FEEDBACK_ENTRIES - 1]?.description).toBe(`entry ${MAX_FEEDBACK_ENTRIES + 9}`)
-  })
-
-  it('CLI feedback appends and lists', async () => {
-    const dir = join(tmpDir('guard-fb-'), 'state')
-    const out = cliIo()
-    expect(await runCli(['feedback', 'canary 误判', '--state-dir', dir], out.io)).toBe(0)
-    expect(out.out.join('')).toContain('feedback recorded')
-    const list = cliIo()
-    expect(await runCli(['feedback', 'list', '--state-dir', dir], list.io)).toBe(0)
-    expect(list.out.join('')).toContain('canary 误判')
-    const usage = cliIo()
-    expect(await runCli(['feedback', '--state-dir', dir], usage.io)).toBe(2)
   })
 })
 

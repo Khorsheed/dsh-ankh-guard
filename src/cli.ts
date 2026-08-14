@@ -25,7 +25,6 @@ import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resolveRepoDir, resolveStateDir } from './defaults.ts'
 import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
-import { appendFeedback, readFeedback } from './feedback.ts'
 import {
   clearCredential, loadState, recordCredential, setCheckpoint, verifyCredential,
 } from './state.ts'
@@ -67,7 +66,6 @@ commands:
           [--state-dir DIR] [--repo DIR] [--max-age MIN]
   schedule-exit --port N --delay-ms MS [--initiator ID] [--log FILE] [--state-dir DIR] [--repo DIR]
   supervise --port N --start "CMD" [--foreground] [--log FILE] [--state-dir DIR] [--repo DIR]
-  feedback "<问题描述>" | feedback list [N] [--state-dir DIR]
 flags:
   --state-dir DIR  state directory (default: $DSH_HOME/state, else <cwd>/.dsh-guard-state)
   --repo DIR       repository the credential binds to (default: cwd)
@@ -522,28 +520,6 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       })
       child.unref()
       io.stdout(`exit scheduled in ${delayMs} ms (agent pid ${child.pid ?? 'unknown'}) — watchdog will respawn and run the canary\n`)
-      return 0
-    }
-    case 'feedback': {
-      const sub = positionals[0]
-      if (sub === 'list') {
-        const n = positionals[1] !== undefined ? Number(positionals[1]) : 50
-        const entries = readFeedback(stateDir, Number.isInteger(n) && n > 0 ? n : 50)
-        io.stdout(`${entries.length > 0 ? entries.map(e => JSON.stringify(e)).join('\n') : 'no feedback recorded'}\n`)
-        return 0
-      }
-      if (sub === undefined || sub === '') {
-        io.stderr(`feedback requires a description: feedback "<问题描述>"\n\n${USAGE}`)
-        return 2
-      }
-      const head = currentHead(repoDir)
-      const result = appendFeedback(stateDir, {
-        ts: Date.now(),
-        command: `dsh-ankh-guard feedback ${JSON.stringify(sub)}`,
-        description: sub,
-        ...(head !== null ? { revision: head } : {}),
-      })
-      io.stdout(result.rolled ? 'feedback recorded (rolled to newest 200)\n' : 'feedback recorded\n')
       return 0
     }
     default:
