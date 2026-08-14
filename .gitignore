@@ -2,3 +2,8 @@ node_modules/
 lib/
 *.tsbuildinfo
 *.tgz
+coverage/
+.env
+.DS_Store
+.playwright-mcp/
+*.log
