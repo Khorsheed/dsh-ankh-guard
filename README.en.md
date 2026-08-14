@@ -1,10 +1,20 @@
-# @khorsheed/dsh-ankh-guard
+# @deepseek-ai/dsh-ankh-guard
 
-English | [中文](README.md)
+English | [中文](README.zh.md)
 
-Hard gate for self-modification restarts. A self-modifying agent changes this repository and then restarts the running instance — if the change is broken, the restart takes the instance (and the conversation) down. This plugin makes the restart conditional on proof: a **green-build credential** recorded only after the full build and targeted tests pass, bound to the git HEAD it was produced on and to a freshness window.
+**The plugin that stops an agent from breaking its own deployment.** When a self-modifying agent changes code and wants to restart the running service, this plugin checks first: did the change pass the full build and tests? If not, the restart is refused — so broken code can never take the whole service (and the conversation) down.
 
-The credential is the gate's source of truth: `verify()` is denied when there is no credential, when it is older than `maxAgeMinutes`, or — the load-bearing part — when the current HEAD differs from the revision the credential was recorded on. Any tree change after recording invalidates it, so a post-hoc or stale credential can never authorize a restart of unverified code. That single rule catches the whole failure class seen in the 2026-08-14 file-preview incident (wrong import style, missing tsconfig registrations, missing `./typert` export): every one of those errors fails the build/typecheck, so no credential is recorded and the restart is refused before it can hurt.
+That's the whole idea: **prove the code is good before you allow a restart.** The mechanism is explained in the next section, "How it works".
+
+## How it works
+
+The **green-build credential** is the gate's only source of truth: it is recorded only after the full build and targeted tests pass, bound to the git HEAD that produced it, with a freshness window (`maxAgeMinutes`). `verify()` denies in any of these cases:
+
+- no credential;
+- the credential is older than `maxAgeMinutes`;
+- the current HEAD differs from the revision the credential was recorded on — any tree change after recording invalidates it.
+
+That single rule catches the whole failure class seen in the 2026-08-14 file-preview incident (wrong import style, missing tsconfig registrations, missing `./typert` export): every one of those errors fails the build/typecheck, so no credential is recorded and the restart is refused before it can hurt.
 
 Beyond the gate it provides the P2 safety net: `checkpoint` commits the whole working tree as a rollback point before a batch, `reset` hard-resets to it, and `canary` re-verifies after a restart (credential freshness + optional TCP port liveness). Checkpoints and credentials persist in a state file that survives restarts, so the canary runs after the new instance is up.
 
