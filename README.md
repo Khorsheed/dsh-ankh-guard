@@ -1,4 +1,4 @@
-# @deepseek-ai/dsh-ankh-guard
+# @khorsheed/dsh-ankh-guard
 
 [English](README.en.md) | 中文
 
@@ -14,15 +14,15 @@
 
 ```sh
 npm install @deepseek-ai/dsh            # the host (dsh web / dsh CLI)
-npm install @deepseek-ai/dsh-ankh-guard # this plugin
+npm install @khorsheed/dsh-ankh-guard # this plugin
 ```
 
 然后启动宿主：`npx @deepseek-ai/dsh web`。
 
-包内自带 CLI（`dsh-ankh-guard` bin）、插件（`@deepseek-ai/dsh-ankh-guard`）、watchdog 脚本与自己的 README——外部部署需要的一切都在发布物里，不在 harness 仓库里。从 npm 安装插件（peer 依赖——`@deepseek-ai/cordis`、`@deepseek-ai/dsh-invariants`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-agent`、`@deepseek-ai/schemastery`、`@deepseek-ai/dsh-session-persistence`——自动安装）：
+包内自带 CLI（`dsh-ankh-guard` bin）、插件（`@khorsheed/dsh-ankh-guard`）、watchdog 脚本与自己的 README——外部部署需要的一切都在发布物里，不在 harness 仓库里。从 npm 安装插件（peer 依赖——`@deepseek-ai/cordis`、`@deepseek-ai/dsh-invariants`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-agent`、`@deepseek-ai/schemastery`、`@deepseek-ai/dsh-session-persistence`——自动安装）：
 
 ```sh
-npm install @deepseek-ai/dsh-ankh-guard
+npm install @khorsheed/dsh-ankh-guard
 ```
 
 或从源码安装——clone 本仓库、构建并测试：
@@ -32,14 +32,14 @@ git clone https://github.com/Khorsheed/dsh-ankh-guard.git
 cd dsh-ankh-guard && pnpm install && pnpm run build && pnpm test
 ```
 
-然后在你自己的包里以依赖引用（`"@deepseek-ai/dsh-ankh-guard": "file:../dsh-ankh-guard"`），或直接从检出里跑 CLI：`node lib/cli.js <命令>`。
+然后在你自己的包里以依赖引用（`"@khorsheed/dsh-ankh-guard": "file:../dsh-ankh-guard"`），或直接从检出里跑 CLI：`node lib/cli.js <命令>`。
 
 在 `cordis.yml` 里以 cordis 插件方式加载（这就是加载步骤——没被加载的重启 guard 保护不了任何东西）：
 
 ```yaml
 plugins:
   - id: ankh-guard
-    name: '@deepseek-ai/dsh-ankh-guard'
+    name: '@khorsheed/dsh-ankh-guard'
 ```
 
 配置（全部可选）：`stateDir`（默认 `$DSH_HOME/state`，否则 `<cwd>/.dsh-guard-state`）、`repoDir`（默认进程 cwd）、`maxAgeMinutes`（凭证新鲜窗口，默认 10）、`reportRestartContext`（`followup` 自主报告 / `step` 骑下一次回合 / `off`，默认 `followup`）、`fallbackGraceMs`（非发起根 agent 在发起会话尚未恢复时等待多久才认领记录，默认 60000）。

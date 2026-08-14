@@ -1,4 +1,4 @@
-# @deepseek-ai/dsh-ankh-guard
+# @khorsheed/dsh-ankh-guard
 
 English | [中文](README.md)
 
@@ -14,15 +14,15 @@ This package is a **dsh plugin**: it guards the running dsh web instance against
 
 ```sh
 npm install @deepseek-ai/dsh            # the host (dsh web / dsh CLI)
-npm install @deepseek-ai/dsh-ankh-guard # this plugin
+npm install @khorsheed/dsh-ankh-guard # this plugin
 ```
 
 Then start the host: `npx @deepseek-ai/dsh web`.
 
-The package ships the CLI (`dsh-ankh-guard` bin), the plugin (`@deepseek-ai/dsh-ankh-guard`), the watchdog script, and its own README — everything an external deployment needs lives in the artifact, not in the harness repository. Install the plugin from npm (peer dependencies — `@deepseek-ai/cordis`, `@deepseek-ai/dsh-invariants`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/schemastery`, `@deepseek-ai/dsh-session-persistence` — install automatically):
+The package ships the CLI (`dsh-ankh-guard` bin), the plugin (`@khorsheed/dsh-ankh-guard`), the watchdog script, and its own README — everything an external deployment needs lives in the artifact, not in the harness repository. Install the plugin from npm (peer dependencies — `@deepseek-ai/cordis`, `@deepseek-ai/dsh-invariants`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/schemastery`, `@deepseek-ai/dsh-session-persistence` — install automatically):
 
 ```sh
-npm install @deepseek-ai/dsh-ankh-guard
+npm install @khorsheed/dsh-ankh-guard
 ```
 
 Or install from source — clone this repository, build, and test it:
@@ -32,14 +32,14 @@ git clone https://github.com/Khorsheed/dsh-ankh-guard.git
 cd dsh-ankh-guard && pnpm install && pnpm run build && pnpm test
 ```
 
-Then reference it as a dependency (`"@deepseek-ai/dsh-ankh-guard": "file:../dsh-ankh-guard"`) in your own package, or run the CLI directly from the checkout with `node lib/cli.js <command>`.
+Then reference it as a dependency (`"@khorsheed/dsh-ankh-guard": "file:../dsh-ankh-guard"`) in your own package, or run the CLI directly from the checkout with `node lib/cli.js <command>`.
 
 Load it as a cordis plugin in your `cordis.yml` (this is the loading step — a restart guard that is not loaded cannot protect anything):
 
 ```yaml
 plugins:
   - id: ankh-guard
-    name: '@deepseek-ai/dsh-ankh-guard'
+    name: '@khorsheed/dsh-ankh-guard'
 ```
 
 Config (all optional): `stateDir` (default `$DSH_HOME/state`, else `<cwd>/.dsh-guard-state`), `repoDir` (default the process cwd), `maxAgeMinutes` (credential freshness, default 10), `reportRestartContext` (`followup` autonomous report / `step` ride the next turn / `off`, default `followup`), `fallbackGraceMs` (how long a non-initiator root agent waits before claiming a record whose initiator session has not resumed, default 60000).

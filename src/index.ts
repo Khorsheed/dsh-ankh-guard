@@ -11,7 +11,7 @@
  * authorize a restart of unverified code. Checkpoints (P2) are plain commits
  * with a guard message; rollback is `git reset --hard` to the checkpoint.
  *
- * @module @deepseek-ai/dsh-ankh-guard
+ * @module @khorsheed/dsh-ankh-guard
  */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
