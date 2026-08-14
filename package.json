@@ -1,7 +1,7 @@
 {
   "name": "@khorsheed/dsh-ankh-guard",
   "description": "Hard gate for self-modification restarts: a green-build credential bound to the git HEAD, checked before any restart of the running instance",
-  "version": "0.1.0-rc.6",
+  "version": "0.1.0-rc.8",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Khorsheed/dsh-ankh-guard.git"
