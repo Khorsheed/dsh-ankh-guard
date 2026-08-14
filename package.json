@@ -70,5 +70,8 @@
     "build": "tsc -p tsconfig.build.json && tsdown",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.build.json --noEmit"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
