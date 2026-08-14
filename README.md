@@ -1,40 +1,40 @@
 # @deepseek-ai/dsh-ankh-guard
 
-English | [中文](README.zh.md)
+[English](README.en.md) | 中文
 
-Hard gate for self-modification restarts. A self-modifying agent changes this repository and then restarts the running instance — if the change is broken, the restart takes the instance (and the conversation) down. This plugin makes the restart conditional on proof: a **green-build credential** recorded only after the full build and targeted tests pass, bound to the git HEAD it was produced on and to a freshness window.
+自我修改重启的硬闸门。自我修改的 agent 改动本仓库后要重启运行中的实例——如果改动是坏的，重启会把实例（连同会话）一起带走。这个插件让重启以证据为条件：**绿色构建凭证**，只有在完整构建与定向测试通过后才记录，绑定到产出它的 git HEAD，并有新鲜度窗口。
 
-The credential is the gate's source of truth: `verify()` is denied when there is no credential, when it is older than `maxAgeMinutes`, or — the load-bearing part — when the current HEAD differs from the revision the credential was recorded on. Any tree change after recording invalidates it, so a post-hoc or stale credential can never authorize a restart of unverified code. That single rule catches the whole failure class seen in the 2026-08-14 file-preview incident (wrong import style, missing tsconfig registrations, missing `./typert` export): every one of those errors fails the build/typecheck, so no credential is recorded and the restart is refused before it can hurt.
+凭证是闸门的唯一事实来源：没有凭证、超过 `maxAgeMinutes`、或——最关键的一环——当前 HEAD 与记录凭证时的 revision 不一致，`verify()` 一律拒绝。记录之后的任何树改动都会令凭证失效，所以事后补记或过期的凭证永远无法为未验证代码的重启背书。这一条规则就能拦住 2026-08-14 file-preview 事故的整类失败（错误导入风格、漏注册 tsconfig、缺 `./typert` 导出）：这些错误全部过不了构建/类型检查，于是不会有凭证，重启在造成伤害之前就被拒绝。
 
-Beyond the gate it provides the P2 safety net: `checkpoint` commits the whole working tree as a rollback point before a batch, `reset` hard-resets to it, and `canary` re-verifies after a restart (credential freshness + optional TCP port liveness). Checkpoints and credentials persist in a state file that survives restarts, so the canary runs after the new instance is up.
+闸门之外还提供 P2 安全网：`checkpoint` 在批次前把整个工作树提交为回滚点，`reset` 硬重置回该点，`canary` 在重启后复检（凭证新鲜度 + 可选 TCP 端口存活）。检查点与凭证持久化在重启后依然存活的状态文件中，因此 canary 可以在新实例起来之后运行。
 
-## Installation and loading
+## 安装与加载
 
-This package is a **dsh plugin**: it guards the running dsh web instance against broken self-modification restarts. It does not ship a host — install the host yourself and load this plugin into it:
+本包是 **dsh 插件**：它守护运行中的 dsh web 实例，防止坏掉的自我修改重启。它不自带宿主——请自行安装宿主，再把本插件加载进去：
 
 ```sh
 npm install @deepseek-ai/dsh            # the host (dsh web / dsh CLI)
 npm install @deepseek-ai/dsh-ankh-guard # this plugin
 ```
 
-Then start the host: `npx @deepseek-ai/dsh web`.
+然后启动宿主：`npx @deepseek-ai/dsh web`。
 
-The package ships the CLI (`dsh-ankh-guard` bin), the plugin (`@deepseek-ai/dsh-ankh-guard`), the watchdog script, and its own README — everything an external deployment needs lives in the artifact, not in the harness repository. Install the plugin from npm (peer dependencies — `@deepseek-ai/cordis`, `@deepseek-ai/dsh-invariants`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/schemastery`, `@deepseek-ai/dsh-session-persistence` — install automatically):
+包内自带 CLI（`dsh-ankh-guard` bin）、插件（`@deepseek-ai/dsh-ankh-guard`）、watchdog 脚本与自己的 README——外部部署需要的一切都在发布物里，不在 harness 仓库里。从 npm 安装插件（peer 依赖——`@deepseek-ai/cordis`、`@deepseek-ai/dsh-invariants`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-agent`、`@deepseek-ai/schemastery`、`@deepseek-ai/dsh-session-persistence`——自动安装）：
 
 ```sh
 npm install @deepseek-ai/dsh-ankh-guard
 ```
 
-Or install from source — clone this repository, build, and test it:
+或从源码安装——clone 本仓库、构建并测试：
 
 ```sh
 git clone https://github.com/Khorsheed/dsh-ankh-guard.git
 cd dsh-ankh-guard && pnpm install && pnpm run build && pnpm test
 ```
 
-Then reference it as a dependency (`"@deepseek-ai/dsh-ankh-guard": "file:../dsh-ankh-guard"`) in your own package, or run the CLI directly from the checkout with `node lib/cli.js <command>`.
+然后在你自己的包里以依赖引用（`"@deepseek-ai/dsh-ankh-guard": "file:../dsh-ankh-guard"`），或直接从检出里跑 CLI：`node lib/cli.js <命令>`。
 
-Load it as a cordis plugin in your `cordis.yml` (this is the loading step — a restart guard that is not loaded cannot protect anything):
+在 `cordis.yml` 里以 cordis 插件方式加载（这就是加载步骤——没被加载的重启 guard 保护不了任何东西）：
 
 ```yaml
 plugins:
@@ -42,67 +42,67 @@ plugins:
     name: '@deepseek-ai/dsh-ankh-guard'
 ```
 
-Config (all optional): `stateDir` (default `$DSH_HOME/state`, else `<cwd>/.dsh-guard-state`), `repoDir` (default the process cwd), `maxAgeMinutes` (credential freshness, default 10), `reportRestartContext` (`followup` autonomous report / `step` ride the next turn / `off`, default `followup`), `fallbackGraceMs` (how long a non-initiator root agent waits before claiming a record whose initiator session has not resumed, default 60000).
+配置（全部可选）：`stateDir`（默认 `$DSH_HOME/state`，否则 `<cwd>/.dsh-guard-state`）、`repoDir`（默认进程 cwd）、`maxAgeMinutes`（凭证新鲜窗口，默认 10）、`reportRestartContext`（`followup` 自主报告 / `step` 骑下一次回合 / `off`，默认 `followup`）、`fallbackGraceMs`（非发起根 agent 在发起会话尚未恢复时等待多久才认领记录，默认 60000）。
 
-Runtime needs: `node` (the CLI, the watchdog's crash page, and the detached exit agent), `bash` (the watchdog script), and `lsof` on macOS/Linux for listener discovery (`--pid` bypasses it). No build step for consumers — the published `lib/` is the runnable artifact.
+运行时需要：`node`（CLI、watchdog 崩溃页与 detached 退出代理）、`bash`（watchdog 脚本）、macOS/Linux 上的 `lsof`（发现监听者；`--pid` 可绕过）。消费者无需构建——发布的 `lib/` 就是可运行产物。
 
-## The gate
+## 闸门
 
-The state file lives at `$DSH_HOME/state/self-restart-guard.json` (override with `stateDir`; falls back to `<cwd>/.dsh-guard-state`). It records the credential, the latest checkpoint, and a capped audit trail. `verify()` checks, in order:
+状态文件位于 `$DSH_HOME/state/self-restart-guard.json`（可用 `stateDir` 覆盖；否则回退到 `<cwd>/.dsh-guard-state`）。它记录凭证、最新检查点和有上限的审计轨迹。`verify()` 依次检查：
 
-1. a credential exists;
-2. the current git HEAD equals the credential's revision;
-3. the credential is younger than `maxAgeMinutes`.
+1. 存在凭证；
+2. 当前 git HEAD 等于凭证的 revision；
+3. 凭证未超过 `maxAgeMinutes`。
 
-Anything else is a denial with a reason that says exactly what to do (record, rebuild, or re-record).
+其余情况一律拒绝，并给出明确该做什么的理由（record / 重建 / 重录）。
 
-## Usage
+## 用法
 
-The primary interface is the CLI, which works even while the instance is down (no app boot needed). Installed consumers use the `dsh-ankh-guard` bin (or `node lib/cli.js`); inside this repository the source form `node --import tsx/esm src/cli.ts` also works. The state file lives at `$DSH_HOME/state` — pass `--state-dir "$DSH_HOME/state" --repo "$PWD"` on every command.
+主要接口是 CLI，即使实例宕机也能用（无需启动应用）。安装后的使用者用 `dsh-ankh-guard` bin（或 `node lib/cli.js`）；在本仓库内源码形态 `node --import tsx/esm src/cli.ts` 也可用。状态文件位于 `$DSH_HOME/state`——所有命令都带 `--state-dir "$DSH_HOME/state" --repo "$PWD"`。
 
-### The self-restart protocol (self-contained)
+### 自我重启协议（自包含）
 
-The safe way to restart an instance after changing its code:
+改完代码后安全重启实例的六步：
 
-1. **checkpoint** — snapshot the working tree as the rollback point: `dsh-ankh-guard checkpoint --message "<batch>"`
-2. **modify** — make the change; register every surface it needs (aggregates, paths, bundle rows, dependencies).
-3. **build + test** — the narrow full set for the changed surface; no credential without green.
-4. **record** — `dsh-ankh-guard record build+test --command "<what went green>"`
-5. **verify** — `dsh-ankh-guard verify` must exit 0; a denial (missing/stale/HEAD-mismatched credential) means rebuild and re-record.
-6. **restart + canary** — see below. After the new instance is up, `dsh-ankh-guard canary --port N` confirms it.
+1. **checkpoint**——把工作树快照为回滚点：`dsh-ankh-guard checkpoint --message "<批次>"`
+2. **修改**——做完改动；注册它需要的每个面（聚合、paths、bundle 行、依赖）。
+3. **构建 + 测试**——改动面的完整定向集；没有绿色就没有凭证。
+4. **record**——`dsh-ankh-guard record build+test --command "<什么过了>"`
+5. **verify**——`dsh-ankh-guard verify` 必须 exit 0；拒绝（缺凭证/过期/HEAD 不匹配）就重建重录。
+6. **重启 + canary**——见下。新实例起来后 `dsh-ankh-guard canary --port N` 确认。
 
-### supervise: seamless restart for non-technical users
+### supervise：不懂技术的用户也能无感重启
 
-`restart` runs the whole kill → start → probe → canary loop in one CLI process (use `--delay-ms` so the scheduling turn finishes first). For deployments where nobody should touch a terminal, `supervise` hands the job to a **watchdog** — a detached supervisor process that survives the instance:
+`restart` 在单个 CLI 进程里跑完 kill → start → probe → canary（用 `--delay-ms` 让调度方回合先完成）。对于不该碰终端的部署，`supervise` 把工作交给 **watchdog**——一个 detached、比实例活得久的监督进程：
 
 ```sh
 dsh-ankh-guard supervise --port 3080 --start "CMD" --state-dir "$DSH_HOME/state" --repo "$PWD"
 ```
 
-It spawns `scripts/dsh-watchdog.sh` (ships with the package) detached with `--wait-owner`: the watchdog idles while the current instance runs, takes over the port when the instance exits (intentional restart or crash), respawns it, runs the guard canary on intentional restarts (a `restart-requested.json` marker), and clears the marker on pass. Two consecutive boot failures roll the checkout back to the guard checkpoint; four failures serve a crash page on the port with a retry button (SIGUSR1 to the watchdog). A `watchdog-stop` marker exits the watchdog for good. The instance itself can adopt supervision before a self-restart — the user never starts the watchdog by hand.
+它以 `--wait-owner` 模式 detached 拉起随包发布的 `scripts/dsh-watchdog.sh`：watchdog 在当前实例运行期间待机，实例退出（有意重启或崩溃）后接管端口、重新拉起，有意重启时跑 guard canary（读 `restart-requested.json` 标记），通过后清除标记。连续 2 次起不来→回滚到 guard checkpoint；4 次失败→在端口上提供带重试按钮的崩溃页（SIGUSR1 通知 watchdog）。`watchdog-stop` 标记让 watchdog 彻底退出。实例可以在自我重启前自行采用监督——用户永远不需要手动启动 watchdog。
 
-When a watchdog is already supervising, the restart trigger is `schedule-exit` — the reliable way to end the host: it writes the restart marker and spawns a **detached exit agent** (setsid via node `spawn`), which cannot be reaped by a managed shell's process group, so the scheduled kill actually lands after the scheduling turn ends (the fix for `(sleep N; kill) &` silently never firing). The watchdog respawns, runs the canary, and the new instance reports via `last-restart.json`. Prefer `restart` (single-shot loop) only when no watchdog is present.
+已有 watchdog 监督时，重启触发用 `schedule-exit`——可靠的结束宿主方式：它写入 restart 标记并 spawn 一个 **detached 退出代理**（node `spawn` 的 setsid），托管 shell 的进程组回收不到它，所以计划中的 kill 会在调度回合结束后真实落地（修复 `(sleep N; kill) &` 静默不触发的坑）。watchdog 重新拉起、跑 canary，新实例经 `last-restart.json` 回报。只有无 watchdog 时才用 `restart`（单次循环）。
 
-**The restart report reaches the model by itself.** On agent creation after a scheduled restart (a pending `last-restart.json` record), the plugin queues the report as the next turn via `agent.followup` — the official wake-the-agent seam the schedule system uses for reminders — so the agent reports the restart result **without any user message**. The report returns to the session that scheduled the exit: `schedule-exit` records `$DSH_SESSION_ID` as the initiator, and while that session's root agent is live only it may claim the record (a non-initiator session resuming first does not steal it); Session restore is asynchronous, so when the initiator is not live yet its session is checked against persistence: if it still exists (slow resume), a grace timer (Config `fallbackGraceMs`, default 60000 ms) waits for it before any root agent falls back; if it is gone (deleted, or a subagent that never resumes), the first live root agent claims the record so the report is never lost. The timer validates the record identity on fire (same `exitAt`, still unreported) so a second restart or an earlier claim cannot be acked by a stale timer. Only root agents, once (the record is acknowledged). Config `reportRestartContext`: `followup` (default, autonomous), `step` (ride the first step of whatever turn comes next), or `off`.
+**重启报告自动到达模型。** 计划重启后，插件在 agent 创建时（存在未确认的 `last-restart.json` 记录）通过 `agent.followup` 把报告排入下一回合——这是 schedule 系统用于提醒的官方唤醒 agent 接缝——agent **无需任何用户消息**即可回报重启结果。报告返回给发起重启的会话：`schedule-exit` 把 `$DSH_SESSION_ID` 记为 initiator，只要该会话的根 agent 还活着，就只有它能领走记录（先恢复的非发起会话抢不走）；会话恢复是异步的，因此发起会话尚未 live 时先查持久化：会话还在（慢恢复）则用宽限定时器（配置 `fallbackGraceMs`，默认 60000 ms）等它，宽限期后才允许任意根 agent 回退；会话确实没了（已删除、或是不再恢复的子 agent）则由首个 live 根 agent 领走，报告不会丢失。定时器触发时会校验记录身份（`exitAt` 相同且未确认），二次重启或已有人认领时旧定时器不会误 ack。仅根 agent、仅一次（记录被确认）。配置 `reportRestartContext`：`followup`（默认，自主）、`step`（骑在下一次回合的第一步上）、或 `off`。
 
-### The local feedback board
+### 本地留言板
 
-This plugin is a local loop inside one deployment, not an upstream feedback channel. When the gate misbehaves — a false deny or allow, a canary misjudgment, a supervise anomaly, or documentation that does not match behavior — agents running this plugin leave a structured note on the local board:
+本插件是单部署内的本地闭环，不是上游反馈渠道。当闸门行为异常——误拒/误放、canary 误判、supervise 行为异常、文档与行为不符——使用本插件的 agent 在本地留言板留一条结构化记录：
 
 ```sh
 dsh-ankh-guard feedback "<reproducible problem description>" --state-dir "$DSH_HOME/state"
 dsh-ankh-guard feedback list              # read the newest entries
 ```
 
-Entries are appended to `$DSH_HOME/feedback/dsh-self-restart-guard.jsonl` (the DSH_HOME runtime area — never the plugin install directory or the source tree), append-only and capped at 200 with the newest kept. Write only reproducible, actionable problems; never secrets or private data. Upstream issues belong on the project's issue tracker, not here.
+条目追加到 `$DSH_HOME/feedback/dsh-self-restart-guard.jsonl`（DSH_HOME 运行时区——绝不写入插件安装目录或源码树），append-only、单文件封顶 200 条（保留最新）。只写可复现、可行动的问题；绝不写密钥/隐私。上游问题请走项目 issue 渠道，不是这里。
 
-### supervise: one port, one owner
+### supervise：一个端口一个拥有者
 
-A port must have exactly one supervision owner, but the owner itself should be supervised. Three deployment shapes:
+一个端口只能有一个监督拥有者，但拥有者本身也应该被监督。三种部署形态：
 
-- **A — pure guard**: no external supervisor; the instance adopts the watchdog via `supervise` before a self-restart. Simplest, but nothing pulls the host back after an unexpected crash.
-- **B — pure launchd/systemd**: the launcher owns the port with KeepAlive. Solid for crashes, but self-modification restarts are not guarded by the credential gate.
-- **C — layered (recommended)**: launchd supervises the watchdog, the watchdog supervises the instance. One owner per port, and the owner is supervised. Run the watchdog in the foreground so the external supervisor acts on it:
+- **A — 纯 guard**：无外部监督者；实例在自我重启前用 `supervise` 采用 watchdog。最简单，但意外崩溃后没有东西拉回宿主。
+- **B — 纯 launchd/systemd**：launcher 用 KeepAlive 拥有端口。抗崩溃，但自我修改重启不受凭证闸门约束。
+- **C — 分层（推荐）**：launchd 监督 watchdog，watchdog 监督实例。每端口一个拥有者，且拥有者也被监督。watchdog 以前台方式运行，外部监督者作用于它：
 
 ```sh
 # launchd/systemd job (KeepAlive) runs this; the CLI process IS the watchdog:
@@ -110,9 +110,9 @@ dsh-ankh-guard supervise --foreground --port 3093 --start "<start command>" \
   --state-dir "$DSH_HOME/state" --repo "<checkout>"
 ```
 
-`--foreground` runs the watchdog inline (adopting the port) and exits with it, so a dead watchdog triggers the external supervisor's restart. The detached form (`supervise` without `--foreground`) is for the instance adopting supervision ahead of a self-restart.
+`--foreground` 让 watchdog 内联运行（接管端口）并随它退出，watchdog 死掉会触发外部监督者重启。detached 形态（不带 `--foreground` 的 `supervise`）用于实例在自我重启前自行采用监督。
 
-Commands: `verify` (exit 0/1), `record <scope>`, `status`, `clear`, `checkpoint [--message]`, `reset <sha>`, `canary [--port N]`, `restart --port N --start "CMD" [--delay-ms MS] [--rollback]`, `schedule-exit --port N --delay-ms MS`, `supervise --port N --start "CMD" [--log FILE]`. The checkpoint/reset round trip:
+命令：`verify`（退出码 0/1）、`record <scope>`、`status`、`clear`、`checkpoint [--message]`、`reset <sha>`、`canary [--port N]`、`restart --port N --start "CMD" [--delay-ms MS] [--rollback]`、`schedule-exit --port N --delay-ms MS`、`supervise --port N --start "CMD" [--log FILE]`。检查点/回滚闭环：
 
 ```sh
 dsh-ankh-guard checkpoint --message "before batch"
@@ -121,7 +121,7 @@ dsh-ankh-guard canary --port 3080   # fails → roll back
 dsh-ankh-guard reset <checkpoint-sha>
 ```
 
-`restart` owns the whole restart loop in a **detached process that outlives the restarted instance** — the compatibility fix for "the restart kills the session that used to own the canary". It refuses to stop the instance when the gate denies (the credential check is enforced in the restart path itself, not just by procedure), stops the listener on `--port`, starts the `--start` command detached, polls until the port listens, re-verifies, and with `--rollback` hard-resets to the recorded checkpoint when the new instance never comes up:
+`restart` 在**独立于被重启实例的进程中**跑完整套重启循环——这正是"重启会杀死原来持有 canary 的会话"的兼容性修复。它在闸门拒绝时拒绝停实例（凭证检查在重启路径本身强制，而非仅靠流程），停止 `--port` 上的监听者，以 detached 方式启动 `--start` 命令，轮询端口直到监听，重新校验；`--rollback` 时若新实例一直起不来则硬重置到记录的检查点：
 
 ```sh
 dsh-ankh-guard restart \
@@ -129,22 +129,20 @@ dsh-ankh-guard restart \
   --state-dir "$DSH_HOME/state" --repo "$PWD"
 ```
 
-`--delay-ms MS` turns this into a graceful agent-driven self-restart: the detached CLI waits out the delay before stopping, so the scheduling agent's turn completes and its final message is delivered first — the disruption becomes a reconnect, not a mid-turn kill (true in-place node hot-swap is unavailable by design: the web bundle disables cordis module-reload HMR; client-plugin bundles, by contrast, hot-swap without any process restart via the `dsh-client-hmr` stat-poll/SSE chain).
-
-Mounted as a cordis plugin (base bundle), the same surface is available as the `selfRestartGuard` service for in-app gates. Config: `maxAgeMinutes` (default 10), `stateDir`, `repoDir`, `reportRestartContext` (`followup` default), `fallbackGraceMs` (default 60000).
+以 cordis 插件挂载（base bundle）后，同一套能力以 `selfRestartGuard` 服务的形式供应用内闸门使用。配置：`maxAgeMinutes`（默认 10）、`stateDir`、`repoDir`、`reportRestartContext`（默认 `followup`）、`fallbackGraceMs`（默认 60000）。
 
 ## Model Experience
 
-None. The guard is host-side infrastructure; it adds no tool schema, prompt, or result to any model request.
+无。guard 是宿主侧基础设施；不给任何模型请求增加工具 schema、提示词或结果。
 
 #### KV Cache effect
 
-None.
+无。
 
 ## Known Limitations and Deferred Work
 
-- **The gate is enforced in `restart`/`supervise`, not the launcher** — both refuse to stop the instance on a denial, but a manual `kill`/start outside the guard still bypasses it; the watchdog (P2) is the automatic safety net that makes a bypassed gate recoverable.
-- **The watchdog needs a supervisor to outlive the instance** — `supervise` spawns it detached (setsid); a watchdog spawned from inside a process that is about to die must be orphaned first, so the app adopts supervision *before* exiting.
-- **A/B partition (P1) is out of scope here** — the slot-switch mechanism for production exists elsewhere; a worktree-based dev flow that never touches the running checkout is a separate follow-up.
-- **Checkpoint commits sweep the whole working tree** — intended (a checkpoint is a full rollback point), but note it also captures unrelated uncommitted work.
-- **`restart`/`supervise` discover the listener via `lsof`** (macOS/Linux with lsof); other platforms need `--pid`.
+- **闸门在 `restart`/`supervise` 里强制，launcher 里还没有**——两者在拒绝时会拒绝停实例，但绕开 guard 的手动 `kill`/启动仍可绕过；watchdog（P2）是让被绕过的闸门可恢复的自动安全网。
+- **watchdog 需要一个比实例活得久的监督者**——`supervise` 以 detached（setsid）方式拉起它；从即将死亡的进程内派生的 watchdog 必须先被孤儿化，所以应用要在退出**之前**采用监督。
+- **A/B 分区（P1）不在本包范围**——生产的槽位切换机制在别处；基于 worktree、永不触碰运行中检出的开发流是独立的后续项。
+- **checkpoint 提交会扫入整个工作树**——有意为之（检查点就是完整回滚点），但也会带上无关的未提交改动。
+- **`restart`/`supervise` 通过 `lsof` 发现监听者**（macOS / 带 lsof 的 Linux）；其他平台需用 `--pid`。
