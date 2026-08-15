@@ -22,34 +22,35 @@ The restart itself is handed to a watchdog: a detached supervisor that brings th
 
 ## Install and load
 
-This package is a dsh plugin: it guards a running dsh web instance against broken self-modification restarts. It ships no host — install the host, then load the plugin:
+This package is a dsh plugin: it guards a running dsh web instance against broken self-modification restarts. It ships no host — you need a dsh host first (`npx @deepseek-ai/dsh web`). Host compatibility: dsh `0.0.1-rc.5+` or `0.1.0-rc.5+` (any current npm release works).
+
+One command installs the plugin into a profile and activates it as a patch layer (the package declares `dsh.bundle`, so `add` both writes the dependency and mounts the plugin — re-running is safe, deduped by package name):
 
 ```sh
-npm install @deepseek-ai/dsh            # the host (dsh web / dsh CLI)
-npm install @khorsheed/dsh-ankh-guard   # this plugin
+dsh plugin --profile web add @khorsheed/dsh-ankh-guard
 ```
 
-Then start the host: `npx @deepseek-ai/dsh web`.
-
-Install the plugin from npm (peer dependencies install automatically):
+Or install from GitHub (builds itself on install via `prepare`):
 
 ```sh
-npm install @khorsheed/dsh-ankh-guard
+dsh plugin --profile web add github:Khorsheed/dsh-ankh-guard
 ```
 
-Or from source — clone, build, test:
+Restart the host afterwards. Note: if your profile already composes `ankh-guard` through another bundle, do NOT also `plugin add` it — mounting the same entry id twice fails loud at boot (`duplicate loader entry id`).
+
+For custom profiles, compose it by hand in your own patch layer instead:
+
+```yaml
+- insert:
+    - id: ankh-guard
+      name: '@khorsheed/dsh-ankh-guard'
+```
+
+From source — clone, build, test:
 
 ```sh
 git clone https://github.com/Khorsheed/dsh-ankh-guard.git
 cd dsh-ankh-guard && pnpm install && pnpm run build && pnpm test
-```
-
-Load it in `cordis.yml`:
-
-```yaml
-plugins:
-  - id: ankh-guard
-    name: '@khorsheed/dsh-ankh-guard'
 ```
 
 Config (all optional): `stateDir` (default `$DSH_HOME/state`, else `<cwd>/.dsh-guard-state`), `repoDir` (default the process cwd), `maxAgeMinutes` (credential freshness, default 10), `reportRestartContext` (`followup` autonomous report / `step` ride the next turn / `off`, default `followup`), `fallbackGraceMs` (how long to wait for the initiating session before another agent takes the report, default 60000).

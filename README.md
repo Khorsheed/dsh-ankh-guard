@@ -22,34 +22,35 @@ agent 改完代码想重启的时候，这个插件会先问一句：这次改�
 
 ## 安装与加载
 
-本包是 dsh 插件：守护运行中的 dsh web 实例，防止坏掉的自我修改重启。不自带宿主，先装宿主再加载插件：
+本包是 dsh 插件：守护运行中的 dsh web 实例，防止坏掉的自我修改重启。不自带宿主——先准备 dsh 宿主（`npx @deepseek-ai/dsh web`)。宿主兼容性：dsh `0.0.1-rc.5+` 或 `0.1.0-rc.5+`(npm 上任何当前版本均可）。
+
+一条命令安装到 profile 并作为补丁层激活（本包声明了 `dsh.bundle`,add 会同时写入依赖并挂载插件；重复执行安全，按包名去重）:
 
 ```sh
-npm install @deepseek-ai/dsh            # the host (dsh web / dsh CLI)
-npm install @khorsheed/dsh-ankh-guard   # this plugin
+dsh plugin --profile web add @khorsheed/dsh-ankh-guard
 ```
 
-然后启动宿主：`npx @deepseek-ai/dsh web`。
-
-从 npm 安装插件（peer 依赖自动装）：
+或从 GitHub 安装（安装时经 `prepare` 自动构建）:
 
 ```sh
-npm install @khorsheed/dsh-ankh-guard
+dsh plugin --profile web add github:Khorsheed/dsh-ankh-guard
 ```
 
-或源码安装——clone、构建、测试：
+装完重启宿主。注意：如果你的 profile 已经通过其他 bundle 组合了 ankh-guard，请不要再 add——同一条目 id 挂载两次会在启动时 fail loud(`duplicate loader entry id`)。
+
+自定义 profile 也可以在自己的补丁层里手工组合：
+
+```yaml
+- insert:
+    - id: ankh-guard
+      name: '@khorsheed/dsh-ankh-guard'
+```
+
+源码安装——clone、构建、测试：
 
 ```sh
 git clone https://github.com/Khorsheed/dsh-ankh-guard.git
 cd dsh-ankh-guard && pnpm install && pnpm run build && pnpm test
-```
-
-在 `cordis.yml` 里加载：
-
-```yaml
-plugins:
-  - id: ankh-guard
-    name: '@khorsheed/dsh-ankh-guard'
 ```
 
 配置（全部可选）：`stateDir`（默认 `$DSH_HOME/state`，否则 `<cwd>/.dsh-guard-state`）、`repoDir`（默认进程 cwd）、`maxAgeMinutes`（凭证新鲜窗口，默认 10）、`reportRestartContext`（`followup` 自主报告 / `step` 骑下一次回合 / `off`，默认 `followup`）、`fallbackGraceMs`（发起会话尚未恢复时等其他 agent 接管报告前等多久，默认 60000）。
