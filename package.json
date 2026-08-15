@@ -31,16 +31,27 @@
     "lib/*.js",
     "lib/types/**/*.d.ts",
     "scripts/dsh-watchdog.sh",
+    "cordis.patch.yml",
     "README.en.md"
   ],
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.5",
     "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-session-persistence": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
@@ -68,6 +79,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsdown",
+    "prepare": "npm run build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.build.json --noEmit"
   },

@@ -1,0 +1,7 @@
+# Self-mounting patch layer: `dsh plugin add @khorsheed/dsh-ankh-guard` applies
+# this layer to the profile, inserting the guard plugin into the loader tree.
+# Profiles that already compose ankh-guard through another bundle must NOT also
+# plugin-add it — the duplicate entry id fails loud at boot.
+- insert:
+    - id: ankh-guard
+      name: '@khorsheed/dsh-ankh-guard'
