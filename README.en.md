@@ -145,3 +145,7 @@ None.
 - **A/B partition (P1) is out of scope here** — the slot-switch mechanism for production exists elsewhere; a worktree-based dev flow that never touches the running checkout is a separate follow-up.
 - **Checkpoint commits sweep the whole working tree** — intended (a checkpoint is a full rollback point), but note it also captures unrelated uncommitted work.
 - **`restart`/`supervise` discover the listener via `lsof`** (macOS/Linux with lsof); other platforms need `--pid`.
+
+## Links
+
+- [dshfind](https://dshfind.com/)

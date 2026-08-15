@@ -145,3 +145,7 @@ dsh-ankh-guard restart \
 - **A/B 分区（P1）不在本包范围**——生产的槽位切换机制在别处；基于 worktree、永不触碰运行中检出的开发流是独立的后续项。
 - **checkpoint 提交会扫入整个工作树**——有意为之（检查点就是完整回滚点），但也会带上无关的未提交改动。
 - **`restart`/`supervise` 通过 `lsof` 发现监听者**（macOS / 带 lsof 的 Linux）；其他平台需用 `--pid`。
+
+## 友情链接
+
+- [dshfind](https://dshfind.com/)
