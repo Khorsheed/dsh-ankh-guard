@@ -6,6 +6,10 @@ Let an agent change its own code and restart its own service — without taking 
 
 When the agent wants to restart after editing code, this plugin asks one question first: did the build and tests pass? Yes, go ahead. No, blocked — so broken code can't take the service, and the conversation running inside it, down with it.
 
+![The restart loop in action](assets/restart-loop-demo.png)
+
+A real self-restart, end to end: the agent announces its verification plan before restarting (1); the host exits and the in-flight tool call is safely interrupted and recorded (2); the watchdog brings the instance back within seconds and ankh-guard injects the restart context into the original session (3) — the agent wakes up and runs the exact checks it promised, while the user notices nothing.
+
 ## How it works
 
 One rule at the core: **prove the code is good before you allow a restart.**
