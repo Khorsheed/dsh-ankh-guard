@@ -1,7 +1,7 @@
 {
   "name": "@khorsheed/dsh-ankh-guard",
   "description": "Hard gate for self-modification restarts: a green-build credential bound to the git HEAD, checked before any restart of the running instance",
-  "version": "0.1.0-rc.6.2",
+  "version": "0.1.0-rc.6.3",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Khorsheed/dsh-ankh-guard.git"
@@ -36,12 +36,12 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.5",
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/cordis": "^4.0.1-rc.4",
+    "@deepseek-ai/dsh-agent": "^0.0.1-rc.5 || ^0.1.0-rc.5",
+    "@deepseek-ai/dsh-invariants": "^0.0.1-rc.5 || ^0.1.0-rc.5",
+    "@deepseek-ai/dsh-llm": "^0.0.1-rc.5 || ^0.1.0-rc.5",
+    "@deepseek-ai/dsh-session-persistence": "^0.0.1-rc.5 || ^0.1.0-rc.5",
+    "@deepseek-ai/schemastery": "^3.18.1-rc.4"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-session-persistence": {
