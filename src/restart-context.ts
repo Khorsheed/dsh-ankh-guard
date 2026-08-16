@@ -9,7 +9,7 @@
  * those sessions and queue a "continue" turn. Pure logic reads the durable
  * files; the plugin wires them into `agent/created` and `agent.followup`.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** The exit agent's durable restart record (written by `schedule-exit`). */
@@ -140,11 +140,15 @@ export function readInterruptedSnapshot(stateDir: string): InterruptedSnapshot |
 
 /**
  * Write the shutdown snapshot (synchronous — called from a signal handler).
+ * The state directory is created on demand: a fresh deployment has no
+ * `$DSH_HOME/state` yet, and a missing directory must not silently drop the
+ * snapshot.
  * @param stateDir - state directory.
  * @param snapshot - the snapshot to persist.
  */
 export function writeInterruptedSnapshot(stateDir: string, snapshot: InterruptedSnapshot): void {
   try {
+    mkdirSync(stateDir, { recursive: true })
     writeFileSync(interruptedSnapshotFile(stateDir), `${JSON.stringify(snapshot)}\n`)
   } catch {
     // Best-effort: a failed snapshot loses auto-continue for this stop, never the process.
