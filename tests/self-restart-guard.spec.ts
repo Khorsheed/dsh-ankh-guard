@@ -7,11 +7,11 @@
  * reads the clock; git calls run against throwaway repositories.
  */
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { get as httpGet } from 'node:http'
 import { connect, createServer, type AddressInfo, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
@@ -22,9 +22,9 @@ import { install as installInvariant } from '../src/invariant.ts'
 import {
   acknowledgeRestartRecord, pendingRestartRecord, restartContextText,
 } from '../src/restart-context.ts'
-import { runCli, type CliIo } from '../src/cli.ts'
+import { preflightInternals, resolvePreflightBin, runCli, type CliIo } from '../src/cli.ts'
 import {
-  clearCredential, emptyState, loadState, recordCredential, setCheckpoint,
+  clearCredential, emptyState, lastGoodBootRevision, loadState, recordCredential, setCheckpoint,
   verifyCredential, type GuardState,
 } from '../src/state.ts'
 
@@ -114,6 +114,15 @@ describe('state core', () => {
     writeFileSync(join(dir, 'self-restart-guard.json'), '{ nope')
     expect(() => loadState(dir)).toThrow(/unreadable state file/)
   })
+
+  it('lastGoodBootRevision reads the healthy-boot stamp, tolerating absence and malformed files', () => {
+    const dir = tmpDir('guard-state-')
+    expect(lastGoodBootRevision(dir)).toBeUndefined()
+    writeFileSync(join(dir, 'last-good-boot.json'), '{ nope')
+    expect(lastGoodBootRevision(dir)).toBeUndefined()
+    writeFileSync(join(dir, 'last-good-boot.json'), JSON.stringify({ revision: 'abc123', at: NOW }))
+    expect(lastGoodBootRevision(dir)).toBe('abc123')
+  })
 })
 
 describe('cordis service (real git repo)', () => {
@@ -164,6 +173,24 @@ function cliIo(): { out: string[]; err: string[]; io: CliIo } {
   return { out, err, io: { stdout: l => out.push(l), stderr: l => err.push(l) } }
 }
 
+/** Set or unset $DSH_PREFLIGHT_COMMAND, restored after the test. `undefined` restores real app-bin resolution. */
+function stubPreflight(command: string | undefined): void {
+  const previous = process.env.DSH_PREFLIGHT_COMMAND
+  if (command === undefined) delete process.env.DSH_PREFLIGHT_COMMAND
+  else process.env.DSH_PREFLIGHT_COMMAND = command
+  cleanups.push(() => {
+    if (previous === undefined) delete process.env.DSH_PREFLIGHT_COMMAND
+    else process.env.DSH_PREFLIGHT_COMMAND = previous
+  })
+}
+
+/** Point the app-bin resolution at a fixed answer, restored after the test. */
+function stubPreflightBin(resolveBin: () => string | undefined): void {
+  const original = preflightInternals.resolveBin
+  preflightInternals.resolveBin = resolveBin
+  cleanups.push(() => { preflightInternals.resolveBin = original })
+}
+
 describe('CLI', () => {
   const io = cliIo
 
@@ -207,6 +234,21 @@ describe('CLI', () => {
     const reset = io()
     expect(await runCli(['reset', sha ?? '', '--repo', repo], reset.io)).toBe(0)
     expect(reset.out.join('')).toContain('reset to')
+  })
+
+  it('checkpoint warns (but still commits) when bare-tsc artifacts under src/ are swept in', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    mkdirSync(join(repo, 'packages', 'x', 'y', 'src'), { recursive: true })
+    writeFileSync(join(repo, 'packages', 'x', 'y', 'src', 'index.js'), '// stray emit\n')
+    writeFileSync(join(repo, 'packages', 'x', 'y', 'src', 'index.ts'), 'export {}\n')
+    const cp = io()
+    expect(await runCli(['checkpoint', '--message', 'batch', ...flags], cp.io)).toBe(0)
+    expect(cp.out.join('')).toContain('1 build-artifact-looking')
+    expect(cp.out.join('')).toContain('packages/x/y/src/index.js')
+    // The commit still happened, artifact included — a checkpoint never refuses work.
+    expect(execFileSync('git', ['ls-files'], { cwd: repo, encoding: 'utf8' })).toContain('packages/x/y/src/index.js')
   })
 
   it('canary passes only when verify passes and the port is listening', async () => {
@@ -269,6 +311,7 @@ describe('CLI', () => {
     try {
       await waitForPort(port)
       await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      stubPreflight('true')
       const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
       const restarted = io()
       expect(await runCli(
@@ -292,6 +335,7 @@ describe('CLI', () => {
     try {
       await waitForPort(port)
       await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      stubPreflight('true')
       const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
       const started = Date.now()
       const out = io()
@@ -321,6 +365,7 @@ describe('CLI', () => {
       const sha = cp.out.join('').trim().split(' ').pop()
       commitChange(repo)
       await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      stubPreflight('true')
       const broken = `"${process.execPath}" -e "process.exit(3)"`
       const failed = io()
       expect(await runCli(
@@ -328,12 +373,224 @@ describe('CLI', () => {
           '--state-dir', stateDir, '--repo', repo],
         failed.io,
       )).toBe(1)
-      expect(failed.out.join('')).toContain('rolled back to checkpoint')
+      expect(failed.out.join('')).toContain('rolled back to last known-good')
+      // No boot stamp: the pre-batch checkpoint outranks the credential.
       expect(currentHead(repo)).toBe(sha)
     } finally {
       await killListener(port)
       server.kill('SIGKILL')
     }
+  })
+
+  it('restart --rollback skips the reset when the target already is HEAD', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const server = spawnServer(port, 'old')
+    try {
+      await waitForPort(port)
+      // Checkpoint and credential both bind the CURRENT HEAD: there is
+      // nothing to roll back, and the dirty tree must survive.
+      const cp = io()
+      expect(await runCli(['checkpoint', '--message', 'pre', '--state-dir', stateDir, '--repo', repo], cp.io)).toBe(0)
+      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      stubPreflight('true')
+      writeFileSync(join(repo, 'a.txt'), 'dirty')
+      const broken = `"${process.execPath}" -e "process.exit(3)"`
+      const failed = io()
+      expect(await runCli(
+        ['restart', '--port', String(port), '--start', broken, '--rollback', '--timeout-ms', '2000',
+          '--state-dir', stateDir, '--repo', repo],
+        failed.io,
+      )).toBe(1)
+      expect(failed.out.join('')).toContain('skipping reset')
+      expect(readFileSync(join(repo, 'a.txt'), 'utf8')).toBe('dirty')
+    } finally {
+      await killListener(port)
+      server.kill('SIGKILL')
+    }
+  })
+})
+
+describe('composition preflight gate', () => {
+  const io = cliIo
+
+  it('resolvePreflightBin stays undefined in this standalone checkout and maps foreign layouts', () => {
+    // The standalone publish repo has no sibling dsh app: undefined by design.
+    const here = resolvePreflightBin()
+    expect(here).toBeUndefined()
+    // The production seam resolves the same bin.
+    expect(preflightInternals.resolveBin()).toBe(here)
+    // Built-only layout: no src/bin.ts and no tsx, but lib/bin.js exists.
+    const builtOnly = tmpDir('guard-layout-')
+    mkdirSync(join(builtOnly, 'apps/cli/lib'), { recursive: true })
+    writeFileSync(join(builtOnly, 'apps/cli/lib/bin.js'), '')
+    const foreignCli = (root: string): string => join(root, 'packages/guard/ankh-guard/lib/cli.js')
+    expect(resolvePreflightBin(foreignCli(builtOnly))).toBe(`node ${join(builtOnly, 'apps/cli/lib/bin.js')}`)
+    // Source bin without tsx and no built bin: unresolvable.
+    const noTsx = tmpDir('guard-layout-')
+    mkdirSync(join(noTsx, 'apps/cli/src'), { recursive: true })
+    writeFileSync(join(noTsx, 'apps/cli/src/bin.ts'), '')
+    expect(resolvePreflightBin(foreignCli(noTsx))).toBeUndefined()
+    // No app at all: unresolvable.
+    expect(resolvePreflightBin(foreignCli(tmpDir('guard-layout-')))).toBeUndefined()
+  })
+
+  it('preflight maps the subprocess verdict onto exit codes', async () => {
+    stubPreflight('true')
+    const pass = io()
+    expect(await runCli(['preflight', '--profile', 'custom', '--timeout-ms', '5000'], pass.io)).toBe(0)
+
+    stubPreflight(`"${process.execPath}" -e "console.error('composition is broken'); process.exit(1)"`)
+    const failed = io()
+    expect(await runCli(['preflight'], failed.io)).toBe(1)
+    expect(failed.err.join('')).toContain('composition is broken')
+
+    stubPreflight(`"${process.execPath}" -e "process.exit(3)"`)
+    const infra = io()
+    expect(await runCli(['preflight'], infra.io)).toBe(3)
+
+    stubPreflight(`"${process.execPath}" -e "process.exit(2)"`)
+    const unexpected = io()
+    expect(await runCli(['preflight'], unexpected.io)).toBe(3)
+    expect(unexpected.err.join('')).toContain('unexpected code 2')
+  })
+
+  it('preflight resolves the profile from $DSH_PROFILE when no flag is given', async () => {
+    stubPreflight('true')
+    const previous = process.env.DSH_PROFILE
+    process.env.DSH_PROFILE = 'envprofile'
+    cleanups.push(() => {
+      if (previous === undefined) delete process.env.DSH_PROFILE
+      else process.env.DSH_PROFILE = previous
+    })
+    expect(await runCli(['preflight'], io().io)).toBe(0)
+  })
+
+  it('an empty DSH_PREFLIGHT_COMMAND falls back to the resolved app bin', async () => {
+    stubPreflight('')
+    stubPreflightBin(() => 'true')
+    const out = io()
+    expect(await runCli(['preflight', '--profile', "it's"], out.io)).toBe(0)
+  })
+
+  it('preflight exits 3 with a clear message when no sibling dsh app exists', async () => {
+    stubPreflight(undefined)
+    stubPreflightBin(() => undefined)
+    const out = io()
+    expect(await runCli(['preflight'], out.io)).toBe(3)
+    expect(out.err.join('')).toContain('preflight unavailable outside the dsh app layout')
+  })
+
+  it('schedule-exit refuses when the composition preflight fails, quoting the diagnostics', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    const lines = Array.from({ length: 50 }, (_, i) => `console.error('layer ${i} failed')`).join(';')
+    stubPreflight(`"${process.execPath}" -e "${lines}; process.exit(1)"`)
+    const out = io()
+    expect(await runCli(
+      ['schedule-exit', '--port', '3099', '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
+      out.io,
+    )).toBe(1)
+    expect(out.err.join('')).toContain('schedule-exit refused: composition preflight failed')
+    expect(out.err.join('')).toContain('layer 0 failed')
+    expect(out.err.join('')).toContain('more lines')
+    expect(out.err.join('')).not.toContain('layer 49 failed')
+  })
+
+  it('schedule-exit refuses with the infrastructure wording when preflight exits 3', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    stubPreflight(`"${process.execPath}" -e "process.exit(3)"`)
+    const out = io()
+    expect(await runCli(
+      ['schedule-exit', '--port', '3099', '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
+      out.io,
+    )).toBe(1)
+    expect(out.err.join('')).toContain('schedule-exit refused: the composition preflight itself failed')
+    expect(out.err.join('')).toContain('NOT a verdict on the composition')
+    expect(out.err.join('')).toContain('manual override')
+  })
+
+  it('schedule-exit refuses when the preflight times out', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    // exec replaces the shell, so the timeout's SIGKILL kills the sleeper itself.
+    stubPreflight('exec sleep 10')
+    const out = io()
+    expect(await runCli(
+      ['schedule-exit', '--port', '3099', '--delay-ms', '100', '--preflight-timeout-ms', '300',
+        '--state-dir', stateDir, '--repo', repo],
+      out.io,
+    )).toBe(1)
+    expect(out.err.join('')).toContain('preflight timed out after 300 ms')
+  }, 15_000)
+
+  it('schedule-exit warns and proceeds when no sibling dsh app exists (standalone layout)', async () => {
+    const repo = makeRepo()
+    const home = tmpDir('guard-home-')
+    const previousHome = process.env.DSH_HOME
+    process.env.DSH_HOME = home
+    cleanups.push(() => {
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+    })
+    await runCli(['record', 'build', '--state-dir', join(home, 'state'), '--repo', repo], io().io)
+    stubPreflight(undefined)
+    stubPreflightBin(() => undefined)
+    const out = io()
+    expect(await runCli(
+      ['schedule-exit', '--port', '3099', '--delay-ms', '60000', '--state-dir', join(home, 'state'), '--repo', repo],
+      out.io,
+    )).toBe(0)
+    expect(out.out.join('')).toContain('preflight unavailable outside the dsh app layout — proceeding without it')
+    expect(out.out.join('')).toContain('exit scheduled')
+  })
+
+  it('restart refuses on a composition preflight failure without stopping the instance', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const server = spawnServer(port, 'old')
+    try {
+      await waitForPort(port)
+      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      stubPreflight('false')
+      const out = io()
+      expect(await runCli(
+        ['restart', '--port', String(port), '--start', 'true', '--state-dir', stateDir, '--repo', repo],
+        out.io,
+      )).toBe(1)
+      expect(out.err.join('')).toContain('restart refused: composition preflight failed')
+      expect(await portListening(port)).toBe(true)
+    } finally {
+      await killListener(port)
+      server.kill('SIGKILL')
+    }
+  })
+
+  it('caps captured preflight output instead of growing without bound', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    stubPreflight(`"${process.execPath}" -e "process.stderr.write('x'.repeat(300000)); process.exit(1)"`)
+    const out = io()
+    expect(await runCli(
+      ['schedule-exit', '--port', '3099', '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
+      out.io,
+    )).toBe(1)
+    // The refusal holds, and the diagnostics are far below the raw 300 KB.
+    expect(out.err.join('')).toContain('composition preflight failed')
+    expect(out.err.join('').length).toBeLessThan(150_000)
+  })
+
+  it('rejects a bad --preflight-timeout-ms', async () => {
+    const err = io()
+    expect(await runCli(['preflight', '--preflight-timeout-ms', '10'], err.io)).toBe(2)
+    expect(err.err.join('')).toContain('--preflight-timeout-ms must be an integer >= 100')
   })
 })
 
@@ -509,6 +766,7 @@ describe('supervise', () => {
     // Green credential in the throwaway state (bound to the throwaway HEAD).
     const rec = io()
     expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', join(env.home, 'state')], rec.io)).toBe(0)
+    stubPreflight('true')
     const host = spawn(process.execPath, ['-e',
       `require('http').createServer((q,s)=>s.end('host')).listen(${port},'127.0.0.1')`],
     { detached: true, stdio: 'ignore' })
@@ -559,6 +817,259 @@ describe('supervise', () => {
       env.restore()
     }
   }, 30_000)
+
+  it('rolls back to the deployment-proven boot stamp, leaving HEAD and WIP anchors', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const stateDir = join(env.home, 'state')
+    mkdirSync(stateDir, { recursive: true })
+    const checkpointSha = currentHead(repo)
+    // Four revisions: checkpoint (oldest) → boot stamp (deployment-proven) →
+    // credential (green build+test, never booted) → the bad HEAD.
+    writeFileSync(join(repo, 'a.txt'), '2')
+    run(repo, ['add', '-A'])
+    run(repo, ['commit', '-qm', 'booted'])
+    const stampSha = currentHead(repo)
+    writeFileSync(join(repo, 'a.txt'), '3')
+    run(repo, ['add', '-A'])
+    run(repo, ['commit', '-qm', 'green'])
+    const greenSha = currentHead(repo)
+    setCheckpoint(stateDir, { revision: checkpointSha ?? '', message: 'old' }, NOW)
+    recordCredential(stateDir, { scope: 'build+test', revision: greenSha ?? '', command: '' }, NOW)
+    writeFileSync(join(stateDir, 'last-good-boot.json'), `${JSON.stringify({ revision: stampSha, at: NOW })}\n`)
+    // A bad commit on top, plus uncommitted work the rollback must not lose.
+    writeFileSync(join(repo, 'a.txt'), '4')
+    run(repo, ['add', '-A'])
+    run(repo, ['commit', '-qm', 'bad'])
+    const badSha = currentHead(repo)
+    writeFileSync(join(repo, 'a.txt'), '4-dirty')
+    try {
+      // Boot failure whose error subject is INSIDE the repo → rollback fires.
+      const startCmd = `"${process.execPath}" -e "console.error('Error: boot failed - cannot load ${join(repo, 'src', 'boom.ts')}');process.exit(1)"`
+      const sup = io()
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        sup.io,
+      )).toBe(0)
+      const logFile = join(env.home, 'state', 'watchdog.log')
+      const deadline = Date.now() + 30_000
+      let log = ''
+      while (Date.now() < deadline) {
+        if (existsSync(logFile)) {
+          log = readFileSync(logFile, 'utf8')
+          if (log.includes('rolling repo back to last known-good') && log.includes('-wip')) break
+        }
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      expect(log).toContain(`rolling repo back to last known-good ${stampSha}`)
+      expect(log).toContain('recovery anchor: branch')
+      // The stamp beats both the older checkpoint and the newer (never-booted)
+      // credential: it is the last revision that actually came up.
+      expect(currentHead(repo)).toBe(stampSha)
+      const branches = execFileSync('git', ['branch', '--list', 'guard-backup-*'], { cwd: repo, encoding: 'utf8' })
+        .split('\n').map(branch => branch.trim()).filter(branch => branch !== '')
+      const headAnchor = branches.find(branch => !branch.endsWith('-wip'))
+      const wipAnchor = branches.find(branch => branch.endsWith('-wip'))
+      expect(headAnchor).toBeDefined()
+      expect(wipAnchor).toBeDefined()
+      // The HEAD anchor keeps the discarded commit; the WIP anchor keeps the
+      // uncommitted worktree state (git stash create snapshots it).
+      expect(execFileSync('git', ['rev-parse', headAnchor ?? ''], { cwd: repo, encoding: 'utf8' }).trim()).toBe(badSha)
+      expect(execFileSync('git', ['show', `${wipAnchor}:a.txt`], { cwd: repo, encoding: 'utf8' })).toBe('4-dirty')
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
+
+  it('falls back to the pre-batch checkpoint when no boot stamp exists', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const stateDir = join(env.home, 'state')
+    mkdirSync(stateDir, { recursive: true })
+    const checkpointSha = currentHead(repo)
+    commitChange(repo)
+    const greenSha = currentHead(repo)
+    setCheckpoint(stateDir, { revision: checkpointSha ?? '', message: 'old' }, NOW)
+    recordCredential(stateDir, { scope: 'build+test', revision: greenSha ?? '', command: '' }, NOW)
+    try {
+      const startCmd = `"${process.execPath}" -e "console.error('Error: boot failed - cannot load ${join(repo, 'src', 'boom.ts')}');process.exit(1)"`
+      const sup = io()
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        sup.io,
+      )).toBe(0)
+      const logFile = join(env.home, 'state', 'watchdog.log')
+      const deadline = Date.now() + 30_000
+      let log = ''
+      while (Date.now() < deadline) {
+        if (existsSync(logFile)) {
+          log = readFileSync(logFile, 'utf8')
+          // The anchor line prints after the reset completes — the barrier
+          // that makes the HEAD assertion below race-free.
+          if (log.includes('rolling repo back to last known-good') && log.includes('recovery anchor')) break
+        }
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      // No stamp: the checkpoint (pre-batch) outranks the credential, whose
+      // green HEAD is exactly what failed to boot.
+      expect(log).toContain(`rolling repo back to last known-good ${checkpointSha}`)
+      expect(currentHead(repo)).toBe(checkpointSha)
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
+
+  it('skips the repository rollback when the boot failure originates outside the repo', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const stateDir = join(env.home, 'state')
+    mkdirSync(stateDir, { recursive: true })
+    const head = currentHead(repo)
+    recordCredential(stateDir, { scope: 'build+test', revision: head ?? '', command: '' }, NOW)
+    try {
+      // The incident shape: node's uncaught-exception printout leads with the
+      // throw site (a path INSIDE the repo — the parser), while the Error
+      // message line names the offending path OUTSIDE it (a profile overlay).
+      // The classifier must follow the Error line, not the preamble.
+      const outside = join(env.home, 'profiles', 'web', 'node_modules', '@x', 'cordis.patch.yml')
+      const throwSite = join(repo, 'packages', 'boot', 'app-boot', 'src', 'index.ts')
+      const output = [
+        `${throwSite}:327`,
+        '    throw new Error(`failed to parse ${file}`)',
+        '          ^',
+        '',
+        `Error: dsh: failed to parse overlay ${outside}: YAMLException: bad indentation of a mapping entry (9:13)`,
+        `    at parsePatchList (${throwSite}:327:11)`,
+        '',
+      ].join('\n')
+      const boom = join(env.home, 'boom.js')
+      writeFileSync(boom, `console.error(${JSON.stringify(output)});process.exit(1)\n`)
+      const startCmd = `"${process.execPath}" "${boom}"`
+      const sup = io()
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        sup.io,
+      )).toBe(0)
+      const logFile = join(env.home, 'state', 'watchdog.log')
+      const deadline = Date.now() + 30_000
+      let log = ''
+      while (Date.now() < deadline) {
+        if (existsSync(logFile)) {
+          log = readFileSync(logFile, 'utf8')
+          if (log.includes('originates outside')) break
+        }
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      expect(log).toContain(`boot failure originates outside ${repo} — repository rollback cannot fix it`)
+      // The checkout is untouched: HEAD unchanged, no backup branches created.
+      expect(currentHead(repo)).toBe(head)
+      expect(execFileSync('git', ['branch', '--list', 'guard-backup-*'], { cwd: repo, encoding: 'utf8' }).trim()).toBe('')
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
+
+  it('treats EADDRINUSE as a port race: frees the port and retries without counting toward rollback or give-up', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const stateDir = join(env.home, 'state')
+    mkdirSync(stateDir, { recursive: true })
+    const head = currentHead(repo)
+    recordCredential(stateDir, { scope: 'build+test', revision: head ?? '', command: '' }, NOW)
+    // Five consecutive EADDRINUSE attempts before the instance binds: if they
+    // counted as boot failures, #2 would roll the repo back and #4 would give
+    // up — reaching 'new' proves neither happened.
+    const counter = join(env.home, 'attempts')
+    const boom = join(env.home, 'eaddr.js')
+    writeFileSync(boom, `
+      const fs = require('node:fs')
+      const count = fs.existsSync(${JSON.stringify(counter)}) ? Number(fs.readFileSync(${JSON.stringify(counter)}, 'utf8')) : 0
+      fs.writeFileSync(${JSON.stringify(counter)}, String(count + 1))
+      if (count < 5) {
+        console.error('Error: listen EADDRINUSE: address already in use 127.0.0.1:${port}')
+        process.exit(1)
+      }
+      require('node:http').createServer((q, s) => s.end('new')).listen(${port}, '127.0.0.1')
+    `)
+    try {
+      const startCmd = `"${process.execPath}" "${boom}"`
+      const sup = io()
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        sup.io,
+      )).toBe(0)
+      const deadline = Date.now() + 20_000
+      let body = ''
+      while (Date.now() < deadline) {
+        try {
+          body = await fetchBody(port)
+          if (body === 'new') break
+        } catch { /* not up yet */ }
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      expect(body).toBe('new')
+      const log = readFileSync(join(env.home, 'state', 'watchdog.log'), 'utf8')
+      expect(log).toContain('boot hit EADDRINUSE')
+      expect(log).not.toContain('rolling repo back')
+      expect(log).not.toContain('giving up')
+      expect(currentHead(repo)).toBe(head)
+      expect(existsSync(join(env.home, 'state', 'watchdog-gave-up'))).toBe(false)
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 30_000)
+
+  it('skips the reset when the rollback target already is HEAD — uncommitted work survives', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const stateDir = join(env.home, 'state')
+    mkdirSync(stateDir, { recursive: true })
+    // No stamp, no credential: the chain falls to the checkpoint, which IS
+    // the current HEAD — the reset would only wipe the dirty tree.
+    const head = currentHead(repo)
+    setCheckpoint(stateDir, { revision: head ?? '', message: 'pre' }, NOW)
+    writeFileSync(join(repo, 'a.txt'), 'someone-elses-dirty-work')
+    try {
+      const startCmd = `"${process.execPath}" -e "console.error('Error: boot failed - cannot load ${join(repo, 'src', 'boom.ts')}');process.exit(1)"`
+      const sup = io()
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        sup.io,
+      )).toBe(0)
+      const logFile = join(env.home, 'state', 'watchdog.log')
+      const deadline = Date.now() + 30_000
+      let log = ''
+      while (Date.now() < deadline) {
+        if (existsSync(logFile)) {
+          log = readFileSync(logFile, 'utf8')
+          if (log.includes('skipping reset')) break
+        }
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      expect(log).toContain(`rollback target ${head} is the current HEAD — skipping reset`)
+      expect(log).not.toContain('rolling repo back')
+      expect(readFileSync(join(repo, 'a.txt'), 'utf8')).toBe('someone-elses-dirty-work')
+      expect(currentHead(repo)).toBe(head)
+      expect(execFileSync('git', ['branch', '--list', 'guard-backup-*'], { cwd: repo, encoding: 'utf8' }).trim()).toBe('')
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
 })
 
 describe('restart context injection', () => {
@@ -629,268 +1140,352 @@ describe('restart context injection', () => {
     await fiber.dispose()
   })
 
-  it('falls back to any root agent when the initiator session is gone', async () => {
+  it('stays silent for other sessions while the initiator is absent; the owner reports whenever it resumes', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-ctx-')
+    const initiatorId = 'session-initiator'
     writeFileSync(join(stateDir, 'last-restart.json'),
-      JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: 'session-gone' }))
-    const followup = vi.fn()
-    const agent = { id: 'session-live', followup } as never
+      JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: initiatorId }))
+    const otherFollowup = vi.fn()
+    const initiatorFollowup = vi.fn()
+    const otherAgent = { id: 'session-other', followup: otherFollowup } as never
+    const initiatorAgent = { id: initiatorId, followup: initiatorFollowup } as never
     const ctx = new Context()
     await ctx.plugin(Loader)
+    let liveAgents: unknown[] = [otherAgent]
     ctx.provide('agents', {
-      roots: () => [agent],
-      list: () => [agent],
+      roots: () => liveAgents,
+      list: () => liveAgents,
     } as never)
-    // The initiator is absent from persistence: fall back immediately, no grace wait.
-    ctx.provide('sessionPersistence', { list: async () => [] } as never)
     const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
     await fiber.await()
-    ctx.emit('agent/created', { agent })
-    await Promise.resolve() // let the async persistence check settle
-    expect(followup).toHaveBeenCalledTimes(1)
+    // A non-initiator root resuming first is never woken for reporting; the
+    // record simply stays pending — restore is lazy, so no fallback can race.
+    ctx.emit('agent/created', { agent: otherAgent })
+    expect(otherFollowup).not.toHaveBeenCalled()
+    expect(pendingRestartRecord(stateDir)).not.toBeNull()
+    // The owner resumes much later — no grace window, no fallback — and
+    // still receives the full report, settling the record.
+    liveAgents = [otherAgent, initiatorAgent]
+    ctx.emit('agent/created', { agent: initiatorAgent })
+    expect(initiatorFollowup).toHaveBeenCalledTimes(1)
+    const text = (initiatorFollowup.mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]!.text
+    expect(text).toContain('请向用户简要回报')
+    expect(text).toContain(new Date(1_700_000_000_000).toISOString())
     expect(pendingRestartRecord(stateDir)).toBeNull()
     await fiber.dispose()
   })
 
-  it('does not double-claim when the initiator claims while the persistence list is in flight', async () => {
-    vi.useFakeTimers()
-    try {
-      const repo = makeRepo()
-      const stateDir = tmpDir('guard-ctx-')
-      const initiatorId = 'session-init'
-      const otherId = 'session-other'
-      writeFileSync(join(stateDir, 'last-restart.json'),
-        JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: initiatorId }))
-      const otherFollowup = vi.fn()
-      const initiatorFollowup = vi.fn()
-      const otherAgent = { id: otherId, followup: otherFollowup } as never
-      const initiatorAgent = { id: initiatorId, followup: initiatorFollowup } as never
-      const ctx = new Context()
-      await ctx.plugin(Loader)
-      let liveAgents: unknown[] = [otherAgent]
-      ctx.provide('agents', {
-        roots: () => liveAgents,
-        list: () => liveAgents,
-      } as never)
-      // A deferred list: the resolution arrives only after the initiator has
-      // claimed, so the stale `.then` must re-check the record identity.
-      let resolveList!: (sessions: Array<{ id: string }>) => void
-      ctx.provide('sessionPersistence', { list: () => new Promise((resolve) => { resolveList = resolve }) } as never)
-      const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, fallbackGraceMs: 10_000 })
-      await fiber.await()
-      // Non-initiator resumes first; the persistence check is now in flight.
-      ctx.emit('agent/created', { agent: otherAgent })
-      await Promise.resolve()
-      // The initiator resumes and claims while list() is unresolved.
-      liveAgents = [otherAgent, initiatorAgent]
-      ctx.emit('agent/created', { agent: initiatorAgent })
-      await Promise.resolve()
-      expect(initiatorFollowup).toHaveBeenCalledTimes(1)
-      expect(otherFollowup).not.toHaveBeenCalled()
-      expect(pendingRestartRecord(stateDir)).toBeNull()
-      // Now the stale list resolution lands: it must NOT claim again.
-      resolveList([])
-      await Promise.resolve()
-      expect(initiatorFollowup).toHaveBeenCalledTimes(1)
-      expect(otherFollowup).not.toHaveBeenCalled()
-      await fiber.dispose()
-    } finally {
-      vi.useRealTimers()
+  it('snapshots running root sessions on SIGTERM; disposal removes the listener', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({ initiator: 'session-init' }))
+    const running = { id: 'session-busy', status: 'running', followup: vi.fn() }
+    const idle = { id: 'session-idle', status: 'idle', followup: vi.fn() }
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    ctx.provide('agents', { roots: () => [running, idle], list: () => [running, idle] } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
+    await fiber.await()
+    process.emit('SIGTERM')
+    const snapshot = JSON.parse(readFileSync(join(stateDir, 'interrupted-sessions.json'), 'utf8')) as {
+      resume: string[]
+      interrupted: string[]
     }
+    // Only the live turn is interrupted; the restart's initiator rides along
+    // so the report's owner is resumed even when its own turn had finished.
+    expect(snapshot.interrupted).toEqual(['session-busy'])
+    expect(snapshot.resume).toEqual(['session-init'])
+    await fiber.dispose()
+    // Disposal removed the signal listener: a later SIGTERM snapshots nothing.
+    unlinkSync(join(stateDir, 'interrupted-sessions.json'))
+    process.emit('SIGTERM')
+    expect(existsSync(join(stateDir, 'interrupted-sessions.json'))).toBe(false)
   })
 
-  it('re-arms the grace timer for a record replaced during a pending window', async () => {
-    vi.useFakeTimers()
-    try {
-      const repo = makeRepo()
-      const stateDir = tmpDir('guard-ctx-')
-      const initiatorId = 'session-init'
-      const otherId = 'session-other'
-      const otherFollowup = vi.fn()
-      const otherAgent = { id: otherId, followup: otherFollowup } as never
-      const ctx = new Context()
-      await ctx.plugin(Loader)
-      const liveAgents: unknown[] = [otherAgent]
-      ctx.provide('agents', {
-        roots: () => liveAgents,
-        list: () => liveAgents,
-      } as never)
-      ctx.provide('sessionPersistence', { list: async () => [{ id: initiatorId }] } as never)
-      const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, fallbackGraceMs: 10_000 })
-      await fiber.await()
-      // Restart 1 arms the timer for the first record.
-      writeFileSync(join(stateDir, 'last-restart.json'),
-        JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: initiatorId }))
-      ctx.emit('agent/created', { agent: otherAgent })
-      await Promise.resolve()
-      expect(otherFollowup).not.toHaveBeenCalled()
-      // Halfway through the window, restart 2 replaces the record. Its own
-      // created event cannot arm a second timer (the singleton guard), so the
-      // first timer must re-arm the new record when it fires and finds the
-      // identity changed.
-      writeFileSync(join(stateDir, 'last-restart.json'),
-        JSON.stringify({ exitAt: 1_700_000_000_001, pid: 9, initiator: initiatorId }))
-      ctx.emit('agent/created', { agent: otherAgent })
-      await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(10_000) // old timer fires, identity mismatch → re-arms new record
-      expect(otherFollowup).not.toHaveBeenCalled() // new record still inside its fresh window
-      await vi.advanceTimersByTimeAsync(10_000) // re-armed timer expires → fallback
-      expect(otherFollowup).toHaveBeenCalledTimes(1)
-      expect(pendingRestartRecord(stateDir)).toBeNull()
-      await fiber.dispose()
-    } finally {
-      vi.useRealTimers()
+  it('resumes interrupted sessions on a restart boot: the owner gets the report, the interrupted get continue', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    // Restart-boot markers: a pending restart record plus the SIGTERM snapshot.
+    writeFileSync(join(stateDir, 'last-restart.json'),
+      JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: 'session-init' }))
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now(), resume: ['session-init'], interrupted: ['session-busy'] }))
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const resumed: string[] = []
+    const resumeOptions = new Map<string, { agentOptions?: unknown; setup?: (agentCtx: never) => Promise<void> }>()
+    const followups = new Map<string, ReturnType<typeof vi.fn>>()
+    const liveAgents: Array<{ id: string; status: string; followup: ReturnType<typeof vi.fn> }> = []
+    ctx.provide('agents', {
+      roots: () => liveAgents,
+      list: () => liveAgents,
+      resume: async (options: { resumeSessionId: string; agentOptions?: unknown; setup?: (agentCtx: never) => Promise<void> }) => {
+        const id = options.resumeSessionId
+        resumed.push(id)
+        resumeOptions.set(id, options)
+        const agent = { id, status: 'idle', followup: vi.fn() }
+        followups.set(id, agent.followup)
+        liveAgents.push(agent)
+        ctx.emit('agent/created', { agent } as never)
+        return agent
+      },
+    } as never)
+    // The composition services a faithful resume consults.
+    ctx.provide('agentDefaultModel', { currentSelection: () => ({ provider: 'deepseek', model: 'v4' }) } as never)
+    const mount = vi.fn()
+    ctx.provide('agentPresets', {
+      resolve: async (presetId?: string) => ({ id: presetId ?? 'default' }),
+      mount,
+    } as never)
+    ctx.provide('sessionPersistence', {
+      inspect: async (id: string) => ({ meta: { agentPreset: `preset-of-${id}` }, events: [] }),
+    } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 1 })
+    await fiber.await()
+    const deadline = Date.now() + 5000
+    while (resumed.length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 20) })
     }
+    expect([...resumed].sort()).toEqual(['session-busy', 'session-init'])
+    // Faithful composition: the default model selection seeds agentOptions
+    // (without it the persona's {{model}} interpolation fails every turn),
+    // and setup mounts the session's stored preset (resolved from the log).
+    expect(resumeOptions.get('session-busy')?.agentOptions).toEqual({ provider: 'deepseek', model: 'v4' })
+    const setup = resumeOptions.get('session-busy')?.setup
+    expect(setup).toBeTypeOf('function')
+    await setup!({} as never)
+    expect(mount).toHaveBeenCalledWith({}, 'preset-of-session-busy')
+    // The report's owner received the full report (its created event claimed it).
+    expect(followups.get('session-init')).toHaveBeenCalledTimes(1)
+    const report = (followups.get('session-init')!.mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]!.text
+    expect(report).toContain('请向用户简要回报')
+    // The interrupted session received the continue prompt, not the report.
+    expect(followups.get('session-busy')).toHaveBeenCalledTimes(1)
+    const cont = (followups.get('session-busy')!.mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]!.text
+    expect(cont).toContain('被中断')
+    expect(cont).toContain('继续未完成的任务')
+    expect(cont).not.toContain('请向用户简要回报')
+    // The snapshot is consumed: a later boot does not replay it.
+    expect(existsSync(join(stateDir, 'interrupted-sessions.json'))).toBe(false)
+    await fiber.dispose()
   })
 
-  it('waits out the grace window when the initiator is persisted but slow to resume', async () => {
-    vi.useFakeTimers()
-    try {
-      const repo = makeRepo()
-      const stateDir = tmpDir('guard-ctx-')
-      const initiatorId = 'session-init'
-      const otherId = 'session-other'
-      writeFileSync(join(stateDir, 'last-restart.json'),
-        JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: initiatorId }))
-      const otherFollowup = vi.fn()
-      const initiatorFollowup = vi.fn()
-      const otherAgent = { id: otherId, followup: otherFollowup } as never
-      const initiatorAgent = { id: initiatorId, followup: initiatorFollowup } as never
-      const ctx = new Context()
-      await ctx.plugin(Loader)
-      let liveAgents: unknown[] = [otherAgent]
-      ctx.provide('agents', {
-        roots: () => liveAgents,
-        list: () => liveAgents,
-      } as never)
-      ctx.provide('sessionPersistence', { list: async () => [{ id: initiatorId }] } as never)
-      const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, fallbackGraceMs: 10_000 })
-      await fiber.await()
-      // Non-initiator resumes first: within the grace window it must NOT claim.
-      ctx.emit('agent/created', { agent: otherAgent })
-      await Promise.resolve()
-      expect(otherFollowup).not.toHaveBeenCalled()
-      expect(initiatorFollowup).not.toHaveBeenCalled()
-      // The initiator resumes inside the window: its own creation claims it.
-      liveAgents = [otherAgent, initiatorAgent]
-      ctx.emit('agent/created', { agent: initiatorAgent })
-      await Promise.resolve()
-      expect(initiatorFollowup).toHaveBeenCalledTimes(1)
-      expect(otherFollowup).not.toHaveBeenCalled()
-      expect(pendingRestartRecord(stateDir)).toBeNull()
-      await fiber.dispose()
-    } finally {
-      vi.useRealTimers()
+  it('merges continue and report into ONE message when the initiator was itself interrupted', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    writeFileSync(join(stateDir, 'last-restart.json'),
+      JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: 'session-init' }))
+    // The initiator's own turn was still running when its scheduled exit fired.
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now(), resume: ['session-init'], interrupted: ['session-init'] }))
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const liveAgents: Array<{ id: string; status: string; followup: ReturnType<typeof vi.fn> }> = []
+    ctx.provide('agents', {
+      roots: () => liveAgents,
+      list: () => liveAgents,
+      resume: async (options: { resumeSessionId: string }) => {
+        const agent = { id: options.resumeSessionId, status: 'idle', followup: vi.fn() }
+        liveAgents.push(agent)
+        ctx.emit('agent/created', { agent } as never)
+        return agent
+      },
+    } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 1 })
+    await fiber.await()
+    const deadline = Date.now() + 5000
+    while (liveAgents.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 20) })
     }
+    // Exactly one injection carrying both purposes; the record settles.
+    expect(liveAgents[0]?.followup).toHaveBeenCalledTimes(1)
+    const text = (liveAgents[0]!.followup.mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]!.text
+    expect(text).toContain('继续未完成的任务')
+    expect(text).toContain('向用户简要回报本次重启结果')
+    expect(text).toContain(new Date(1_700_000_000_000).toISOString())
+    expect(pendingRestartRecord(stateDir)).toBeNull()
+    await fiber.dispose()
   })
 
-  it('falls back to the first live root agent once the grace window elapses', async () => {
-    vi.useFakeTimers()
-    try {
-      const repo = makeRepo()
-      const stateDir = tmpDir('guard-ctx-')
-      const initiatorId = 'session-init'
-      writeFileSync(join(stateDir, 'last-restart.json'),
-        JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: initiatorId }))
-      const followup = vi.fn()
-      const agent = { id: 'session-live', followup } as never
-      const ctx = new Context()
-      await ctx.plugin(Loader)
-      ctx.provide('agents', {
-        roots: () => [agent],
-        list: () => [agent],
-      } as never)
-      ctx.provide('sessionPersistence', { list: async () => [{ id: initiatorId }] } as never)
-      const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, fallbackGraceMs: 10_000 })
-      await fiber.await()
-      ctx.emit('agent/created', { agent })
-      await Promise.resolve()
-      expect(followup).not.toHaveBeenCalled()
-      // Elapse the grace window: the initiator never resumed, so fall back.
-      await vi.advanceTimersByTimeAsync(10_000)
-      expect(followup).toHaveBeenCalledTimes(1)
-      expect(pendingRestartRecord(stateDir)).toBeNull()
-      await fiber.dispose()
-    } finally {
-      vi.useRealTimers()
+  it('injects continue exactly once into an already-live interrupted session (reactivated by UI/schedule)', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({}))
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now(), resume: [], interrupted: ['session-busy'] }))
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const busy = { id: 'session-busy', status: 'idle', followup: vi.fn() }
+    const resume = vi.fn()
+    ctx.provide('agents', {
+      roots: () => [busy],
+      list: () => [busy],
+      resume,
+    } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 1 })
+    await fiber.await()
+    const deadline = Date.now() + 5000
+    while (busy.followup.mock.calls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 20) })
     }
+    // Already live (the user reopened it, or a reminder woke it): no resume
+    // needed, but the continue injection still lands — exactly once.
+    expect(resume).not.toHaveBeenCalled()
+    expect(busy.followup).toHaveBeenCalledTimes(1)
+    const cont = (busy.followup.mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]!.text
+    expect(cont).toContain('继续未完成的任务')
+    expect(existsSync(join(stateDir, 'interrupted-sessions.json'))).toBe(false)
+    await fiber.dispose()
   })
 
-  it('does not let a stale grace timer ack a newer restart record', async () => {
-    vi.useFakeTimers()
-    try {
-      const repo = makeRepo()
-      const stateDir = tmpDir('guard-ctx-')
-      const initiatorId = 'session-init'
-      writeFileSync(join(stateDir, 'last-restart.json'),
-        JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: initiatorId }))
-      const followup = vi.fn()
-      const agent = { id: 'session-live', followup } as never
-      const ctx = new Context()
-      await ctx.plugin(Loader)
-      ctx.provide('agents', {
-        roots: () => [agent],
-        list: () => [agent],
-      } as never)
-      ctx.provide('sessionPersistence', { list: async () => [{ id: initiatorId }] } as never)
-      const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, fallbackGraceMs: 10_000 })
-      await fiber.await()
-      ctx.emit('agent/created', { agent })
-      await Promise.resolve()
-      expect(followup).not.toHaveBeenCalled()
-      // A second restart replaces the record with a new exitAt while the
-      // first timer is pending: the stale timer must not ack the new record.
-      writeFileSync(join(stateDir, 'last-restart.json'),
-        JSON.stringify({ exitAt: 1_700_000_000_001, pid: 9, initiator: initiatorId }))
-      await vi.advanceTimersByTimeAsync(10_000)
-      expect(followup).not.toHaveBeenCalled()
-      expect(pendingRestartRecord(stateDir)).not.toBeNull()
-      await fiber.dispose()
-    } finally {
-      vi.useRealTimers()
+  it('honors a fresh snapshot even without restart markers (a quick manual stop/start rescues too)', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    // No restart marker, no pending record: freshness is the only gate.
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now(), resume: [], interrupted: ['session-busy'] }))
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const resumed: string[] = []
+    const liveAgents: Array<{ id: string; status: string; followup: ReturnType<typeof vi.fn> }> = []
+    ctx.provide('agents', {
+      roots: () => liveAgents,
+      list: () => liveAgents,
+      resume: async (options: { resumeSessionId: string }) => {
+        resumed.push(options.resumeSessionId)
+        const agent = { id: options.resumeSessionId, status: 'idle', followup: vi.fn() }
+        liveAgents.push(agent)
+        ctx.emit('agent/created', { agent } as never)
+        return agent
+      },
+    } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 1 })
+    await fiber.await()
+    const deadline = Date.now() + 5000
+    while (resumed.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 20) })
     }
+    expect(resumed).toEqual(['session-busy'])
+    expect(existsSync(join(stateDir, 'interrupted-sessions.json'))).toBe(false)
+    await fiber.dispose()
   })
 
-  it('leaves the record for the next creation when no root agent is live at grace expiry', async () => {
-    vi.useFakeTimers()
-    try {
-      const repo = makeRepo()
-      const stateDir = tmpDir('guard-ctx-')
-      const initiatorId = 'session-init'
-      writeFileSync(join(stateDir, 'last-restart.json'),
-        JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: initiatorId }))
-      const followup = vi.fn()
-      const agent = { id: 'session-live', followup } as never
-      const ctx = new Context()
-      await ctx.plugin(Loader)
-      let liveAgents: unknown[] = []
-      ctx.provide('agents', {
-        roots: () => liveAgents,
-        list: () => liveAgents,
-      } as never)
-      ctx.provide('sessionPersistence', { list: async () => [{ id: initiatorId }] } as never)
-      const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, fallbackGraceMs: 10_000 })
-      await fiber.await()
-      // Resume the only root agent, then drop it before the grace elapses.
-      liveAgents = [agent]
-      ctx.emit('agent/created', { agent })
-      await Promise.resolve()
-      liveAgents = []
-      await vi.advanceTimersByTimeAsync(10_000)
-      expect(followup).not.toHaveBeenCalled()
-      expect(pendingRestartRecord(stateDir)).not.toBeNull()
-      // A later creation arms the window again and claims on expiry.
-      liveAgents = [agent]
-      ctx.emit('agent/created', { agent })
-      await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(10_000)
-      expect(followup).toHaveBeenCalledTimes(1)
-      expect(pendingRestartRecord(stateDir)).toBeNull()
-      await fiber.dispose()
-    } finally {
-      vi.useRealTimers()
+  it('resumes even when the canary cleared the restart marker before the delayed pass ran', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    // The marker exists at plugin apply (boot), but the watchdog's canary
+    // clears it as soon as the instance is healthy — seconds before the
+    // delayed resume pass evaluates its gate. The gate is captured at apply.
+    writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({}))
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now(), resume: [], interrupted: ['session-busy'] }))
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const resumed: string[] = []
+    const liveAgents: Array<{ id: string; status: string; followup: ReturnType<typeof vi.fn> }> = []
+    ctx.provide('agents', {
+      roots: () => liveAgents,
+      list: () => liveAgents,
+      resume: async (options: { resumeSessionId: string }) => {
+        resumed.push(options.resumeSessionId)
+        const agent = { id: options.resumeSessionId, status: 'idle', followup: vi.fn() }
+        liveAgents.push(agent)
+        ctx.emit('agent/created', { agent } as never)
+        return agent
+      },
+    } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 20 })
+    await fiber.await()
+    // The canary clears the marker before the pass fires.
+    unlinkSync(join(stateDir, 'restart-requested.json'))
+    const deadline = Date.now() + 5000
+    while (resumed.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 20) })
     }
+    expect(resumed).toEqual(['session-busy'])
+    expect(liveAgents[0]?.followup).toHaveBeenCalledTimes(1)
+    await fiber.dispose()
+  })
+
+  it('drops a stale snapshot even on a restart boot (manual stop/start hours later)', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({}))
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now() - 20 * 60_000, resume: [], interrupted: ['session-busy'] }))
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const resume = vi.fn()
+    ctx.provide('agents', { roots: () => [], list: () => [], resume } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 1 })
+    await fiber.await()
+    const deadline = Date.now() + 5000
+    while (existsSync(join(stateDir, 'interrupted-sessions.json')) && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 20) })
+    }
+    expect(resume).not.toHaveBeenCalled()
+    expect(existsSync(join(stateDir, 'interrupted-sessions.json'))).toBe(false)
+    await fiber.dispose()
+  })
+
+  it('resumeInterrupted: off skips the resume pass and keeps the snapshot', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({}))
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now(), resume: [], interrupted: ['session-busy'] }))
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const resume = vi.fn()
+    ctx.provide('agents', { roots: () => [], list: () => [], resume } as never)
+    const fiber = ctx.plugin(selfRestartGuard,
+      { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeInterrupted: false, resumeDelayMs: 1 })
+    await fiber.await()
+    await new Promise((resolve) => { setTimeout(resolve, 100) })
+    expect(resume).not.toHaveBeenCalled()
+    expect(existsSync(join(stateDir, 'interrupted-sessions.json'))).toBe(true)
+    await fiber.dispose()
+  })
+
+  it('a second restart replaces the record; the new record reports to its own initiator', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    writeFileSync(join(stateDir, 'last-restart.json'),
+      JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9, initiator: 'session-a' }))
+    const aFollowup = vi.fn()
+    const bFollowup = vi.fn()
+    const otherFollowup = vi.fn()
+    const aAgent = { id: 'session-a', followup: aFollowup } as never
+    const bAgent = { id: 'session-b', followup: bFollowup } as never
+    const otherAgent = { id: 'session-other', followup: otherFollowup } as never
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const liveAgents: unknown[] = [otherAgent]
+    ctx.provide('agents', {
+      roots: () => liveAgents,
+      list: () => liveAgents,
+    } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
+    await fiber.await()
+    ctx.emit('agent/created', { agent: otherAgent })
+    expect(otherFollowup).not.toHaveBeenCalled()
+    // A second restart replaces the record (new exitAt, new initiator).
+    writeFileSync(join(stateDir, 'last-restart.json'),
+      JSON.stringify({ exitAt: 1_700_000_000_500, pid: 10, initiator: 'session-b' }))
+    // A's initiator resumes: the replaced record is not its record — silence.
+    liveAgents.push(aAgent)
+    ctx.emit('agent/created', { agent: aAgent })
+    expect(aFollowup).not.toHaveBeenCalled()
+    // B's initiator resumes: it claims B's facts and settles the record.
+    liveAgents.push(bAgent)
+    ctx.emit('agent/created', { agent: bAgent })
+    expect(bFollowup).toHaveBeenCalledTimes(1)
+    const text = (bFollowup.mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]!.text
+    expect(text).toContain(new Date(1_700_000_000_500).toISOString())
+    expect(text).toContain('请向用户简要回报')
+    expect(pendingRestartRecord(stateDir)).toBeNull()
+    await fiber.dispose()
   })
 
   it('reports a pending restart record and acknowledges it after one injection', () => {

@@ -3,11 +3,16 @@
 #
 # Owns a TCP port, respawns the host when it dies (including intentional
 # self-restarts), runs the self-restart-guard canary on intentional restarts,
-# rolls back to the guard checkpoint when the instance repeatedly fails to
-# come up, and serves a crash page with a retry button when it gives up. The
-# enforcement point of the restart-safety mechanism lives here, outside the
-# protected process — spawned detached (setsid) by the guard CLI's `supervise`
-# verb or by a launcher, never by hand in normal operation.
+# rolls the repository back to the last known-good revision (the healthy-boot
+# stamp — deployment-proven — else the guard checkpoint, else the green
+# credential's HEAD) when the instance repeatedly fails to come up — leaving
+# guard-backup-* branches on the discarded HEAD and uncommitted work — and
+# serves a crash page with a retry button when it gives up. A boot failure
+# whose error subject is a path outside the repository skips the rollback:
+# reverting the checkout cannot fix a broken profile overlay or installed
+# plugin. The enforcement point of the restart-safety mechanism lives here,
+# outside the protected process — spawned detached (setsid) by the guard CLI's
+# `supervise` verb or by a launcher, never by hand in normal operation.
 #
 # Everything is parameterized by environment (the guard CLI's `supervise` verb
 # sets these); nothing here is machine-specific:
@@ -38,6 +43,7 @@ GIVE_UP_MARKER="$DSH_ROOT/state/watchdog-gave-up"
 RESTART_MARKER="$DSH_ROOT/state/restart-requested.json"
 STOP_MARKER="$DSH_ROOT/state/watchdog-stop"
 PIDFILE="$DSH_ROOT/state/watchdog.pid"
+ATTEMPT_LOG="$DSH_ROOT/state/boot-attempt.log"
 
 [ -n "$DSH_ROOT" ] || { echo "[watchdog] WD_HOME or DSH_HOME must be set" >&2; exit 1; }
 export DSH_HOME="$DSH_ROOT"
@@ -70,8 +76,76 @@ free_port() {
   fi
 }
 
-checkpoint_sha() {
-  node -e "try{const s=require('$DSH_ROOT/state/self-restart-guard.json');process.stdout.write(s.checkpoint?.revision??'')}catch{}" 2>/dev/null
+# The rollback target: the last DEPLOYMENT-PROVEN revision (stamped by this
+# watchdog on every healthy boot — a green credential proves build+test
+# passed, never that the deployment composes and the instance comes up),
+# falling back to the guard checkpoint, then the credential's HEAD.
+# The reset itself (guard CLI) leaves guard-backup-* recovery anchors for the
+# discarded HEAD and any uncommitted work, so recovery never needs the reflog.
+rollback_sha() {
+  node -e "
+    const fs = require('fs')
+    let sha = ''
+    try {
+      const boot = JSON.parse(fs.readFileSync('$DSH_ROOT/state/last-good-boot.json', 'utf8'))
+      if (typeof boot.revision === 'string' && boot.revision !== '') sha = boot.revision
+    } catch {}
+    if (sha === '') {
+      try {
+        const s = require('$DSH_ROOT/state/self-restart-guard.json')
+        sha = s.checkpoint?.revision ?? s.credential?.revision ?? ''
+      } catch {}
+    }
+    process.stdout.write(sha)
+  " 2>/dev/null
+}
+
+# A healthy boot proves the current HEAD runs in this deployment: stamp it as
+# the preferred rollback target.
+stamp_last_good_boot() {
+  [ -n "$REPO" ] || return 0
+  local sha
+  sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null) || return 0
+  [ -n "$sha" ] || return 0
+  printf '{"revision":"%s","at":%s}\n' "$sha" "$(date +%s)000" > "$DSH_ROOT/state/last-good-boot.json"
+}
+
+# Roll back to a known-good revision — unless that revision already IS HEAD:
+# the reset would be a commit no-op whose only effect is wiping uncommitted
+# work (a real hazard with concurrent sessions on a shared checkout), so skip
+# it. Returns 1 when the reset was skipped, so the boot-failure path keeps
+# counting toward give-up instead of retrying a boot that cannot change.
+rollback_to() {
+  local sha="$1" head
+  head=$(git -C "$REPO" rev-parse HEAD 2>/dev/null)
+  if [ -n "$head" ] && [ "$sha" = "$head" ]; then
+    echo "[watchdog] rollback target $sha is the current HEAD — skipping reset (nothing to roll back; a reset would only wipe uncommitted work)"
+    return 1
+  fi
+  echo "[watchdog] rolling repo back to last known-good $sha"
+  guard_reset "$sha"
+}
+
+# Where did the boot failure originate? The error's subject is the first
+# absolute path on the `Error:` message line of the attempt log. Node's
+# uncaught-exception printout leads with the THROW SITE (a repo-internal path
+# naming the parser, not the cause) and follows with `    at ` stack frames,
+# so the message line is the only reliable carrier of the offending path; the
+# non-frame scan is the fallback for output without an `Error:` line. A
+# subject outside the repository means a rollback — which only reverts the
+# checkout — cannot fix this failure.
+failure_subject_outside_repo() {
+  [ -n "$REPO" ] || return 1
+  local subject
+  subject=$(grep -m1 -E '^[A-Za-z]*Error: ' "$ATTEMPT_LOG" 2>/dev/null | grep -oE '/[^ )]+' | head -1)
+  if [ -z "$subject" ]; then
+    subject=$(grep -v '^ *at ' "$ATTEMPT_LOG" 2>/dev/null | grep -oE '/[^ )]+' | head -1)
+  fi
+  [ -n "$subject" ] || return 1
+  case "$subject" in
+    "$REPO"|"$REPO"/*) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 guard_cmd() {
@@ -147,7 +221,10 @@ fi
 
 while true; do
   echo "[watchdog] starting instance on :$PORT (failures=$failures)"
-  launch_instance &
+  # Capture this attempt's output for failure-domain classification while
+  # keeping the instance's output flowing to the watchdog log as before.
+  : > "$ATTEMPT_LOG"
+  launch_instance > >(tee -a "$ATTEMPT_LOG") 2>&1 &
   child=$!
   # Boot window: the instance is up when the port answers 200.
   up=0
@@ -162,19 +239,38 @@ while true; do
     # Never came up (or died); stop a still-alive child and reap it.
     if kill -0 "$child" 2>/dev/null; then kill "$child" 2>/dev/null; fi
     wait "$child" 2>/dev/null
+
+    if grep -q 'EADDRINUSE' "$ATTEMPT_LOG" 2>/dev/null; then
+      # The port was still held (a leftover process, a slow exit) — an
+      # operational race, not a code regression. The watchdog owns the port,
+      # so free it and retry WITHOUT counting toward rollback or give-up.
+      echo "[watchdog] boot hit EADDRINUSE on :$PORT — freeing the port and retrying (not a code failure)"
+      free_port
+      continue
+    fi
+
     failures=$((failures + 1))
     echo "[watchdog] instance failed to come up (failure #$failures)"
 
     if [ "$failures" -ge 2 ] && [ "$reset_done" -eq 0 ]; then
-      sha=$(checkpoint_sha)
-      if [ -n "$sha" ]; then
-        echo "[watchdog] rolling repo back to guard checkpoint $sha"
-        guard_reset "$sha"
+      sha=$(rollback_sha)
+      if [ -z "$sha" ]; then
+        echo "[watchdog] no guard credential/checkpoint recorded; cannot roll back"
+      elif failure_subject_outside_repo; then
+        # The failure lives outside the checkout (profile overlay, installed
+        # plugin, environment) — reverting the repository cannot fix it.
+        echo "[watchdog] boot failure originates outside $REPO — repository rollback cannot fix it; leaving the checkout untouched"
         reset_done=1
-        failures=0
-        continue
+      else
+        if rollback_to "$sha"; then
+          reset_done=1
+          failures=0
+          continue
+        fi
+        # The target already is HEAD: the reset was skipped, so keep counting
+        # toward give-up — retrying a boot that cannot change is pointless.
+        reset_done=1
       fi
-      echo "[watchdog] no guard checkpoint recorded; cannot roll back"
     fi
 
     if [ "$failures" -ge 4 ]; then
@@ -193,6 +289,7 @@ while true; do
 
   # Instance is up.
   echo "[watchdog] instance up on :$PORT"
+  stamp_last_good_boot
 
   # Intentional restart: run the guard canary (credential fresh + HEAD match).
   if [ -f "$RESTART_MARKER" ]; then
@@ -200,9 +297,9 @@ while true; do
       echo "[watchdog] canary PASS — clearing restart marker"
       rm -f "$RESTART_MARKER"
     else
-      echo "[watchdog] canary FAIL — rolling back to checkpoint"
-      sha=$(checkpoint_sha)
-      if [ -n "$sha" ]; then guard_reset "$sha"; fi
+      echo "[watchdog] canary FAIL — rolling back to last known-good"
+      sha=$(rollback_sha)
+      if [ -n "$sha" ]; then rollback_to "$sha" || true; fi
       rm -f "$RESTART_MARKER"
       failures=0
       reset_done=0

@@ -26,7 +26,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resolveRepoDir, resolveStateDir } from './defaults.ts'
 import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
 import {
-  clearCredential, loadState, recordCredential, setCheckpoint, verifyCredential,
+  clearCredential, lastGoodBootRevision, loadState, recordCredential, setCheckpoint, verifyCredential,
 } from './state.ts'
 
 /** Parsed CLI options; empty stateDir/repoDir mean "use defaults". */
@@ -45,6 +45,8 @@ interface CliOptions {
   foreground: boolean
   rollback: boolean
   initiator: string | undefined
+  profile: string | undefined
+  preflightTimeoutMs: number | undefined
 }
 
 /** stdout/stderr sink (injected so tests capture output). */
@@ -62,9 +64,11 @@ commands:
   checkpoint [--message MSG] [--repo DIR] [--state-dir DIR]
   reset <sha> [--repo DIR]
   canary [--port N] [--state-dir DIR] [--repo DIR] [--max-age MIN]
+  preflight [--profile NAME] [--timeout-ms MS]
   restart --port N --start "CMD" [--pid PID] [--timeout-ms MS] [--delay-ms MS] [--rollback]
-          [--state-dir DIR] [--repo DIR] [--max-age MIN]
-  schedule-exit --port N --delay-ms MS [--initiator ID] [--log FILE] [--state-dir DIR] [--repo DIR]
+          [--profile NAME] [--preflight-timeout-ms MS] [--state-dir DIR] [--repo DIR] [--max-age MIN]
+  schedule-exit --port N --delay-ms MS [--initiator ID] [--log FILE] [--profile NAME]
+          [--preflight-timeout-ms MS] [--state-dir DIR] [--repo DIR]
   supervise --port N --start "CMD" [--foreground] [--log FILE] [--state-dir DIR] [--repo DIR]
 flags:
   --state-dir DIR  state directory (default: $DSH_HOME/state, else <cwd>/.dsh-guard-state)
@@ -75,24 +79,32 @@ flags:
   --message MSG    checkpoint: batch description
   --start "CMD"    restart/supervise: the shell command that starts the instance
   --pid PID        restart: process to stop (default: the listener on --port)
-  --timeout-ms MS  restart: how long to wait for the new instance to listen (default 60000)
+  --timeout-ms MS  restart: how long to wait for the new instance to listen (default 60000);
+                   preflight: how long the dry-run boot may take (default 120000)
   --delay-ms MS    restart: sleep before stopping, so the current turn can finish first
                    (agent-driven graceful self-restart: schedule, complete, then restart);
                    schedule-exit: delay before the detached exit agent kills the host
   --log FILE       supervise/schedule-exit: watchdog/exit-agent log file (default: <home>/state/*.log)
   --initiator ID   schedule-exit: session id that requested the exit (default: $DSH_SESSION_ID);
                    recorded in last-restart.json so the restart report returns to that session
+  --profile NAME   preflight/schedule-exit/restart: the dsh profile to dry-run (default:
+                   $DSH_PROFILE, else "web")
+  --preflight-timeout-ms MS  schedule-exit/restart: bound on the composition preflight (default 120000)
   --rollback       restart: on failure, git reset --hard to the recorded checkpoint
 `
 
-/** Parse argv into a command, positionals, and options. */
+/**
+ * Parse argv into a command, positionals, and options.
+ * @param argv - the raw argument vector (without node/script entries).
+ * @returns the parsed command with positionals and options, or a parse error.
+ */
 export function parse(
   argv: readonly string[],
 ): { error: string } | { command: string; positionals: readonly string[]; options: CliOptions } {
   const options: CliOptions = {
     stateDir: '', repoDir: '', maxAgeMinutes: 10, port: undefined, command: undefined, message: undefined,
     start: undefined, pid: undefined, timeoutMs: undefined, delayMs: undefined, log: undefined,
-    foreground: false, rollback: false, initiator: undefined,
+    foreground: false, rollback: false, initiator: undefined, profile: undefined, preflightTimeoutMs: undefined,
   }
   const positionals: string[] = []
   let i = 0
@@ -148,6 +160,15 @@ export function parse(
         }
         case '--foreground': options.foreground = true; break
         case '--initiator': options.initiator = flagValue(arg, true) ?? ''; i++; break
+        case '--profile': options.profile = flagValue(arg, true) ?? ''; i++; break
+        case '--preflight-timeout-ms': {
+          const raw = flagValue(arg, true)
+          const n = Number(raw)
+          if (raw === undefined || !Number.isInteger(n) || n < 100) throw new Error('--preflight-timeout-ms must be an integer >= 100')
+          options.preflightTimeoutMs = n
+          i++
+          break
+        }
         case '--rollback': options.rollback = true; break
         case '--help':
         case '-h':
@@ -204,8 +225,165 @@ function guardInvocation(): string {
   return `node ${cliPath}`
 }
 
+/** Default bound on one preflight subprocess run (a real web-profile boot takes tens of seconds). */
+const DEFAULT_PREFLIGHT_TIMEOUT_MS = 120_000
+
+/** Captured preflight output is diagnostics, not a log — cap it before it can grow without bound. */
+const PREFLIGHT_OUTPUT_CAP = 64 * 1024
+
+/**
+ * How the guard invokes the dsh app's `preflight` mode: the source form runs
+ * `node --import <repo>/node_modules/tsx/dist/esm/index.mjs <repo>/apps/cli/src/bin.ts`,
+ * the built form `node <repo>/apps/cli/lib/bin.js` (same source/built split as
+ * {@link guardInvocation}). This CLI sits at packages/guard/ankh-guard/src
+ * (source) or packages/guard/ankh-guard/lib (built); the repository root is
+ * four levels up from either.
+ * @param cliFile - this CLI's own file (injectable so tests can point it at a
+ * layout without the sibling app).
+ * @returns the command prefix (`preflight --profile <name>` is appended), or
+ * `undefined` outside the dsh app layout (a standalone published package).
+ */
+export function resolvePreflightBin(cliFile: string = fileURLToPath(import.meta.url)): string | undefined {
+  const root = resolve(dirname(cliFile), '../../../..')
+  const sourceBin = join(root, 'apps', 'cli', 'src', 'bin.ts')
+  if (existsSync(sourceBin)) {
+    const tsx = join(root, 'node_modules', 'tsx', 'dist', 'esm', 'index.mjs')
+    if (existsSync(tsx)) return `node --import ${tsx} ${sourceBin}`
+  }
+  const builtBin = join(root, 'apps', 'cli', 'lib', 'bin.js')
+  if (existsSync(builtBin)) return `node ${builtBin}`
+  return undefined
+}
+
+/** Replaceable seams for tests; production keeps the defaults. */
+export const preflightInternals: { resolveBin: () => string | undefined } = {
+  resolveBin: () => resolvePreflightBin(),
+}
+
+/**
+ * One preflight run's verdict class plus its captured output. `pass` and
+ * `composition-failed` are verdicts ON the composition; `infra-failed` means
+ * preflight itself could not execute (timeout, spawn failure, the app's own
+ * exit 3) and says nothing about the composition; `unavailable` means there
+ * is no sibling dsh app to dry-run at all (standalone deployment).
+ */
+export interface PreflightOutcome {
+  kind: 'pass' | 'composition-failed' | 'infra-failed' | 'unavailable'
+  /** Combined stdout+stderr, capped at {@link PREFLIGHT_OUTPUT_CAP}. */
+  output: string
+  /** Why no verdict was produced (timeout, spawn error, unexpected exit code). */
+  detail?: string
+}
+
+/** POSIX single-quote one word for the shell command line. */
+function shellQuote(word: string): string {
+  return `'${word.replace(/'/g, "'\\''")}'`
+}
+
+/**
+ * Run the dsh app's preflight mode as a subprocess and classify its exit.
+ * `DSH_PREFLIGHT_COMMAND` replaces the resolved bin wholesale — a shell
+ * command run instead (test hook; also the escape hatch for exotic layouts).
+ * @param profile - the dsh profile to dry-run.
+ * @param timeoutMs - bound on the whole subprocess run; a timeout kills it.
+ * @returns the classified outcome.
+ */
+export async function runPreflightCheck(profile: string, timeoutMs: number): Promise<PreflightOutcome> {
+  const override = process.env.DSH_PREFLIGHT_COMMAND
+  let command: string
+  if (override !== undefined && override !== '') {
+    command = override
+  } else {
+    const bin = preflightInternals.resolveBin()
+    if (bin === undefined) return { kind: 'unavailable', output: '' }
+    command = `${bin} preflight --profile ${shellQuote(profile)}`
+  }
+  return await new Promise((resolvePromise) => {
+    let output = ''
+    let timedOut = false
+    const child = spawn(command, { shell: true })
+    const append = (chunk: Buffer): void => {
+      if (output.length < PREFLIGHT_OUTPUT_CAP) output += chunk.toString('utf8')
+    }
+    child.stdout.on('data', append)
+    child.stderr.on('data', append)
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+    }, timeoutMs)
+    // 'close' follows both a normal exit and a spawn failure, so one handler
+    // settles the promise exactly once.
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (timedOut) {
+        resolvePromise({ kind: 'infra-failed', output, detail: `preflight timed out after ${timeoutMs} ms` })
+      } else if (code === 0) {
+        resolvePromise({ kind: 'pass', output })
+      } else if (code === 1) {
+        resolvePromise({ kind: 'composition-failed', output })
+      } else if (code === 3) {
+        resolvePromise({ kind: 'infra-failed', output })
+      } else {
+        resolvePromise({ kind: 'infra-failed', output, detail: `preflight exited with unexpected code ${String(code)}` })
+      }
+    })
+  })
+}
+
+/** The profile a gated verb dry-runs: the flag, then $DSH_PROFILE, then the deployment default. */
+function resolveProfileName(options: CliOptions): string {
+  const flag = options.profile ?? ''
+  if (flag !== '') return flag
+  const env = process.env.DSH_PROFILE ?? ''
+  return env !== '' ? env : 'web'
+}
+
+/** The first ~40 lines of captured preflight output, newline-terminated, or empty. */
+function summarizeOutput(output: string): string {
+  if (output.trim() === '') return ''
+  const lines = output.split('\n')
+  const kept = lines.length > 41 ? [...lines.slice(0, 40), `… (${lines.length - 40} more lines)`] : lines
+  return `${kept.join('\n').replace(/\n+$/, '')}\n`
+}
+
+/**
+ * The composition gate shared by `schedule-exit` and `restart`, run AFTER the
+ * credential check: a green build does not prove the profile composition
+ * boots, and a broken composition must never stop the running instance.
+ * @param verb - the refusing verb, for the diagnostic prefix.
+ * @param profile - the profile to dry-run.
+ * @param timeoutMs - bound on the preflight subprocess.
+ * @param io - output sinks.
+ * @returns whether the verb may proceed.
+ */
+async function preflightGate(verb: string, profile: string, timeoutMs: number, io: CliIo): Promise<boolean> {
+  const outcome = await runPreflightCheck(profile, timeoutMs)
+  switch (outcome.kind) {
+    case 'pass':
+      io.stdout(`composition preflight PASS (profile ${JSON.stringify(profile)})\n`)
+      return true
+    case 'unavailable':
+      // A standalone published deployment has no sibling dsh app to dry-run —
+      // and no profile composition to check either — so there is nothing to gate on.
+      io.stdout('composition preflight unavailable outside the dsh app layout — proceeding without it\n')
+      return true
+    case 'composition-failed':
+      io.stderr(`${verb} refused: composition preflight failed:\n${summarizeOutput(outcome.output)}`)
+      return false
+    case 'infra-failed':
+      io.stderr(`${verb} refused: the composition preflight itself failed${
+        outcome.detail !== undefined ? ` — ${outcome.detail}` : ''
+      }. This is NOT a verdict on the composition, but the guard will not stop a healthy instance it cannot prove will come back.\n${
+        summarizeOutput(outcome.output)
+      }manual override: stop the instance by hand (\`kill $(lsof -tiTCP:<port> -sTCP:LISTEN)\`) and let the watchdog respawn it, or fix the preflight failure and retry.\n`)
+      return false
+  }
+}
+
 /** The first process listening on a TCP port, or null when none is (via lsof). */
 function findPidOnPort(port: number): string | null {
+
+
   try {
     const out = execFileSync('lsof', [`-tiTCP:${port}`, '-sTCP:LISTEN', '-P'], { encoding: 'utf8' }).trim()
     const first = out.split('\n')[0]
@@ -234,17 +412,27 @@ async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
   return false
 }
 
-/** Restart failure path: optional hard reset to the recorded checkpoint. */
-function rollbackToCheckpoint(stateDir: string, repoDir: string, io: CliIo): void {
-  const checkpoint = loadState(stateDir).checkpoint
-  if (checkpoint === undefined) {
-    io.stderr('no checkpoint recorded — manual rollback required\n')
+/**
+ * Restart failure path: optional hard reset to the last known-good revision —
+ * the healthy-boot stamp (deployment-proven), else the recorded checkpoint,
+ * else the credential's HEAD.
+ */
+function rollbackToKnownGood(stateDir: string, repoDir: string, io: CliIo): void {
+  const state = loadState(stateDir)
+  const target = lastGoodBootRevision(stateDir) ?? state.checkpoint?.revision ?? state.credential?.revision
+  if (target === undefined) {
+    io.stderr('no boot stamp, checkpoint, or credential recorded — manual rollback required\n')
     return
   }
-  const result = resetToCheckpoint(repoDir, checkpoint.revision)
+  if (target === currentHead(repoDir)) {
+    io.stdout(`rollback target ${target} is the current HEAD — skipping reset (nothing to roll back; a reset would only wipe uncommitted work)\n`)
+    return
+  }
+  const result = resetToCheckpoint(repoDir, target)
   io.stdout(result.ok
-    ? `rolled back to checkpoint ${checkpoint.revision}\n`
+    ? `rolled back to last known-good ${target}\n`
     : `rollback failed: ${result.error ?? 'git reset failed'}\n`)
+  for (const anchor of result.anchors) io.stdout(`recovery anchor: branch ${anchor}\n`)
 }
 
 /**
@@ -303,6 +491,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       }
       setCheckpoint(stateDir, { revision: result.sha, message }, Date.now())
       io.stdout(`checkpoint committed: ${result.sha}\n`)
+      if (result.artifacts.length > 0) {
+        io.stdout(`warning: ${result.artifacts.length} build-artifact-looking file(s) swept in (bare tsc emission? real build output belongs in lib/):\n`)
+        for (const file of result.artifacts.slice(0, 5)) io.stdout(`  ${file}\n`)
+      }
       return 0
     }
     case 'reset': {
@@ -317,6 +509,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         return 1
       }
       io.stdout(`reset to ${sha}\n`)
+      for (const anchor of result.anchors) io.stdout(`recovery anchor: branch ${anchor}\n`)
       return 0
     }
     case 'canary': {
@@ -331,6 +524,17 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       io.stdout(ok ? 'canary PASS\n' : 'canary FAIL\n')
       return ok ? 0 : 1
     }
+    case 'preflight': {
+      const outcome = await runPreflightCheck(resolveProfileName(options), options.timeoutMs ?? DEFAULT_PREFLIGHT_TIMEOUT_MS)
+      if (outcome.kind === 'unavailable') {
+        io.stderr('preflight unavailable outside the dsh app layout\n')
+        return 3
+      }
+      const sink = outcome.kind === 'pass' ? io.stdout : io.stderr
+      if (outcome.detail !== undefined) sink(`${outcome.detail}\n`)
+      sink(summarizeOutput(outcome.output))
+      return outcome.kind === 'pass' ? 0 : outcome.kind === 'composition-failed' ? 1 : 3
+    }
     case 'restart': {
       const port = options.port
       if (port === undefined || options.start === undefined || options.start === '') {
@@ -341,6 +545,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       const gate = verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), options.maxAgeMinutes)
       if (!gate.ok) {
         io.stderr(`restart refused: ${gate.reason}\n`)
+        return 1
+      }
+      // THE COMPOSITION GATE: a green build does not prove the profile boots.
+      if (!(await preflightGate('restart', resolveProfileName(options), options.preflightTimeoutMs ?? DEFAULT_PREFLIGHT_TIMEOUT_MS, io))) {
         return 1
       }
       // Graceful self-restart: wait out the delay so the scheduling agent's
@@ -378,14 +586,14 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       }
       if (!listening) {
         io.stderr(`new instance not listening on 127.0.0.1:${port} within ${timeoutMs}ms\n`)
-        if (options.rollback) rollbackToCheckpoint(stateDir, repoDir, io)
+        if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
         return 1
       }
       const post = verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), options.maxAgeMinutes)
       io.stdout(`canary verify: ${post.ok ? 'PASS' : 'FAIL'} — ${post.reason}\n`)
       io.stdout(`canary port: PASS — listening on 127.0.0.1:${port}\n`)
       if (!post.ok) {
-        if (options.rollback) rollbackToCheckpoint(stateDir, repoDir, io)
+        if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
         return 1
       }
       io.stdout('restart + canary PASS\n')
@@ -466,6 +674,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       const gate = verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), options.maxAgeMinutes)
       if (!gate.ok) {
         io.stderr(`schedule-exit refused: ${gate.reason}\n`)
+        return 1
+      }
+      // THE COMPOSITION GATE: a green build does not prove the profile boots.
+      if (!(await preflightGate('schedule-exit', resolveProfileName(options), options.preflightTimeoutMs ?? DEFAULT_PREFLIGHT_TIMEOUT_MS, io))) {
         return 1
       }
       // Intentional-restart marker: the supervising watchdog runs the canary

@@ -8,10 +8,13 @@
  *
  * The credential is bound to the git HEAD it was recorded on, so any change
  * after recording invalidates it — a post-hoc or stale credential can never
- * authorize a restart of unverified code. Checkpoints (P2) are plain commits
- * with a guard message; rollback is `git reset --hard` to the checkpoint.
+ * authorize a restart of unverified code. Checkpoints are plain commits with
+ * a guard message; rollback is `git reset --hard` to the last known-good
+ * revision (the watchdog's healthy-boot stamp, else the checkpoint, else the
+ * credential), always leaving `guard-backup-*` anchors for whatever it
+ * discards.
  *
- * @module @khorsheed/dsh-ankh-guard
+ * @module @deepseek-ai/dsh-ankh-guard
  */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -19,12 +22,15 @@ import { connect } from 'node:net'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 // Type-only: pulls the agent package's event merge ('agent/pre-step').
 import type {} from '@deepseek-ai/dsh-agent'
-import { existsSync } from 'node:fs'
+import type { AgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
+import { resolveSessionPreset, type PresetBearingSession } from '@deepseek-ai/dsh-agent-presets'
+import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveRepoDir, resolveStateDir } from './defaults.ts'
 import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
 import {
-  acknowledgeRestartRecord, pendingRestartRecord, restartContextText,
+  acknowledgeRestartRecord, continueAndReportText, continueInterruptedText, interruptedSnapshotFile,
+  pendingRestartRecord, readInterruptedSnapshot, restartContextText, writeInterruptedSnapshot,
   type RestartRecord,
 } from './restart-context.ts'
 import {
@@ -49,14 +55,27 @@ export interface SelfRestartGuardConfig {
    */
   reportRestartContext?: 'followup' | 'step' | 'off'
   /**
-   * How long a non-initiator root agent waits before claiming a restart record
-   * whose initiator session has not resumed yet (default 60000 ms). While the
-   * initiator is still present in session persistence, its own agent creation
-   * is expected within this window; only after it elapses without the initiator
-   * appearing does any root agent fall back and claim the record, so a slow
-   * session restore never loses the report to a session that resumed first.
+   * Resume the sessions a restart interrupted (default true). At SIGTERM the
+   * plugin snapshots which root sessions had a live turn (plus the restart's
+   * initiating session); on the next restart boot it resumes them via
+   * `ctx.agents.resume` and queues a "continue" followup for the interrupted
+   * ones, so a self-restart no longer silently pauses every other session.
+   * The pass only runs on a restart boot (restart marker or pending restart
+   * record present); a cold start drops the snapshot without acting.
    */
-  fallbackGraceMs?: number
+  resumeInterrupted?: boolean
+  /**
+   * Delay before the interrupted-session resume pass runs after plugin load
+   * (default 5000 ms), so the pass starts turns only after the app's services
+   * are up.
+   */
+  resumeDelayMs?: number
+  /**
+   * Maximum age of the interrupted-session snapshot the resume pass honors
+   * (default 600000 ms, ten minutes). A snapshot older than that comes from a
+   * manual stop/start, not a restart, and is dropped without acting.
+   */
+  resumeMaxSnapshotAgeMs?: number
 }
 
 export const Config: z<SelfRestartGuardConfig> = z.object({
@@ -64,7 +83,9 @@ export const Config: z<SelfRestartGuardConfig> = z.object({
   stateDir: z.string().default(''),
   repoDir: z.string().default(''),
   reportRestartContext: z.union([z.const('followup'), z.const('step'), z.const('off')]).default('followup'),
-  fallbackGraceMs: z.natural().min(1).default(60000),
+  resumeInterrupted: z.boolean().default(true),
+  resumeDelayMs: z.natural().min(0).default(5000),
+  resumeMaxSnapshotAgeMs: z.natural().min(1).default(600000),
 })
 
 /** One canary check line. */
@@ -82,7 +103,7 @@ export interface CanaryResult {
 
 /** Result of a checkpoint request. */
 export type CheckpointResult =
-  | { ok: true; sha: string }
+  | { ok: true; sha: string; artifacts: string[] }
   | { ok: false; error: string }
 
 /**
@@ -120,11 +141,12 @@ export interface SelfRestartGuard {
    */
   checkpoint(message?: string): CheckpointResult
   /**
-   * Hard-reset the checkout to a checkpoint commit.
+   * Hard-reset the checkout to a checkpoint commit, leaving `guard-backup-*`
+   * recovery anchors for the discarded HEAD and any uncommitted work.
    * @param sha - the checkpoint commit to reset to.
-   * @returns success or a failure reason.
+   * @returns success with the recovery anchor refs, or a failure reason.
    */
-  reset(sha: string): { ok: boolean; error?: string }
+  reset(sha: string): { ok: boolean; error?: string; anchors: string[] }
   /**
    * Post-restart canary: verify plus an optional port-liveness probe.
    * @param options - optional TCP port that must be listening.
@@ -169,128 +191,199 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
   const repoDir = resolveRepoDir(config.repoDir)
   const maxAgeMinutes = config.maxAgeMinutes ?? 10
   const reportMode = config.reportRestartContext ?? 'followup'
-  const graceMs = config.fallbackGraceMs ?? 60_000
+  const resumeInterrupted = config.resumeInterrupted ?? true
+  const resumeDelayMs = config.resumeDelayMs ?? 5000
+  const resumeMaxSnapshotAgeMs = config.resumeMaxSnapshotAgeMs ?? 600_000
 
-  // Autonomous report: on agent creation (session resume after a restart),
-  // queue the restart record as the next turn via `agent.followup` — the
-  // official wake-the-agent seam the schedule system uses for reminders — so
-  // the agent reports without any user message. Only root agents (not
-  // subagents) and only once (the record is acknowledged on followup). The
-  // report returns to the session that scheduled the exit (`record.initiator`,
-  // recorded by `schedule-exit` from $DSH_SESSION_ID).
+  // Restart continuity, two halves wired into `agent/created`:
   //
-  // Session restore after a restart is asynchronous and ordered, so a
-  // non-initiator root agent can fire `agent/created` before the initiator's
-  // session has resumed. Two gates keep the record from racing to the wrong
-  // session: while the initiator's agent is live, only it may claim; when it
-  // is not live yet but its session still exists in persistence, a grace timer
-  // (Config `fallbackGraceMs`, default 60000 ms) waits for its resume before
-  // any root agent falls back — a slow restore never loses the report to a
-  // session that resumed first. The timer is idempotent (one pending timer per
-  // record), validates the record identity on fire (the same exitAt, still
-  // unreported), and refuses to ack when no root agent is live. An initiator
-  // that is absent from persistence entirely (deleted, or a subagent that
-  // never resumes) falls back immediately.
+  // 1. The restart REPORT waits for its owner. Session restore after a
+  //    restart is lazy (an agent is created only when the UI or an RPC
+  //    touches the session), so the full report is queued via
+  //    `agent.followup` — the official wake-the-agent seam the schedule
+  //    system uses for reminders — only for the session that scheduled the
+  //    exit (`record.initiator`, recorded by `schedule-exit` from
+  //    $DSH_SESSION_ID), whenever it resumes; a record without an initiator
+  //    is claimed by the first root agent created. No other session is ever
+  //    woken for reporting: the record stays pending until its owner resumes
+  //    or the next restart replaces it (a new exitAt), the only retirement
+  //    paths. Only root agents (not subagents), and only once (the record is
+  //    acknowledged on delivery).
+  // 2. Sessions the restart INTERRUPTED are resumed and continued. The
+  //    SIGTERM handler snapshots which root sessions had a live turn (plus
+  //    the restart's initiator, so the report's owner comes back even when
+  //    its own turn had already finished); on the next restart boot — and
+  //    only then: a cold start drops the snapshot without acting — the
+  //    resume pass re-creates those agents via `ctx.agents.resume` and queues
+  //    a "continue" followup for the interrupted ones (their logs were closed
+  //    with `reason.kind === 'interrupted'` by crash-recovery repair).
   if (reportMode === 'followup') {
-    // One pending grace timer per record; cleared by ctx.effect disposal.
-    let graceTimer: NodeJS.Timeout | null = null
-    let graceRecord: RestartRecord | null = null
-    ctx.effect(() => () => {
-      if (graceTimer !== null) clearTimeout(graceTimer)
-      graceTimer = null
-      graceRecord = null
+    type FollowupAgent = { followup: (message: ReturnType<typeof createUserMessage>) => void }
+    const pluginMessage = (text: string): ReturnType<typeof createUserMessage> => createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: name, form: 'snapshot', sections: [{ name: 'restart', text }] },
     })
+    // Interrupted sessions awaiting their `agent/created` to receive the
+    // "continue" followup: session id → exitAt of the interrupting exit.
+    const pendingContinue = new Map<string, number>()
+    let disposed = false
+    ctx.effect(() => () => { disposed = true })
 
-    const claim = (agent: unknown, record: RestartRecord): void => {
+    const claim = (agent: FollowupAgent, record: RestartRecord): void => {
       const canaryPending = existsSync(join(stateDir, 'restart-requested.json'))
       const text = restartContextText(record, canaryPending)
       if (text === '') return
-      const message = createUserMessage({
-        content: [{ type: 'text', text }],
-        source: { kind: 'plugin', plugin: name, form: 'snapshot', sections: [{ name: 'restart', text }] },
-      })
       // Deliver before acknowledging: an ack on an undelivered followup would
-      // lose the report (the record is already marked reported and no one
-      // re-injects). A followup that throws keeps the record pending for the
-      // next creation instead.
-      ;(agent as { followup: (message: ReturnType<typeof createUserMessage>) => void }).followup(message)
+      // lose the report; a followup that throws keeps the record pending for
+      // the next creation instead.
+      agent.followup(pluginMessage(text))
       acknowledgeRestartRecord(stateDir, record, Date.now())
     }
 
-    const armGraceTimer = (record: RestartRecord, graceMs: number): void => {
-      if (graceTimer !== null) return // one pending timer per record
-      graceRecord = record
-      graceTimer = setTimeout(() => {
-        graceTimer = null
-        const pending = graceRecord
-        graceRecord = null
-        // Identity check: only the exact record that armed this timer may be
-        // claimed, and only while it is still unreported — a second restart
-        // (new exitAt) or an earlier claim must not be acked by this timer.
-        const current = pendingRestartRecord(stateDir)
-        if (current === null || pending === null || current.exitAt !== pending.exitAt) {
-          // The record was replaced while this timer was pending (second
-          // restart). The new record never armed a timer of its own (the
-          // singleton guard rejected it), so re-arm it here — otherwise its
-          // fallback would never fire without another creation event.
-          if (current !== null && pending !== null && current.exitAt !== pending.exitAt) {
-            armGraceTimer(current, graceMs)
-          }
-          return
+    // The single delivery path for every resume trigger (this plugin's pass,
+    // the UI, the schedule system): an interrupted session gets exactly one
+    // "continue" injection; the restart's initiator gets the report — merged
+    // into one message when it is both. The map makes repeat calls no-ops.
+    const deliver = (agent: FollowupAgent & { id: unknown }): void => {
+      const id = agent.id as string
+      const exitAt = pendingContinue.get(id)
+      if (exitAt !== undefined) pendingContinue.delete(id)
+      const record = pendingRestartRecord(stateDir)
+      if (exitAt !== undefined && record !== null
+        && (record.initiator === undefined || id === record.initiator)) {
+        // The initiator was itself interrupted by its own restart: one
+        // combined turn continues the work AND reports the outcome — two
+        // separate injections would run two near-duplicate turns.
+        const canaryPending = existsSync(join(stateDir, 'restart-requested.json'))
+        const text = continueAndReportText(record, canaryPending)
+        if (text !== '') {
+          agent.followup(pluginMessage(text))
+          acknowledgeRestartRecord(stateDir, record, Date.now())
         }
-        const liveIds = new Set<string>(ctx.agents.list().map(live => live.id))
-        if (pending.initiator !== undefined && liveIds.has(pending.initiator)) return // initiator resumed — its own creation claims it
-        const roots = ctx.agents.roots()
-        if (roots.length === 0) return // no live root agent — keep the record for the next creation
-        claim(roots[0], pending)
-      }, graceMs)
+        return
+      }
+      if (exitAt !== undefined) {
+        agent.followup(pluginMessage(continueInterruptedText(exitAt)))
+      }
+      if (record === null) return
+      // The report waits for its owner; other sessions are never woken.
+      if (record.initiator !== undefined && id !== record.initiator) return
+      claim(agent, record)
+    }
+
+    // Shutdown snapshot: which root sessions had a live turn when the process
+    // stopped. Synchronous by design — a signal handler cannot await.
+    const snapshotInterrupted = (): void => {
+      try {
+        const interrupted = ctx.agents.roots()
+          .filter(agent => agent.status === 'running')
+          .map(agent => agent.id as string)
+        let initiator: string | undefined
+        try {
+          const marker = JSON.parse(readFileSync(join(stateDir, 'restart-requested.json'), 'utf8')) as { initiator?: string }
+          initiator = marker.initiator
+        } catch {
+          // No scheduled-restart marker: a plain stop snapshots turns only.
+        }
+        writeInterruptedSnapshot(stateDir, {
+          exitAt: Date.now(),
+          resume: initiator !== undefined ? [initiator] : [],
+          interrupted,
+        })
+      } catch {
+        // Best-effort: a signal handler must never throw into shutdown.
+      }
+    }
+    process.on('SIGTERM', snapshotInterrupted)
+    ctx.effect(() => () => { process.off('SIGTERM', snapshotInterrupted) })
+
+    // A faithful resume mirrors the API proxy's cold-resume path: the
+    // session's stored preset composition (resolved from the LOG, not the
+    // creation header) and the deployment's current default model selection.
+    // A bare resume loses both — the persona's {{model}} variable then has no
+    // value and every turn of the resumed agent fails.
+    const buildResumeOptions = async (id: string): Promise<ResumeAgentOptions> => {
+      const agentOptions: AgentOptions = {}
+      const selection = (ctx.get('agentDefaultModel') as
+        | { currentSelection(): { provider?: string; model?: string } }
+        | undefined)?.currentSelection()
+      if (selection?.provider !== undefined) agentOptions.provider = selection.provider
+      if (selection?.model !== undefined) agentOptions.model = selection.model
+      let setup: ResumeAgentOptions['setup']
+      const presets = ctx.get('agentPresets') as
+        | { resolve(presetId?: string): Promise<{ id: string }>; mount(agentCtx: Context, presetId?: string): Promise<unknown> }
+        | undefined
+      const persistence = ctx.get('sessionPersistence') as
+        | { inspect(sessionId: string): Promise<{ meta: PresetBearingSession['header']; events: PresetBearingSession['events'] }> }
+        | undefined
+      if (presets !== undefined && persistence !== undefined) {
+        const inspected = await persistence.inspect(id)
+        const presetId = resolveSessionPreset({ header: inspected.meta, events: inspected.events })
+        setup = async (agentCtx) => { await presets.mount(agentCtx, (await presets.resolve(presetId)).id) }
+      }
+      return { resumeSessionId: id, agentOptions, ...(setup === undefined ? {} : { setup }) } as ResumeAgentOptions
+    }
+
+    // The resume gate is the snapshot's freshness alone. Marker-based gating
+    // (restart-requested.json / pending record) breaks on multi-attempt
+    // boots: the first attempt that reaches healthy consumes both markers, so
+    // a later attempt within the same restart cycle reads "not a restart" and
+    // drops the snapshot unacted. A fresh snapshot only exists when a graceful
+    // stop interrupted live turns, and a quick stop/start rescuing them is
+    // desirable whether the stop was scheduled or manual.
+    //
+    // Pre-populate the continue map at apply time: every interrupted session
+    // then receives exactly one injection whoever resumes it — this plugin's
+    // pass below, the UI, or the schedule system. (Reading the snapshot here
+    // also covers sessions the UI resumes before the delayed pass runs.)
+    if (resumeInterrupted) {
+      const snapshot = readInterruptedSnapshot(stateDir)
+      if (snapshot !== null && Date.now() - snapshot.exitAt <= resumeMaxSnapshotAgeMs) {
+        for (const id of snapshot.interrupted) pendingContinue.set(id, snapshot.exitAt)
+      }
+    }
+
+    // The resume pass, once per boot: resume the snapshot's sessions; delivery
+    // happens through `deliver` below, from the `agent/created` listener or
+    // the live branch here.
+    const resumePass = async (): Promise<void> => {
+      const snapshot = readInterruptedSnapshot(stateDir)
+      if (snapshot === null) return
+      // A stale snapshot (a stop/start hours later) is dropped: only a recent
+      // graceful stop resumes sessions.
+      if (Date.now() - snapshot.exitAt <= resumeMaxSnapshotAgeMs) {
+        for (const id of [...new Set([...snapshot.resume, ...snapshot.interrupted])]) {
+          if (disposed) return
+          const live = ctx.agents.list().find(agent => (agent.id as string) === id)
+          if (live !== undefined) {
+            // Already live: its `agent/created` may have predated this plugin's
+            // apply (config-resumed agents), so deliver directly — the map
+            // makes it a no-op when the listener already delivered.
+            deliver(live)
+            continue
+          }
+          try {
+            await ctx.agents.resume(await buildResumeOptions(id))
+          } catch (error) {
+            pendingContinue.delete(id)
+            ctx.logger(name).warn(`auto-resume of session ${id} failed: ${String(error)}`)
+          }
+        }
+      }
+      try {
+        unlinkSync(interruptedSnapshotFile(stateDir))
+      } catch {
+        // Best-effort: a leftover snapshot is dropped on the next boot's read.
+      }
+    }
+    if (resumeInterrupted) {
+      const timer = setTimeout(() => { void resumePass() }, resumeDelayMs)
+      ctx.effect(() => () => { clearTimeout(timer) })
     }
 
     ctx.on('agent/created', ({ agent }) => {
       if (!ctx.agents.roots().includes(agent)) return
-      const record = pendingRestartRecord(stateDir)
-      if (record === null) return
-      if (record.initiator !== undefined) {
-        const liveIds = new Set<string>(ctx.agents.list().map(live => live.id))
-        if (liveIds.has(record.initiator)) {
-          if (agent.id !== record.initiator) return
-        } else {
-          // Initiator not live yet. If its session still exists in
-          // persistence, wait for its resume within the grace window;
-          // otherwise (deleted, or a never-resuming subagent) fall back now.
-          const persistence = ctx.get('sessionPersistence') as
-            | { list(signal?: AbortSignal): Promise<Array<{ id: string }>> }
-            | undefined
-          if (persistence !== undefined) {
-            void persistence.list().then((sessions) => {
-              // Identity re-check: while list() was in flight the initiator
-              // may have resumed and claimed the record, or a second restart
-              // replaced it. A stale resolution must not double-ack or claim
-              // a record that is already handled — same rule as the timer.
-              const current = pendingRestartRecord(stateDir)
-              if (current === null || current.exitAt !== record.exitAt) return
-              const initiator = record.initiator
-              if (initiator !== undefined && !sessions.some(session => session.id === initiator)) {
-                const liveNow = new Set<string>(ctx.agents.list().map(live => live.id))
-                if (!liveNow.has(initiator)) {
-                  const roots = ctx.agents.roots()
-                  if (roots.length > 0) claim(roots[0], record)
-                }
-              } else {
-                armGraceTimer(record, graceMs)
-              }
-            }).catch(() => {
-              // Persistence listing failed: fall back to the grace window alone.
-              armGraceTimer(record, graceMs)
-            })
-            return
-          }
-          // No persistence service: rely on the grace window alone.
-          armGraceTimer(record, graceMs)
-          return
-        }
-      }
-      claim(agent, record)
+      deliver(agent)
     })
   }
 

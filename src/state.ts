@@ -206,3 +206,20 @@ export function verifyCredential(
     reason: `green credential valid (${credential.scope} @ ${credential.revision}, ${Math.round(leftMs / 60_000)} min left)`,
   }
 }
+
+/**
+ * The last deployment-proven revision, stamped by the watchdog on every
+ * healthy boot (`last-good-boot.json` next to the guard state), or undefined.
+ * A green credential proves build+test passed; only this stamp proves the
+ * deployment composed and the instance came up.
+ * @param stateDir - state directory.
+ * @returns the stamped revision, or undefined.
+ */
+export function lastGoodBootRevision(stateDir: string): string | undefined {
+  try {
+    const stamp = JSON.parse(readFileSync(join(stateDir, 'last-good-boot.json'), 'utf8')) as { revision?: unknown }
+    return typeof stamp.revision === 'string' && stamp.revision !== '' ? stamp.revision : undefined
+  } catch {
+    return undefined
+  }
+}
