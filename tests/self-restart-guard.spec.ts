@@ -416,13 +416,11 @@ describe('CLI', () => {
 describe('composition preflight gate', () => {
   const io = cliIo
 
-  it('resolvePreflightBin finds the sibling app in this checkout and maps foreign layouts', () => {
-    // The monorepo checkout resolves the source form (tsx) or the built one.
-    const here = resolvePreflightBin()
-    expect(here).toBeDefined()
-    expect(here).toContain('apps')
-    // The production seam resolves the same bin.
-    expect(preflightInternals.resolveBin()).toBe(here)
+  it('resolvePreflightBin maps layouts (standalone: no sibling app → undefined)', () => {
+    // The standalone package has no sibling apps/cli — resolution must be
+    // undefined here (the documented out-of-layout contract); the monorepo
+    // checkout resolves the source form (tsx) or the built one instead.
+    expect(resolvePreflightBin()).toBeUndefined()
     // Built-only layout: no src/bin.ts and no tsx, but lib/bin.js exists.
     const builtOnly = tmpDir('guard-layout-')
     mkdirSync(join(builtOnly, 'apps/cli/lib'), { recursive: true })
