@@ -443,6 +443,20 @@ while true; do
       reset_done=0
       continue
     fi
+  else
+    # Unplanned exit (crash, or a stop outside the guard): the instance is
+    # back, but nobody knows — the report machinery only hears from the
+    # scheduled path. Leave a record the plugin reports on this boot, unless
+    # one still awaits its report (never overwrite a pending record).
+    node -e "
+      const fs = require('fs')
+      const file = '$STATE_DIR/last-restart.json'
+      try {
+        const r = JSON.parse(fs.readFileSync(file, 'utf8'))
+        if (r.reportedAt === undefined) process.exit(0)
+      } catch {}
+      fs.writeFileSync(file, JSON.stringify({ exitAt: Date.now(), unexpected: true }) + '\n')
+    " && echo "[watchdog] unplanned exit recovered — left a report record for the next session"
   fi
 
   failures=0

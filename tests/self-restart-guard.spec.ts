@@ -20,9 +20,10 @@ import * as selfRestartGuard from '../src/index.ts'
 import { currentHead } from '../src/git.ts'
 import { install as installInvariant } from '../src/invariant.ts'
 import {
-  acknowledgeRestartRecord, pendingRestartRecord, readInterruptedSnapshot, restartContextText,
-  writeInterruptedSnapshot,
+  acknowledgeRestartRecord, continueAndReportText, pendingRestartRecord, readInterruptedSnapshot,
+  restartContextText, writeInterruptedSnapshot,
 } from '../src/restart-context.ts'
+import { performExit } from '../src/exit-agent.ts'
 import { preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
 import {
   clearCredential, emptyState, loadState, recordCredential, setCheckpoint,
@@ -846,6 +847,15 @@ describe('supervise', () => {
         await new Promise((resolve) => { setTimeout(resolve, 300) })
       }
       expect(await fetchBody(port)).toBe('new')
+      // Unplanned exit (SIGTERM, no restart marker): the watchdog leaves a
+      // report record so the recovery reaches a session instead of staying
+      // silent.
+      const crashRecord = join(env.home, 'state', 'last-restart.json')
+      const recordDeadline = Date.now() + 5000
+      while (!existsSync(crashRecord) && Date.now() < recordDeadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 200) })
+      }
+      expect(JSON.parse(readFileSync(crashRecord, 'utf8')).unexpected).toBe(true)
     } finally {
       env.stop()
       host.kill('SIGKILL')
@@ -1849,6 +1859,49 @@ describe('restart context injection', () => {
   it('renders a failure and stays silent for an empty record', () => {
     expect(restartContextText({ error: 'no listener' }, false)).toContain('失败')
     expect(restartContextText({}, false)).toBe('')
+  })
+
+  it('renders an unplanned-exit recovery record (crash → watchdog respawn)', () => {
+    // The watchdog leaves { unexpected: true } when it respawns without a
+    // restart marker — crash recovery must reach the user, not stay silent.
+    const text = restartContextText({ exitAt: 1_700_000_000_000, unexpected: true }, false)
+    expect(text).toContain('非计划退出')
+    expect(text).toContain('请向用户简要回报')
+    expect(continueAndReportText({ exitAt: 1_700_000_000_000, unexpected: true }, false)).toContain('非计划退出')
+  })
+
+  it('exit-agent performExit SIGTERMs the listener and records the outcome', async () => {
+    const port = await freePort()
+    const host = spawn(process.execPath, ['-e',
+      `require('http').createServer((q,s)=>s.end('x')).listen(${port},'127.0.0.1')`],
+    { detached: true, stdio: 'ignore' })
+    host.unref()
+    const resultFile = join(tmpDir('guard-cli-'), 'last-restart.json')
+    try {
+      await waitForPort(port)
+      performExit(port, resultFile, 'session-x')
+      const record = JSON.parse(readFileSync(resultFile, 'utf8'))
+      expect(record.pid).toBe(host.pid)
+      expect(record.initiator).toBe('session-x')
+      expect(record.exitAt).toBeGreaterThan(0)
+      // The listener actually dies.
+      const deadline = Date.now() + 5000
+      while ((await portListening(port)) && Date.now() < deadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 100) })
+      }
+      expect(await portListening(port)).toBe(false)
+    } finally {
+      host.kill('SIGKILL')
+      await killListener(port)
+    }
+  })
+
+  it('exit-agent performExit records an error when nothing listens', () => {
+    const resultFile = join(tmpDir('guard-cli-'), 'last-restart.json')
+    performExit(1, resultFile, undefined)
+    const record = JSON.parse(readFileSync(resultFile, 'utf8'))
+    expect(record.error).toContain('no listener on port 1')
+    expect(record.initiator).toBeUndefined()
   })
 
   it('writes the shutdown snapshot even when the state directory does not exist yet', () => {

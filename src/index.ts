@@ -25,7 +25,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type { AgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
 import { resolveSessionPreset, type PresetBearingSession } from '@deepseek-ai/dsh-agent-presets'
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
-import { resolveRepoDir, resolveStateDir } from './defaults.ts'
+import { resolveRepoDir, resolveStateDir, SRC_ARTIFACT_PATTERN } from './defaults.ts'
 import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
 import { stateFile } from './state-files.ts'
 import {
@@ -447,7 +447,7 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     clear: () => clearCredential(stateDir, Date.now()),
     status: () => loadState(stateDir),
     checkpoint: (message) => {
-      const result = commitCheckpoint(repoDir, `dsh-ankh-guard checkpoint: ${message ?? 'batch snapshot'}`)
+      const result = commitCheckpoint(repoDir, `dsh-ankh-guard checkpoint: ${message ?? 'batch snapshot'}`, SRC_ARTIFACT_PATTERN)
       if (!result.ok) return result
       setCheckpoint(stateDir, { revision: result.sha, message: message ?? 'batch snapshot' }, Date.now())
       return result

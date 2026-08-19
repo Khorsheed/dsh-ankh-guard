@@ -19,6 +19,11 @@ export interface RestartRecord {
   error?: string
   /** Session id of the agent that scheduled the exit, when known. */
   initiator?: string
+  /**
+   * The watchdog recovered an UNPLANNED exit (crash, or a stop outside the
+   * guard) — written on the respawn so the recovery is reported, not silent.
+   */
+  unexpected?: boolean
   reportedAt?: number
 }
 
@@ -74,6 +79,9 @@ export function pendingRestartRecord(stateDir: string): RestartRecord | null {
 export function restartContextText(record: RestartRecord, canaryPending: boolean): string {
   if (record.exitAt === undefined && record.error === undefined) return ''
   const time = record.exitAt !== undefined ? new Date(record.exitAt).toISOString() : '未知时间'
+  if (record.unexpected === true) {
+    return `[ankh-guard] 服务最近发生过一次非计划退出（崩溃或被手动停止）：${time}，watchdog 已自动拉起实例。请向用户简要回报这次非计划重启。`
+  }
   const outcome = record.error !== undefined ? `失败（${record.error}）` : '成功'
   const canary = canaryPending ? '金丝雀尚未完成' : '金丝雀已处理'
   return `[ankh-guard] 服务最近重启过：${time}，退出${outcome}，${canary}。请向用户简要回报本次重启结果。`
@@ -101,6 +109,9 @@ export function continueInterruptedText(exitAt: number): string {
 export function continueAndReportText(record: RestartRecord, canaryPending: boolean): string {
   if (record.exitAt === undefined && record.error === undefined) return ''
   const time = record.exitAt !== undefined ? new Date(record.exitAt).toISOString() : '未知时间'
+  if (record.unexpected === true) {
+    return `[ankh-guard] 服务于 ${time} 发生非计划退出（崩溃或被手动停止），watchdog 已自动拉起实例。你上次正在进行的回合被中断（日志已标记 interrupted）。请检查当前状态并继续未完成的任务，并向用户简要回报这次非计划重启；若任务已不再适用，简要说明原因后停止。`
+  }
   const outcome = record.error !== undefined ? `失败（${record.error}）` : '成功'
   const canary = canaryPending ? '金丝雀尚未完成' : '金丝雀已处理'
   return `[ankh-guard] 服务于 ${time} 重启，退出${outcome}，${canary}。你上次正在进行的回合被中断（日志已标记 interrupted）。请检查当前状态并继续未完成的任务，并向用户简要回报本次重启结果；若任务已不再适用，简要说明原因后停止。`

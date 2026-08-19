@@ -29,3 +29,13 @@ export function resolveRepoDir(configRepoDir: string | undefined): string {
   if (configRepoDir !== undefined && configRepoDir !== '') return configRepoDir
   return process.cwd()
 }
+
+/**
+ * Files that look like bare-tsc emissions next to sources (real build output
+ * goes to `lib/`). Swept into a checkpoint they pollute diffs forever after —
+ * surfaced as a warning, never a refusal: a checkpoint's job is to preserve
+ * work, including a dirty tree. This is deployment knowledge (the
+ * harness/dsh-plugins monorepo layout); the git helper stays generic and
+ * takes it as a parameter.
+ */
+export const SRC_ARTIFACT_PATTERN = /^packages\/[^/]+\/[^/]+\/src\/.+\.(?:js|d\.ts|js\.map|d\.ts\.map)$/

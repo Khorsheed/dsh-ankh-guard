@@ -48,6 +48,14 @@ Runtime needs: `node`, `bash`, `lsof` on macOS/Linux for listener discovery (`--
 - **git is required.** The credential, checkpoints, and rollback are all git-based: the credential binds HEAD, a checkpoint is a real commit, rollback is a reset. If the deployment directory is not a git repository, `git init` it and make an initial commit before `record` — otherwise the gate refuses with "current git HEAD unavailable". The `git init` is not ceremony: with a repository in place, the checkpoint/rollback recovery anchors actually work.
 - **Full-access (unsandboxed) permissions.** The restart loop spawns detached processes, kills processes, and binds ports; sandboxed tool runners (workspace-write and the like) deny those operations with EPERM and the instance dies at the shell layer (a real incident: the `/dev/fd` open of `> >(tee …)` was refused, four "boot failures" straight to the crash page). Before initiating a self-restart, confirm with the user that the session runs with full access; if not, ask them to switch first.
 
+## Known install pitfalls
+
+- **A GitHub install builds from source.** `dsh plugin add github:…` clones and runs `prepare` (a full devDependency install + build). The npm release (`@khorsheed/dsh-ankh-guard`) ships the built `lib/` — prefer it unless you specifically need the repo edge.
+- **pnpm blocks dependency build scripts by default.** If the add fails on a build-script interception, allow the toolchain entries via `allowBuilds` and retry.
+- **A root-owned npm cache** (one `sudo npm …` in the past) fails the prepare build with EPERM: `sudo chown -R $(id -u):$(id -g) ~/.npm`.
+- **`--start` does not run from your cwd.** The watchdog `cd`s into the dsh home (else `/tmp`) before launching, so the start command must be self-contained — absolute paths, or an explicit `cd` inside it.
+- **Supervision adopted from a sandboxed session stays sandboxed.** A watchdog spawned from inside a workspace-write sandbox passes that profile to every respawned instance (nested sandbox-exec then fails, and every command degrades to approvals). For a permanent deployment, use the layered shape (the launchd/systemd installer) so the watchdog chain starts outside any sandbox.
+
 ## CLI
 
 The primary interface is the CLI, usable even when the instance is down. Use the `dsh-ankh-guard` bin (or `node lib/cli.js`). Every command takes `--state-dir "$DSH_HOME/state" --repo "$PWD"`.

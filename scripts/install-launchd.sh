@@ -131,7 +131,7 @@ xml_escape() {
 
 # One bash -c line: `exec <cli> supervise --foreground ...` so launchd restarts
 # the CLI (which exits with the watchdog) — never the watchdog script directly.
-PROGRAM="exec $CLI supervise --foreground --port $PORT --start $(printf '%q' "$START") --state-dir $(printf '%q' "$STATE_DIR") --repo $(printf '%q' "$REPO") --log $(printf '%q' "$LOG_OUT") --home $(printf '%q' "$HOME_DIR")"
+PROGRAM="exec $CLI supervise --foreground --port $PORT --start $(printf '%q' "$START") --state-dir $(printf '%q' "$STATE_DIR") --repo $(printf '%q' "$REPO") --home $(printf '%q' "$HOME_DIR")"
 
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 mkdir -p "$(dirname "$PLIST")"

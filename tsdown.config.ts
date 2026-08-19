@@ -9,7 +9,7 @@ import { defineConfig } from 'tsdown'
 export default defineConfig(({ env }) => {
   const client = env?.DSH_BUILD_FACE === 'client'
   return {
-    entry: client ? '' : ['lib/types/{index,invariant,cli,preflight-runner}.js'],
+    entry: client ? '' : ['lib/types/{index,invariant,cli,preflight-runner,exit-agent}.js'],
     outDir: 'lib',
     format: ['esm'],
     platform: 'node',

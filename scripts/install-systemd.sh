@@ -124,7 +124,7 @@ LOG_ERR="$STATE_DIR/watchdog.stderr.log"
 
 # One bash -c line: `exec <cli> supervise --foreground ...` so systemd restarts
 # the CLI (which exits with the watchdog) — never the watchdog script directly.
-PROGRAM="exec $CLI supervise --foreground --port $PORT --start $(printf '%q' "$START") --state-dir $(printf '%q' "$STATE_DIR") --repo $(printf '%q' "$REPO") --log $(printf '%q' "$LOG_OUT") --home $(printf '%q' "$HOME_DIR")"
+PROGRAM="exec $CLI supervise --foreground --port $PORT --start $(printf '%q' "$START") --state-dir $(printf '%q' "$STATE_DIR") --repo $(printf '%q' "$REPO") --home $(printf '%q' "$HOME_DIR")"
 
 # Quote one value as a single systemd argument. systemd does NOT parse shell
 # quoting: it splits on whitespace and understands double quotes with backslash
