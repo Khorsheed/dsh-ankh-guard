@@ -904,6 +904,13 @@ describe('supervise', () => {
       const emptyLock = io()
       await runCli(['restart', '--port', String(port), '--start', 'true', ...flags], emptyLock.io)
       expect(emptyLock.err.join()).not.toContain('already in flight')
+      // A FRESH pending marker (schedule-exit in flight): restart must see
+      // the other pending stop and refuse — the exit agent would otherwise
+      // SIGTERM the instance this restart just started.
+      writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({ requestedAt: Date.now() }))
+      const marked = io()
+      expect(await runCli(['restart', '--port', String(port), '--start', 'true', ...flags], marked.io)).toBe(1)
+      expect(marked.err.join()).toContain('scheduled exit is still pending')
     } finally {
       env.restore()
     }
@@ -936,6 +943,17 @@ describe('supervise', () => {
         stale.io,
       )).toBe(0)
       expect(stale.err.join()).toContain('stale restart marker')
+      // And the reverse direction: a live restart lock means an instance is
+      // being restarted right now — the exit agent would kill the one it starts.
+      rmSync(join(stateDir, 'restart-requested.json'), { force: true })
+      writeFileSync(join(stateDir, 'restart.lock'), String(process.pid))
+      const locked = io()
+      expect(await runCli(
+        ['schedule-exit', '--port', '1', '--delay-ms', '60000', '--state-dir', stateDir, '--repo', repo],
+        locked.io,
+      )).toBe(1)
+      expect(locked.err.join()).toContain('restart is in flight')
+      rmSync(join(stateDir, 'restart.lock'), { force: true })
     } finally {
       env.restore()
     }

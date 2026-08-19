@@ -340,6 +340,37 @@ const DEFAULT_PREFLIGHT_TIMEOUT_MS = 120_000
 /** A pending restart marker older than this is stale — its watchdog died mid-flow. */
 const RESTART_MARKER_TTL_MS = 15 * 60_000
 
+/**
+ * The restart marker's state. Every verb that can stop the instance must
+ * consult this (and the restart lock) — a stop right invisible to the other
+ * verb is how an exit agent once got to SIGTERM a freshly restarted instance.
+ */
+function restartMarkerState(stateDir: string): 'none' | 'fresh' | 'stale' {
+  const file = stateFile(stateDir, 'restartRequested')
+  if (!existsSync(file)) return 'none'
+  try {
+    const marker = JSON.parse(readFileSync(file, 'utf8')) as { requestedAt?: number }
+    return typeof marker.requestedAt === 'number' && Date.now() - marker.requestedAt <= RESTART_MARKER_TTL_MS ? 'fresh' : 'stale'
+  } catch {
+    return 'stale' // unparseable is stale by definition
+  }
+}
+
+/** The restart lock's live holder pid (as a string), or null when free/stale. */
+function liveRestartLockHolder(stateDir: string): string | null {
+  try {
+    const raw = readFileSync(stateFile(stateDir, 'restartLock'), 'utf8').trim()
+    const pid = Number(raw)
+    if (raw !== '' && Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0)
+        return raw
+      } catch { /* dead holder */ }
+    }
+  } catch { /* no lock file */ }
+  return null
+}
+
 /** Captured preflight output is diagnostics, not a log — cap it before it can grow without bound. */
 const PREFLIGHT_OUTPUT_CAP = 64 * 1024
 
@@ -771,6 +802,13 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         return 1
       }
       try {
+        // A scheduled exit is pending: its exit agent fires later and would
+        // SIGTERM the instance THIS restart just started. See all pending
+        // stops before becoming one.
+        if (restartMarkerState(stateDir) === 'fresh') {
+          io.stderr('restart refused: a scheduled exit is still pending (restart-requested.json) — its exit agent would kill the instance this restart starts; wait for it or remove the stale marker\n')
+          return 1
+        }
         // Graceful self-restart: wait out the delay so the scheduling agent's
         // turn completes and its final message is delivered before the stop.
         if (options.delayMs !== undefined && options.delayMs > 0) {
@@ -968,17 +1006,21 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // mid-flow without clearing it) — overwrite with a warning instead of
       // refusing forever.
       const markerFile = stateFile(stateDir, 'restartRequested')
-      if (existsSync(markerFile)) {
-        let stale = false
-        try {
-          const marker = JSON.parse(readFileSync(markerFile, 'utf8')) as { requestedAt?: number }
-          stale = typeof marker.requestedAt !== 'number' || Date.now() - marker.requestedAt > RESTART_MARKER_TTL_MS
-        } catch { stale = true }
-        if (!stale) {
-          io.stderr('schedule-exit refused: a restart is already scheduled (restart-requested.json still pending); a stale marker expires on its own after 15 minutes\n')
-          return 1
-        }
+      const markerState = restartMarkerState(stateDir)
+      if (markerState === 'fresh') {
+        io.stderr('schedule-exit refused: a restart is already scheduled (restart-requested.json still pending); a stale marker expires on its own after 15 minutes\n')
+        return 1
+      }
+      if (markerState === 'stale' && existsSync(markerFile)) {
         io.stderr('warning: overwriting a stale restart marker (a previous schedule never completed)\n')
+      }
+      // And the other direction of the same invariant: a restart in flight
+      // (live lock holder) means an instance is being stopped/started right
+      // now — scheduling an exit would SIGTERM the one it just started.
+      const inFlight = liveRestartLockHolder(stateDir)
+      if (inFlight !== null) {
+        io.stderr(`schedule-exit refused: a restart is in flight (pid ${inFlight}) — the exit agent would kill the instance it is starting\n`)
+        return 1
       }
       // Intentional-restart marker: the supervising watchdog runs the canary
       // after the respawn and clears this on pass. The initiator (the session
