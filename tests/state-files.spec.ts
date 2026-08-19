@@ -25,18 +25,21 @@ const EXPECTED: ReadonlyArray<readonly [script: string, content: string, roles: 
   ['install-systemd.sh', systemd, ['watchdogPid', 'watchdogLog', 'watchdogStderrLog']],
 ]
 
-/** Non-comment lines carrying a re-derived state path (home + '/state'). */
-function rederivations(script: string, homeVar: string): string[] {
-  return script.split('\n').filter(line =>
-    !line.trimStart().startsWith('#')
-    && line.includes(`$${homeVar}/state`)
-    && !line.startsWith('STATE_DIR='))
+const SCRIPTS = [
+  ['dsh-watchdog.sh', watchdog],
+  ['install-launchd.sh', launchd],
+  ['install-systemd.sh', systemd],
+] as const
+
+/** Non-comment lines referencing a state path at all. */
+function stateLines(script: string): string[] {
+  return script.split('\n').filter(line => !line.trimStart().startsWith('#') && line.includes('/state'))
 }
 
 describe('state-directory protocol: bash literals match state-files.ts', () => {
   it('every $STATE_DIR/<name> literal in every bash side is a declared file', () => {
     const declared = new Set(Object.values(STATE_FILES))
-    for (const [name, content] of [['dsh-watchdog.sh', watchdog], ['install-launchd.sh', launchd], ['install-systemd.sh', systemd]] as const) {
+    for (const [name, content] of SCRIPTS) {
       const literals = [...content.matchAll(/\$STATE_DIR\/([A-Za-z0-9._-]+)/g)].map(match => match[1])
       expect(literals.length, `${name} references no $STATE_DIR files`).toBeGreaterThan(0)
       for (const literal of literals) expect(declared.has(literal as never), `${name}: $STATE_DIR/${literal} is undeclared`).toBe(true)
@@ -51,11 +54,15 @@ describe('state-directory protocol: bash literals match state-files.ts', () => {
     }
   })
 
-  it('no bash side re-derives the state directory from the home', () => {
-    // The single permitted occurrence is the STATE_DIR default itself. Any
-    // second one is the round-2 bug's shape: the same path derived twice.
-    expect(rederivations(watchdog, 'DSH_ROOT')).toEqual([])
-    expect(rederivations(launchd, 'HOME_DIR')).toEqual([])
-    expect(rederivations(systemd, 'HOME_DIR')).toEqual([])
+  it('every bash side derives the state directory exactly once', () => {
+    // Spelling- and variable-name-agnostic: any non-comment line mentioning
+    // a state path counts, so a re-derivation in ANY spelling ($HOME/state,
+    // ${HOME}/state, a renamed variable) fails here — a filter keyed on one
+    // bug's exact spelling would pass silently the day the spelling changed.
+    for (const [name, content] of SCRIPTS) {
+      const lines = stateLines(content)
+      expect(lines, `${name}: the state dir must be derived exactly once`).toHaveLength(1)
+      expect(lines[0]?.trimStart(), `${name}: the one derivation must be the STATE_DIR assignment`).toMatch(/^STATE_DIR=/)
+    }
   })
 })
