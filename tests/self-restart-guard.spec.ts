@@ -1040,6 +1040,27 @@ describe('supervise', () => {
     }
   })
 
+  it('schedule-exit warns when no live watchdog will respawn the instance', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    try {
+      expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      stubPreflight('true')
+      const port = await freePort()
+      const out = io()
+      // No watchdog has ever run here: the first-install bootstrap gap must
+      // surface as a warning, not as a silently dead service.
+      expect(await runCli(
+        ['schedule-exit', '--port', String(port), '--delay-ms', '60000', '--state-dir', stateDir, '--repo', repo],
+        out.io,
+      )).toBe(0)
+      expect(out.err.join('')).toContain('no live watchdog')
+    } finally {
+      env.restore()
+    }
+  }, 15_000)
+
   it('schedule-exit fires a detached exit agent that kills the host; the watchdog takes over', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()

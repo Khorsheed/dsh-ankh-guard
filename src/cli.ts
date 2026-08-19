@@ -61,6 +61,14 @@ export interface CliIo {
   stderr: (line: string) => void
 }
 
+/**
+ * Printed by the commands every agent-driven restart flow calls before
+ * restarting: the loop spawns detached processes and signals them, which a
+ * sandboxed tool runner denies (EPERM). Runtime hint, because the README
+ * prerequisite section is not reliably read.
+ */
+const FULL_ACCESS_HINT = 'hint: the restart loop spawns detached processes and signals them — a sandboxed session (not full-access) will fail with EPERM; confirm full access with the user before restarting\n'
+
 const USAGE = `usage: dsh-ankh-guard <command> [args] [flags]
 commands:
   verify [--state-dir DIR] [--repo DIR] [--max-age MIN]
@@ -568,6 +576,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
     case 'verify': {
       const result = verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), options.maxAgeMinutes)
       io.stdout(`${result.reason}\n`)
+      if (result.ok) io.stdout(FULL_ACCESS_HINT)
       return result.ok ? 0 : 1
     }
     case 'record': {
@@ -583,6 +592,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       }
       recordCredential(stateDir, { scope, revision: head, command: options.command ?? '' }, Date.now())
       io.stdout(`recorded green credential: ${scope} @ ${head}\n`)
+      io.stdout(FULL_ACCESS_HINT)
       return 0
     }
     case 'status': {
@@ -855,6 +865,17 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // THE COMPOSITION GATE: a green build does not prove the profile boots.
       if (!(await preflightGate('schedule-exit', resolveProfileName(options), options.preflightTimeoutMs ?? DEFAULT_PREFLIGHT_TIMEOUT_MS, io, resolveHarnessRoot(options.repoDir)))) {
         return 1
+      }
+      // Bootstrap guard: with no live watchdog the scheduled exit leaves the
+      // service DOWN — the classic first-install gap (the running instance
+      // has not loaded the plugin yet, and no supervisor exists yet).
+      let watchdogAlive = false
+      try {
+        const wdPid = Number(readFileSync(stateFile(stateDir, 'watchdogPid'), 'utf8').trim())
+        if (Number.isInteger(wdPid)) { process.kill(wdPid, 0); watchdogAlive = true }
+      } catch { /* no pidfile or a dead owner */ }
+      if (!watchdogAlive) {
+        io.stderr('warning: no live watchdog found — nothing will respawn the instance after this exit. For the FIRST restart after install use `restart` (it owns the whole stop→start→canary loop), or install the launchd/systemd supervisor first\n')
       }
       // Intentional-restart marker: the supervising watchdog runs the canary
       // after the respawn and clears this on pass. The initiator (the session

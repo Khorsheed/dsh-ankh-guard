@@ -50,7 +50,8 @@ dsh plugin --profile web add github:Khorsheed/dsh-ankh-guard
 ## 自我重启的前提（给驱动重启的 agent）
 
 - **git 必需。** 凭证、检查点、回滚全部基于 git：凭证绑定 HEAD，checkpoint 是真实提交，rollback 是 reset。部署目录不是 git 仓库时，先 `git init` 并做一次初始提交，再 `record`——否则门禁以 "current git HEAD unavailable" 拒绝重启。`git init` 不是仪式：有了仓库，checkpoint/rollback 的恢复锚点才真正生效。
-- **需要 full-access（无沙箱）权限。** 重启链路要 spawn detached 进程、kill 进程、绑定端口；沙箱化的 tool runner（workspace-write 之类）会以 EPERM 拒绝其中操作，实例在 shell 层就起不来（真实事故：`> >(tee …)` 的 `/dev/fd` open 被拒，连续四次"启动失败"进崩溃页）。发起自我重启前，先向用户确认会话运行在 full-access 模式；不是的话，请用户切换后再继续。
+- **需要 full-access（无沙箱）权限。** 重启链路要 spawn detached 进程、kill 进程、绑定端口；沙箱化的 tool runner（workspace-write 之类）会以 EPERM 拒绝其中操作，实例在 shell 层就起不来（真实事故：`> >(tee …)` 的 `/dev/fd` open 被拒，连续四次"启动失败"进崩溃页）。发起自我重启前，先向用户确认会话运行在 full-access 模式；不是的话，请用户切换后再继续。（`verify` 和 `record` 的输出也会带这条提示。）
+- **安装后的第一次重启必须用 CLI 驱动。** 正在运行的实例还没加载插件（组合变更要重启才生效），watchdog 也还不存在——此时直接退出实例，服务就躺在地上没人拉。用 `dsh-ankh-guard restart --port N --start "CMD" --rollback`（它在 detached 进程里完成 停→起→canary 全循环），或先装 launchd/systemd 监督器。`schedule-exit` 在找不到存活 watchdog 时会发出警告。
 
 ## 已知安装坑
 
