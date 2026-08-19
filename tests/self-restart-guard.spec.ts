@@ -23,7 +23,7 @@ import {
   acknowledgeRestartRecord, pendingRestartRecord, readInterruptedSnapshot, restartContextText,
   writeInterruptedSnapshot,
 } from '../src/restart-context.ts'
-import { preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, runCli, type CliIo } from '../src/cli.ts'
+import { preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
 import {
   clearCredential, emptyState, lastGoodBootRevision, loadState, recordCredential, setCheckpoint,
   verifyCredential, type GuardState,
@@ -947,6 +947,13 @@ describe('supervise', () => {
     )).toBe(1)
     expect(out.err.join('')).toContain('refused')
     env.restore()
+  })
+
+  it('resolveWdHome: the explicit flag beats DSH_HOME, like every other resolver here', () => {
+    expect(resolveWdHome('/explicit', { DSH_HOME: '/env' })).toBe('/explicit')
+    expect(resolveWdHome('', { DSH_HOME: '/env' })).toBe('/env')
+    expect(resolveWdHome('', {})).toBeUndefined()
+    expect(resolveWdHome('', { DSH_HOME: '' })).toBeUndefined()
   })
 
   it('supervise without DSH_HOME or --home fails loud instead of guessing a home', async () => {

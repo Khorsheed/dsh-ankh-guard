@@ -414,6 +414,19 @@ function resolveProfileName(options: CliOptions): string {
   return env !== '' ? env : 'web'
 }
 
+/**
+ * The home the supervised instance boots with (the watchdog exports it as
+ * DSH_HOME): the explicit flag first, then the environment — the same
+ * flag-over-env order as every other resolver in this CLI (and as the
+ * installers' own --home). Undefined when neither names one: supervise fails
+ * loud rather than boot the instance on a home guessed from the state dir.
+ */
+export function resolveWdHome(optionHome: string, env: Record<string, string | undefined> = process.env): string | undefined {
+  if (optionHome !== '') return optionHome
+  const fromEnv = env.DSH_HOME
+  return fromEnv !== undefined && fromEnv !== '' ? fromEnv : undefined
+}
+
 /** The first ~40 lines of captured preflight output, newline-terminated, or empty. */
 function summarizeOutput(output: string): string {
   if (output.trim() === '') return ''
@@ -735,9 +748,9 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // as DSH_HOME): a home derived from the state dir would silently point
       // the instance at the wrong profiles/credentials, surfacing far from
       // the cause — so a missing home is a loud misconfiguration, not a guess.
-      const wdHome = process.env.DSH_HOME ?? (options.home !== '' ? options.home : undefined)
+      const wdHome = resolveWdHome(options.home)
       if (wdHome === undefined) {
-        io.stderr('supervise needs the dsh home: set DSH_HOME or pass --home DIR — the supervised instance reads its profiles/credentials from there, and deriving one from --state-dir would guess wrong\n')
+        io.stderr('supervise needs the dsh home: pass --home DIR or set DSH_HOME — the supervised instance reads its profiles/credentials from there, and deriving one from --state-dir would guess wrong\n')
         return 2
       }
       // One state directory owns every marker and the pidfile; the plugin,

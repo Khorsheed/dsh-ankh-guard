@@ -20,14 +20,22 @@ import { describe, expect, it } from 'vitest'
 import { composePreflightPatches, resolveHarnessRoot } from '../src/preflight-runner.ts'
 
 const harness = resolveHarnessRoot()
-const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+// Probe the home the guard actually protects in deployment: the same chain
+// the supervisor installers use (DSH_WD_HOME → DSH_HOME → ~/.dsh-official),
+// falling back to the conventional ~/.dsh of a plain npm-line machine. The
+// composition differs wildly between homes, and a tripwire that validates a
+// tree nobody runs is a blank round — the resolved home goes into the test
+// name so a green line says WHICH tree it validated.
+const home = [process.env.DSH_WD_HOME, process.env.DSH_HOME]
+  .find(value => value !== undefined && value !== '')
+  ?? (existsSync(join(homedir(), '.dsh-official')) ? join(homedir(), '.dsh-official') : join(homedir(), '.dsh'))
 const profile = process.env.DSH_PREFLIGHT_PROFILE ?? 'web'
 const harnessPresent = existsSync(join(harness, 'apps/cli'))
-const profilePresent = home !== '' && existsSync(join(home, 'profiles', profile, 'package.json'))
+const profilePresent = existsSync(join(home, 'profiles', profile, 'package.json'))
 
 describe('preflight composition drift tripwire', () => {
   const test = harnessPresent && profilePresent ? it : it.skip
-  test('the runner composes the same entry ids as the launcher dump-config', async () => {
+  test(`the runner composes the same entry ids as the launcher dump-config (home ${home})`, async () => {
     const tsx = join(harness, 'node_modules/tsx/dist/esm/index.mjs')
     // cwd matters: the dump must resolve the harness's workspace packages,
     // not this repo's published ones (a foreign @deepseek-ai/cordis lacks
