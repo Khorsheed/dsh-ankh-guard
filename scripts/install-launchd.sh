@@ -98,7 +98,8 @@ if [ -z "$CLI" ]; then
   fi
 fi
 
-PIDFILE="$HOME_DIR/state/watchdog.pid"
+STATE_DIR="$HOME_DIR/state"
+PIDFILE="$STATE_DIR/watchdog.pid"
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   OLD_PID="$(cat "$PIDFILE")"
   if [ "$FORCE" = "1" ]; then
@@ -119,7 +120,6 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   fi
 fi
 
-STATE_DIR="$HOME_DIR/state"
 LOG_OUT="$STATE_DIR/watchdog.log"
 LOG_ERR="$STATE_DIR/watchdog.stderr.log"
 mkdir -p "$STATE_DIR"

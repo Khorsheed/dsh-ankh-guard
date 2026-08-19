@@ -1,11 +1,13 @@
 /**
  * The guard's state-directory protocol: every file that lives in the state
- * dir, named exactly once. Four processes in three languages (this package's
- * TS, the watchdog's bash, the schedule-exit exit agent's inline JS) read and
- * write these — a literal drifting in any one of them splits the protocol
- * silently (three review rounds of path bugs came from exactly that). The
- * bash side is pinned by tests/state-files.spec.ts, which asserts every
- * $STATE_DIR literal in dsh-watchdog.sh appears here.
+ * dir, named exactly once. Five writers in three languages (this package's
+ * TS, the watchdog's bash, the schedule-exit exit agent's inline JS, and the
+ * two supervisor installers) read and write these — a literal drifting in
+ * any one of them splits the protocol silently (three review rounds of path
+ * bugs came from exactly that). The bash sides are pinned by
+ * tests/state-files.spec.ts, which asserts every state-dir literal in the
+ * watchdog and both installers appears here, and that no script re-derives
+ * the directory from the home.
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -32,6 +34,8 @@ export const STATE_FILES = {
   bootAttemptLog: 'boot-attempt.log',
   /** The watchdog's own log. */
   watchdogLog: 'watchdog.log',
+  /** The watchdog's stderr, captured separately by the supervisor installers. */
+  watchdogStderrLog: 'watchdog.stderr.log',
   /** The exit agent's log. */
   scheduleExitLog: 'schedule-exit.log',
 } as const
