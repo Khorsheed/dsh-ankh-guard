@@ -874,6 +874,73 @@ describe('supervise', () => {
     }
   }, 30_000)
 
+  it('restart refuses while another restart holds the lock; a stale lock is reclaimed', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    try {
+      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      stubPreflight('true')
+      const port = await freePort()
+      // A LIVE holder (this test process): the second restart must refuse,
+      // and nothing must be stopped.
+      writeFileSync(join(stateDir, 'restart.lock'), String(process.pid))
+      const refused = io()
+      expect(await runCli(
+        ['restart', '--port', String(port), '--start', 'true', ...flags], refused.io,
+      )).toBe(1)
+      expect(refused.err.join('')).toContain('already in flight')
+      // A STALE holder (dead pid): reclaimed, the restart proceeds (here it
+      // reaches the port check and finds nothing to restart).
+      writeFileSync(join(stateDir, 'restart.lock'), '999999')
+      const proceeded = io()
+      await runCli(['restart', '--port', String(port), '--start', 'true', ...flags], proceeded.io)
+      expect(proceeded.err.join()).not.toContain('already in flight')
+      // An EMPTY lock (a writer SIGKILLed mid-create): nobody's claim —
+      // Number('') is 0 and kill(0, 0) always succeeds, which once read as
+      // "alive" and refused every restart forever.
+      writeFileSync(join(stateDir, 'restart.lock'), '')
+      const emptyLock = io()
+      await runCli(['restart', '--port', String(port), '--start', 'true', ...flags], emptyLock.io)
+      expect(emptyLock.err.join()).not.toContain('already in flight')
+    } finally {
+      env.restore()
+    }
+  }, 15_000)
+
+  it('schedule-exit refuses while a restart marker is still pending', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    mkdirSync(stateDir, { recursive: true })
+    try {
+      expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      stubPreflight('true')
+      writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({ requestedAt: Date.now() }))
+      const out = io()
+      // Two sessions racing to schedule: the second must not overwrite the
+      // first's initiator.
+      expect(await runCli(
+        ['schedule-exit', '--port', '1', '--delay-ms', '60000', '--state-dir', stateDir, '--repo', repo],
+        out.io,
+      )).toBe(1)
+      expect(out.err.join('')).toContain('already scheduled')
+      // A STALE marker (older than the TTL — a watchdog that died mid-flow
+      // never cleared it) is overwritten with a warning, not refused forever.
+      writeFileSync(join(stateDir, 'restart-requested.json'),
+        JSON.stringify({ requestedAt: Date.now() - 20 * 60_000 }))
+      const stale = io()
+      expect(await runCli(
+        ['schedule-exit', '--port', '1', '--delay-ms', '60000', '--state-dir', stateDir, '--repo', repo],
+        stale.io,
+      )).toBe(0)
+      expect(stale.err.join()).toContain('stale restart marker')
+    } finally {
+      env.restore()
+    }
+  }, 15_000)
+
   it('takeover of a previously-healthy deployment leaves an unplanned-exit record', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
@@ -959,6 +1026,48 @@ describe('supervise', () => {
       env.restore()
     }
   })
+
+  it('reclaims a pidfile deleted underneath it, and yields to a live replacement owner', async () => {
+    // The state dir cleaned under a RUNNING watchdog must not fork
+    // supervision: the watchdog reclaims its claim within one poll; and when
+    // the claim is held by another live process it yields instead of fighting.
+    const home = tmpDir('guard-heal-')
+    mkdirSync(join(home, 'state'), { recursive: true })
+    mkdirSync(join(home, 'home'), { recursive: true })
+    const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
+    const port = await freePort()
+    const wd = spawn('bash', [script, '--supervise'], {
+      env: { ...process.env, WD_HOME: home, WD_PORT: String(port), WD_TEST_FAKE: '1' },
+      stdio: 'ignore',
+      detached: true,
+    })
+    wd.unref()
+    const pidfile = join(home, 'state', 'watchdog.pid')
+    cleanups.unshift(() => {
+      try { process.kill(-(wd.pid ?? 0), 'SIGKILL') } catch { /* not a group leader */ }
+      try { process.kill(wd.pid ?? 0, 'SIGKILL') } catch { /* already gone */ }
+    })
+    const until = async (fn: () => boolean, ms: number): Promise<boolean> => {
+      const deadline = Date.now() + ms
+      while (Date.now() < deadline) {
+        if (fn()) return true
+        await new Promise((resolve) => { setTimeout(resolve, 200) })
+      }
+      return false
+    }
+    // Up and claimed.
+    expect(await until(() => existsSync(pidfile) && readFileSync(pidfile, 'utf8').trim() === String(wd.pid), 15_000)).toBe(true)
+    // Deleted underneath → reclaimed by the same pid.
+    unlinkSync(pidfile)
+    expect(await until(() => existsSync(pidfile) && readFileSync(pidfile, 'utf8').trim() === String(wd.pid), 10_000)).toBe(true)
+    // A live replacement owner → the watchdog yields (exits) rather than fighting.
+    writeFileSync(pidfile, String(process.pid))
+    expect(await until(() => {
+      try { process.kill(wd.pid ?? 0, 0); return false } catch { return true }
+    }, 10_000)).toBe(true)
+    // ...and its pidfile claim was NOT stolen back or deleted (it names us).
+    expect(readFileSync(pidfile, 'utf8').trim()).toBe(String(process.pid))
+  }, 45_000)
 
   it('claims the pidfile atomically — concurrent watchdogs leave exactly one supervisor', async () => {
     // The CLI check above serializes two SEQUENTIAL supervise calls. This

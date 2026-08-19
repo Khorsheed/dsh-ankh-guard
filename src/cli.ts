@@ -19,7 +19,7 @@
  *              instance restart killed the session that used to own it.
  */
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { connect } from 'node:net'
 import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
@@ -79,10 +79,55 @@ const NO_WATCHDOG_HINT = 'warning: no live watchdog supervises the instance — 
 /** The live supervising watchdog's pid, or null when none is (pidfile + kill 0). */
 function liveWatchdogPid(stateDir: string): number | null {
   try {
-    const pid = Number(readFileSync(stateFile(stateDir, 'watchdogPid'), 'utf8').trim())
-    if (Number.isInteger(pid)) { process.kill(pid, 0); return pid }
+    const raw = readFileSync(stateFile(stateDir, 'watchdogPid'), 'utf8').trim()
+    const pid = Number(raw)
+    // raw '' → 0, and kill(0, 0) always succeeds (it probes our own process
+    // group): an empty pidfile must read as NO watchdog, never as alive.
+    if (raw !== '' && Number.isInteger(pid) && pid > 0) { process.kill(pid, 0); return pid }
   } catch { /* no pidfile or a dead owner */ }
   return null
+}
+
+/**
+ * Cross-session restart mutual exclusion: two concurrent restarts would both
+ * stop the listener and double-start the instance — a port race whose loser
+ * dies silently (stdio ignored). Atomic create, the watchdog pidfile's own
+ * discipline; a stale lock (dead holder, or an empty file left by a writer
+ * SIGKILLed mid-create) is reclaimed.
+ */
+function acquireRestartLock(stateDir: string): { ok: true; release(): void } | { ok: false; holder: string } {
+  const file = stateFile(stateDir, 'restartLock')
+  mkdirSync(stateDir, { recursive: true })
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(file, String(process.pid), { flag: 'wx' })
+      return {
+        ok: true,
+        release: () => { try { unlinkSync(file) } catch { /* idempotent: the file is already gone */ } },
+      }
+    } catch {
+      // The lock exists. Reclaim only when the holder is provably dead.
+      let holder: string
+      try {
+        holder = readFileSync(file, 'utf8').trim()
+      } catch (error) {
+        return { ok: false, holder: `unreadable (${String(error)})` }
+      }
+      const pid = Number(holder)
+      if (holder !== '' && Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, 0)
+          return { ok: false, holder }
+        } catch { /* dead holder — reclaim below */ }
+      }
+      try {
+        unlinkSync(file)
+      } catch (error) {
+        return { ok: false, holder: `unreclaimable (${String(error)})` }
+      }
+    }
+  }
+  return { ok: false, holder: 'unknown' }
 }
 
 const USAGE = `usage: dsh-ankh-guard <command> [args] [flags]
@@ -291,6 +336,9 @@ function exitAgentInvocation(): string[] {
 
 /** Default bound on one preflight subprocess run (a real web-profile boot takes tens of seconds). */
 const DEFAULT_PREFLIGHT_TIMEOUT_MS = 120_000
+
+/** A pending restart marker older than this is stale — its watchdog died mid-flow. */
+const RESTART_MARKER_TTL_MS = 15 * 60_000
 
 /** Captured preflight output is diagnostics, not a log — cap it before it can grow without bound. */
 const PREFLIGHT_OUTPUT_CAP = 64 * 1024
@@ -704,6 +752,22 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       if (!(await preflightGate('restart', resolveProfileName(options), options.preflightTimeoutMs ?? DEFAULT_PREFLIGHT_TIMEOUT_MS, io, resolveHarnessRoot(options.repoDir)))) {
         return 1
       }
+      // ONE restart at a time across sessions: two concurrent restarts would
+      // both stop the listener and double-start the instance — a port race
+      // whose loser dies silently. The lock is held only until the stop
+      // ONE restart at a time across sessions: two concurrent restarts would
+      // both stop the listener and double-start the instance — a port race
+      // whose loser dies silently. Held to the END of the verb (boot watch
+      // and canary included): a second restart must not find and kill the
+      // instance this one just started. Crash safety comes from the stale
+      // reclaim in acquireRestartLock, not from an early release.
+      const restartLock = acquireRestartLock(stateDir)
+      if (!restartLock.ok) {
+        io.stderr(/^\d+$/.test(restartLock.holder)
+          ? `restart refused: another restart is already in flight (pid ${restartLock.holder})\n`
+          : `restart refused: cannot claim the restart lock (${restartLock.holder}) — remove ${stateFile(stateDir, 'restartLock')} if it is stale\n`)
+        return 1
+      }
       // Graceful self-restart: wait out the delay so the scheduling agent's
       // turn completes and its final message is delivered before the stop.
       if (options.delayMs !== undefined && options.delayMs > 0) {
@@ -712,6 +776,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       }
       const pid = options.pid ?? findPidOnPort(port)
       if (pid === null || pid === '') {
+        restartLock.release()
         io.stderr(`nothing listening on 127.0.0.1:${port} — nothing to restart\n`)
         return 1
       }
@@ -719,6 +784,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       try {
         process.kill(pidNumber, 'SIGTERM')
       } catch (error) {
+        restartLock.release()
         io.stderr(`stop ${pid} failed: ${String(error)}\n`)
         return 1
       }
@@ -746,6 +812,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         await sleep(500)
       }
       if (!listening) {
+        restartLock.release()
         io.stderr(`new instance not listening on 127.0.0.1:${port} within ${timeoutMs}ms\n`)
         if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
         return 1
@@ -753,6 +820,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       const post = verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), options.maxAgeMinutes)
       io.stdout(`canary verify: ${post.ok ? 'PASS' : 'FAIL'} — ${post.reason}\n`)
       io.stdout(`canary port: PASS — listening on 127.0.0.1:${port}\n`)
+      restartLock.release()
       if (!post.ok) {
         if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
         return 1
@@ -891,6 +959,24 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // has not loaded the plugin yet, and no supervisor exists yet).
       if (liveWatchdogPid(stateDir) === null) {
         io.stderr(NO_WATCHDOG_HINT)
+      }
+      // One scheduled restart at a time: the marker carries a single
+      // initiator, so overwriting a FRESH one would silently reassign the
+      // pending report. A marker past the TTL is stale (the watchdog died
+      // mid-flow without clearing it) — overwrite with a warning instead of
+      // refusing forever.
+      const markerFile = stateFile(stateDir, 'restartRequested')
+      if (existsSync(markerFile)) {
+        let stale = false
+        try {
+          const marker = JSON.parse(readFileSync(markerFile, 'utf8')) as { requestedAt?: number }
+          stale = typeof marker.requestedAt !== 'number' || Date.now() - marker.requestedAt > RESTART_MARKER_TTL_MS
+        } catch { stale = true }
+        if (!stale) {
+          io.stderr('schedule-exit refused: a restart is already scheduled (restart-requested.json still pending); a stale marker expires on its own after 15 minutes\n')
+          return 1
+        }
+        io.stderr('warning: overwriting a stale restart marker (a previous schedule never completed)\n')
       }
       // Intentional-restart marker: the supervising watchdog runs the canary
       // after the respawn and clears this on pass. The initiator (the session

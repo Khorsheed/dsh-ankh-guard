@@ -26,6 +26,8 @@ export const STATE_FILES = {
   interruptedSessions: 'interrupted-sessions.json',
   /** The supervising watchdog's pidfile. */
   watchdogPid: 'watchdog.pid',
+  /** Cross-session mutual exclusion for the restart verb. */
+  restartLock: 'restart.lock',
   /** Marker: exit the watchdog without respawn. */
   watchdogStop: 'watchdog-stop',
   /** Marker: the watchdog gave up; a crash page holds the port. */

@@ -288,6 +288,7 @@ rm -f "$GIVE_UP_MARKER"
 failures=0
 reset_done=0
 port_races=0
+yielded=0
 
 trap 'retry_on_usrs' USR1
 
@@ -298,7 +299,9 @@ trap 'retry_on_usrs' USR1
 # start's free_port covers that case. (`set -u` — guard every var.)
 cleanup() {
   if [ -n "${page_pid:-}" ]; then kill "$page_pid" 2>/dev/null; fi
-  if [ -n "${child:-}" ]; then kill_tree "$child" TERM; fi
+  # A YIELDING watchdog leaves its instance running for the new owner (the
+  # port is healthy; killing it would just make the successor respawn).
+  if [ -n "${child:-}" ] && [ "${yielded:-0}" != "1" ]; then kill_tree "$child" TERM; fi
   # Drop the pidfile ONLY while it names us: a successor watchdog may have
   # already claimed it in the restart window, and deleting theirs would let a
   # second supervisor in.
@@ -320,6 +323,20 @@ else
 fi
 
 while true; do
+  # Self-heal the ownership claim FIRST: if the state dir (or the pidfile) was
+  # cleaned underneath a live watchdog, reclaim it; if another LIVE watchdog
+  # now holds it, yield — two supervisors on one port reap each other's
+  # instance (observed: stale watchdog + deleted pidfile → second watchdog
+  # spawned → both fought over the port).
+  if [ "$SUPERVISE" = "1" ]; then
+    if [ ! -f "$PIDFILE" ]; then (set -C; echo $$ > "$PIDFILE") 2>/dev/null || true; fi
+    pidowner=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$pidowner" ] && [ "$pidowner" != "$$" ] && kill -0 "$pidowner" 2>/dev/null; then
+      echo "[watchdog] pidfile now owned by live pid $pidowner — yielding"
+      yielded=1
+      exit 0
+    fi
+  fi
   # Snapshot BEFORE this boot rewrites it: the stamp exists iff this
   # deployment has ever come up healthy — the discriminator between
   # "recovered an unplanned exit" and "first boot ever" (a first boot must
@@ -464,8 +481,23 @@ while true; do
   failures=0
   reset_done=0
   port_races=0
+  # Watch the instance with a poll loop rather than a bare wait: the ownership
+  # claim needs the same self-heal while the instance is healthy (the state
+  # dir can be cleaned underneath a live watchdog at any time — that is how a
+  # second supervisor once got spawned and both fought over the port).
+  while kill -0 "$child" 2>/dev/null; do
+    if [ "$SUPERVISE" = "1" ]; then
+      if [ ! -f "$PIDFILE" ]; then (set -C; echo $$ > "$PIDFILE") 2>/dev/null || true; fi
+      pidowner=$(cat "$PIDFILE" 2>/dev/null)
+      if [ -n "$pidowner" ] && [ "$pidowner" != "$$" ] && kill -0 "$pidowner" 2>/dev/null; then
+        echo "[watchdog] pidfile now owned by live pid $pidowner — yielding (instance left running for the new owner)"
+        yielded=1
+        exit 0
+      fi
+    fi
+    sleep 2
+  done
   wait "$child"
-  exit_code=$?
 
   # Explicit stop: exit the watchdog without respawn.
   if [ -f "$STOP_MARKER" ]; then
