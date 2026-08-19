@@ -43,6 +43,11 @@ Config (all optional): `stateDir` (default `$DSH_HOME/state`, else `<cwd>/.dsh-g
 
 Runtime needs: `node`, `bash`, `lsof` on macOS/Linux for listener discovery (`--pid` bypasses it), and `pgrep` for descendant reaping (the watchdog's `free_port`/cleanup and `restart`'s forced-kill escalation walk the child tree instead of assuming a process group). No build step for consumers — the published `lib/` is the runnable artifact.
 
+## Prerequisites for a self-restart (for the agent driving it)
+
+- **git is required.** The credential, checkpoints, and rollback are all git-based: the credential binds HEAD, a checkpoint is a real commit, rollback is a reset. If the deployment directory is not a git repository, `git init` it and make an initial commit before `record` — otherwise the gate refuses with "current git HEAD unavailable". The `git init` is not ceremony: with a repository in place, the checkpoint/rollback recovery anchors actually work.
+- **Full-access (unsandboxed) permissions.** The restart loop spawns detached processes, kills processes, and binds ports; sandboxed tool runners (workspace-write and the like) deny those operations with EPERM and the instance dies at the shell layer (a real incident: the `/dev/fd` open of `> >(tee …)` was refused, four "boot failures" straight to the crash page). Before initiating a self-restart, confirm with the user that the session runs with full access; if not, ask them to switch first.
+
 ## CLI
 
 The primary interface is the CLI, usable even when the instance is down. Use the `dsh-ankh-guard` bin (or `node lib/cli.js`). Every command takes `--state-dir "$DSH_HOME/state" --repo "$PWD"`.
