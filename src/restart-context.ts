@@ -9,7 +9,7 @@
  * those sessions and queue a "continue" turn. Pure logic reads the durable
  * files; the plugin wires them into `agent/created` and `agent.followup`.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** The exit agent's durable restart record (written by `schedule-exit`). */
@@ -114,7 +114,7 @@ export function continueAndReportText(record: RestartRecord, canaryPending: bool
  */
 export function acknowledgeRestartRecord(stateDir: string, record: RestartRecord, now: number): void {
   try {
-    writeFileSync(restartRecordFile(stateDir), `${JSON.stringify({ ...record, reportedAt: now })}\n`)
+    atomicWrite(restartRecordFile(stateDir), `${JSON.stringify({ ...record, reportedAt: now })}\n`)
   } catch {
     // Best-effort: an unwritable record re-injects next step rather than crashing.
   }
@@ -149,8 +149,15 @@ export function readInterruptedSnapshot(stateDir: string): InterruptedSnapshot |
 export function writeInterruptedSnapshot(stateDir: string, snapshot: InterruptedSnapshot): void {
   try {
     mkdirSync(stateDir, { recursive: true })
-    writeFileSync(interruptedSnapshotFile(stateDir), `${JSON.stringify(snapshot)}\n`)
+    atomicWrite(interruptedSnapshotFile(stateDir), `${JSON.stringify(snapshot)}\n`)
   } catch {
     // Best-effort: a failed snapshot loses auto-continue for this stop, never the process.
   }
+}
+
+/** Write a small durable file atomically (tmp + rename in the same directory). */
+function atomicWrite(file: string, content: string): void {
+  const tmp = `${file}.${process.pid}.tmp`
+  writeFileSync(tmp, content)
+  renameSync(tmp, file)
 }

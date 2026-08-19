@@ -992,6 +992,37 @@ describe('supervise', () => {
     }
   }, 30_000)
 
+  it('schedule-exit writes marker and result into an explicit state dir, not a derived home', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    // Deliberately NOT <home>/state: the write side once derived a home from
+    // stateDir and re-appended 'state', landing markers in <cwd>/state while
+    // the plugin read <cwd>/.dsh-guard-state — report and resume both lost.
+    const stateDir = tmpDir('guard-cli-')
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    try {
+      expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      stubPreflight('true')
+      expect(await runCli(
+        ['schedule-exit', '--port', String(port), '--delay-ms', '20', '--initiator', 'session-x',
+          '--state-dir', stateDir, '--repo', repo],
+        io().io,
+      )).toBe(0)
+      expect(existsSync(join(stateDir, 'restart-requested.json'))).toBe(true)
+      expect(existsSync(join(env.home, 'state', 'restart-requested.json'))).toBe(false)
+      // No listener on the port: the exit agent records its error result in
+      // the same state directory.
+      const deadline = Date.now() + 5000
+      while (!existsSync(join(stateDir, 'last-restart.json')) && Date.now() < deadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 50) })
+      }
+      expect(existsSync(join(stateDir, 'last-restart.json'))).toBe(true)
+      expect(existsSync(join(env.home, 'state', 'last-restart.json'))).toBe(false)
+    } finally {
+      env.restore()
+    }
+  }, 15_000)
+
   it('rolls back to the deployment-proven boot stamp, leaving HEAD and WIP anchors', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
@@ -1675,6 +1706,40 @@ describe('restart context injection', () => {
     await new Promise((resolve) => { setTimeout(resolve, 100) })
     expect(resume).not.toHaveBeenCalled()
     expect(existsSync(join(stateDir, 'interrupted-sessions.json'))).toBe(true)
+    await fiber.dispose()
+  })
+
+  it("reportRestartContext: 'off' still resumes interrupted sessions — report and resume are independent", async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now(), resume: [], interrupted: ['session-busy'] }))
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const resumed: string[] = []
+    const liveAgents: Array<{ id: string; status: string; followup: ReturnType<typeof vi.fn> }> = []
+    ctx.provide('agents', {
+      roots: () => liveAgents,
+      list: () => liveAgents,
+      resume: async (options: { resumeSessionId: string }) => {
+        resumed.push(options.resumeSessionId)
+        const agent = { id: options.resumeSessionId, status: 'idle', followup: vi.fn() }
+        liveAgents.push(agent)
+        ctx.emit('agent/created', { agent } as never)
+        return agent
+      },
+    } as never)
+    // Regression: the whole resume half once lived inside `reportMode ===
+    // 'followup'`, so 'off' (or 'step') silently disabled session recovery.
+    const fiber = ctx.plugin(selfRestartGuard,
+      { stateDir, repoDir: repo, maxAgeMinutes: 5, reportRestartContext: 'off', resumeDelayMs: 20 })
+    await fiber.await()
+    const deadline = Date.now() + 5000
+    while (resumed.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 20) })
+    }
+    expect(resumed).toEqual(['session-busy'])
+    expect(liveAgents[0]?.followup).toHaveBeenCalledTimes(1)
     await fiber.dispose()
   })
 

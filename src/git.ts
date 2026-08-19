@@ -13,7 +13,10 @@ import { execFileSync } from 'node:child_process'
  */
 export function currentHead(repoDir: string): string | null {
   try {
-    const out = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8' }).trim()
+    // stdio 'pipe': without it a non-git directory forwards git's stderr
+    // ("fatal: not a git repository…") into the host's log — expected states
+    // must stay silent.
+    const out = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8', stdio: 'pipe' }).trim()
     return out.length > 0 ? out : null
   } catch {
     return null

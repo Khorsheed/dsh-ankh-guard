@@ -727,10 +727,14 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stderr(`supervise requires --port N and --start "CMD"\n\n${USAGE}`)
         return 2
       }
-      // The watchdog writes its pidfile under <home>/state; reuse the running
-      // one when it is still alive (one supervisor owns the port).
+      // One state directory owns every marker and the pidfile; the plugin,
+      // this CLI, and the watchdog must agree on it. Deriving a home from
+      // stateDir and re-appending 'state' breaks whenever stateDir is not
+      // literally '$DSH_HOME/state' (an explicit --state-dir, or the
+      // '<cwd>/.dsh-guard-state' fallback): the CLI would write '<cwd>/state'
+      // while the plugin reads '<cwd>/.dsh-guard-state'.
       const wdHome = process.env.DSH_HOME ?? dirname(stateDir)
-      const pidfile = join(wdHome, 'state', 'watchdog.pid')
+      const pidfile = join(stateDir, 'watchdog.pid')
       if (existsSync(pidfile)) {
         const existing = readFileSync(pidfile, 'utf8').trim()
         const existingPid = Number(existing)
@@ -773,12 +777,13 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stderr(`watchdog script not found at ${watchdog}\n`)
         return 1
       }
-      const logPath = options.log ?? join(wdHome, 'state', 'watchdog.log')
+      const logPath = options.log ?? join(stateDir, 'watchdog.log')
       mkdirSync(dirname(logPath), { recursive: true })
       const env = {
         ...process.env,
         WD_PORT: String(port),
         WD_HOME: wdHome,
+        WD_STATE_DIR: stateDir,
         WD_REPO: repoDir,
         WD_START: options.start,
         // Foreground (launchd-supervised) mode: the watchdog owns the port by
@@ -829,11 +834,12 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // Intentional-restart marker: the supervising watchdog runs the canary
       // after the respawn and clears this on pass. The initiator (the session
       // that requested the exit) rides along so the restart report can return
-      // to that session instead of racing to whichever root agent resumes first.
-      const wdHome = process.env.DSH_HOME ?? dirname(stateDir)
+      // to that session instead of racing to whichever root agent resumes
+      // first. Everything lands in stateDir directly — the same directory the
+      // plugin reads (see the supervise case for why no home is derived).
       const initiator = options.initiator ?? process.env.DSH_SESSION_ID
-      mkdirSync(join(wdHome, 'state'), { recursive: true })
-      writeFileSync(join(wdHome, 'state', 'restart-requested.json'),
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, 'restart-requested.json'),
         `${JSON.stringify({
           reason: 'scheduled self-restart',
           requestedAt: Date.now(),
@@ -843,8 +849,8 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // the sandbox/harness process group, so the scheduled kill actually
       // lands even after the scheduling turn ends — the fix for "the kill
       // never happened" seen with `(sleep N; kill) &` from a managed shell.
-      const resultFile = join(wdHome, 'state', 'last-restart.json')
-      const logPath = options.log ?? join(wdHome, 'state', 'schedule-exit.log')
+      const resultFile = join(stateDir, 'last-restart.json')
+      const logPath = options.log ?? join(stateDir, 'schedule-exit.log')
       mkdirSync(dirname(logPath), { recursive: true })
       const script = [
         "const { execFileSync } = require('node:child_process');",

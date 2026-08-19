@@ -217,7 +217,13 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
   //    resume pass re-creates those agents via `ctx.agents.resume` and queues
   //    a "continue" followup for the interrupted ones (their logs were closed
   //    with `reason.kind === 'interrupted'` by crash-recovery repair).
-  if (reportMode === 'followup') {
+  //
+  // The two halves are gated INDEPENDENTLY: half 1 by reportMode, half 2 by
+  // resumeInterrupted. Nesting both under reportMode once meant
+  // `reportRestartContext: 'step'/'off'` silently disabled session recovery
+  // (default-on!) with no warning — a misconfiguration failing silent.
+  const followupReport = reportMode === 'followup'
+  if (followupReport || resumeInterrupted) {
     type FollowupAgent = { followup: (message: ReturnType<typeof createUserMessage>) => void }
     const pluginMessage = (text: string): ReturnType<typeof createUserMessage> => createUserMessage({
       content: [{ type: 'text', text }],
@@ -247,8 +253,7 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     const deliver = (agent: FollowupAgent & { id: unknown }): void => {
       const id = agent.id as string
       const exitAt = pendingContinue.get(id)
-      if (exitAt !== undefined) pendingContinue.delete(id)
-      const record = pendingRestartRecord(stateDir)
+      const record = followupReport ? pendingRestartRecord(stateDir) : null
       if (exitAt !== undefined && record !== null
         && (record.initiator === undefined || id === record.initiator)) {
         // The initiator was itself interrupted by its own restart: one
@@ -258,12 +263,18 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
         const text = continueAndReportText(record, canaryPending)
         if (text !== '') {
           agent.followup(pluginMessage(text))
+          pendingContinue.delete(id)
           acknowledgeRestartRecord(stateDir, record, Date.now())
+          return
         }
-        return
+        // A record with nothing to report yet (no exitAt/error) must not
+        // swallow the continue — fall through to the continue-only path.
       }
       if (exitAt !== undefined) {
         agent.followup(pluginMessage(continueInterruptedText(exitAt)))
+        // Delete only after a successful injection: a throwing followup keeps
+        // the session eligible at its next creation (same rule as claim()).
+        pendingContinue.delete(id)
       }
       if (record === null) return
       // The report waits for its owner; other sessions are never woken.
@@ -272,7 +283,9 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     }
 
     // Shutdown snapshot: which root sessions had a live turn when the process
-    // stopped. Synchronous by design — a signal handler cannot await.
+    // stopped. Synchronous by design — a signal handler cannot await. Only
+    // registered when resume is on: the snapshot's sole consumer is the resume
+    // pass, so a disabled resume must not leave stray state files behind.
     const snapshotInterrupted = (): void => {
       try {
         const interrupted = ctx.agents.roots()
@@ -294,8 +307,10 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
         // Best-effort: a signal handler must never throw into shutdown.
       }
     }
-    process.on('SIGTERM', snapshotInterrupted)
-    ctx.effect(() => () => { process.off('SIGTERM', snapshotInterrupted) })
+    if (resumeInterrupted) {
+      process.on('SIGTERM', snapshotInterrupted)
+      ctx.effect(() => () => { process.off('SIGTERM', snapshotInterrupted) })
+    }
 
     // A faithful resume mirrors the API proxy's cold-resume path: the
     // session's stored preset composition (resolved from the LOG, not the

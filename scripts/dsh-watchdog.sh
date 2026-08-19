@@ -25,7 +25,8 @@
 #
 # Everything is parameterized by environment (the guard CLI's `supervise` verb
 # sets these); nothing here is machine-specific:
-#   WD_HOME=DIR        dsh root: markers, pidfile, state (default: $DSH_HOME)
+#   WD_HOME=DIR        dsh root (default: $DSH_HOME)
+#   WD_STATE_DIR=DIR   state dir: markers, pidfile, logs (default: <WD_HOME>/state)
 #   WD_PORT=N          port to own (default 3080)
 #   WD_REPO=DIR        checkout the guard rollback operates on
 #   WD_START="CMD"     shell command that starts the supervised instance
@@ -37,7 +38,7 @@
 #   WD_TEST_FAKE=1     launch a throwaway http server instead of the instance
 #   WD_TEST_BREAK=1    launch a command that always fails (give-up testing)
 #
-# Markers under <WD_HOME>/state (written by the app or the agent):
+# Markers under the state directory (written by the app or the agent):
 #   restart-requested.json  -> intentional restart: respawn + canary + clear
 #   watchdog-stop           -> exit the watchdog without respawn
 set -u
@@ -50,14 +51,22 @@ PORT="${WD_PORT:-3080}"
 DELAY="${WD_DELAY:-0}"
 BOOT_TIMEOUT="${WD_BOOT_TIMEOUT:-60}"
 REPO="${WD_REPO:-}"
-GIVE_UP_MARKER="$DSH_ROOT/state/watchdog-gave-up"
-RESTART_MARKER="$DSH_ROOT/state/restart-requested.json"
-STOP_MARKER="$DSH_ROOT/state/watchdog-stop"
-PIDFILE="$DSH_ROOT/state/watchdog.pid"
-ATTEMPT_LOG="$DSH_ROOT/state/boot-attempt.log"
+# Every marker, the pidfile, and the attempt log live in ONE state directory:
+# WD_STATE_DIR when the guard CLI names it (its --state-dir), else the
+# conventional <home>/state. Deriving it here as <home>/state while the guard
+# plugin reads its own configured stateDir breaks whenever the two differ (an
+# explicit --state-dir, or the '<cwd>/.dsh-guard-state' fallback) — the marker
+# the CLI wrote and the snapshot the plugin reads would land in two places.
+STATE_DIR="${WD_STATE_DIR:-$DSH_ROOT/state}"
+GIVE_UP_MARKER="$STATE_DIR/watchdog-gave-up"
+RESTART_MARKER="$STATE_DIR/restart-requested.json"
+STOP_MARKER="$STATE_DIR/watchdog-stop"
+PIDFILE="$STATE_DIR/watchdog.pid"
+ATTEMPT_LOG="$STATE_DIR/boot-attempt.log"
 
 [ -n "$DSH_ROOT" ] || { echo "[watchdog] WD_HOME or DSH_HOME must be set" >&2; exit 1; }
 export DSH_HOME="$DSH_ROOT"
+mkdir -p "$STATE_DIR"
 cd "$DSH_ROOT/home" 2>/dev/null || cd /tmp || exit 1
 
 launch_instance() {
@@ -133,12 +142,12 @@ rollback_sha() {
     const fs = require('fs')
     let sha = ''
     try {
-      const boot = JSON.parse(fs.readFileSync('$DSH_ROOT/state/last-good-boot.json', 'utf8'))
+      const boot = JSON.parse(fs.readFileSync('$STATE_DIR/last-good-boot.json', 'utf8'))
       if (typeof boot.revision === 'string' && boot.revision !== '') sha = boot.revision
     } catch {}
     if (sha === '') {
       try {
-        const s = require('$DSH_ROOT/state/self-restart-guard.json')
+        const s = require('$STATE_DIR/self-restart-guard.json')
         sha = s.checkpoint?.revision ?? s.credential?.revision ?? ''
       } catch {}
     }
@@ -153,7 +162,7 @@ stamp_last_good_boot() {
   local sha
   sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null) || return 0
   [ -n "$sha" ] || return 0
-  printf '{"revision":"%s","at":%s}\n' "$sha" "$(date +%s)000" > "$DSH_ROOT/state/last-good-boot.json"
+  printf '{"revision":"%s","at":%s}\n' "$sha" "$(date +%s)000" > "$STATE_DIR/last-good-boot.json"
 }
 
 # Roll back to a known-good revision — unless that revision already IS HEAD:
@@ -200,11 +209,11 @@ guard_cmd() {
 }
 
 guard_verify() {
-  guard_cmd verify --repo "$REPO" --state-dir "$DSH_HOME/state" >/dev/null 2>&1
+  guard_cmd verify --repo "$REPO" --state-dir "$STATE_DIR" >/dev/null 2>&1
 }
 
 guard_reset() {
-  guard_cmd reset "$1" --repo "$REPO" --state-dir "$DSH_HOME/state"
+  guard_cmd reset "$1" --repo "$REPO" --state-dir "$STATE_DIR"
 }
 
 # Give-up crash page: a tiny HTTP server served by the watchdog itself, with a
