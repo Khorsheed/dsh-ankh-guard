@@ -10,7 +10,7 @@
  * files; the plugin wires them into `agent/created` and `agent.followup`.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { stateFile } from './state-files.ts'
 
 /** The exit agent's durable restart record (written by `schedule-exit`). */
 export interface RestartRecord {
@@ -37,12 +37,12 @@ export interface InterruptedSnapshot {
 
 /** Absolute path of the restart record inside a state directory. */
 export function restartRecordFile(stateDir: string): string {
-  return join(stateDir, 'last-restart.json')
+  return stateFile(stateDir, 'lastRestart')
 }
 
 /** Absolute path of the interrupted-session snapshot inside a state directory. */
 export function interruptedSnapshotFile(stateDir: string): string {
-  return join(stateDir, 'interrupted-sessions.json')
+  return stateFile(stateDir, 'interruptedSessions')
 }
 
 /**

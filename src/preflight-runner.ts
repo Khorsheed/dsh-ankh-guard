@@ -130,12 +130,16 @@ export interface PreflightComposition {
  * @param profile - the profile name (same resolution as `--profile`).
  * @param patchFiles - `--patch` overlay paths, in argv order.
  * @param root - harness checkout root.
+ * @param home - the dsh home to compose against; defaults to the harness's
+ * own resolution ($DSH_HOME → ~/.dsh). Explicit because a caller verifying a
+ * specific deployment must not silently compose a different home's tree.
  * @returns the patch stack and composed rows.
  */
 export async function composePreflightPatches(
   profile: string,
   patchFiles: readonly string[],
   root: string,
+  home?: string,
 ): Promise<PreflightComposition> {
   let appBoot: Record<string, unknown>
   let homePaths: Record<string, unknown>
@@ -156,10 +160,10 @@ export async function composePreflightPatches(
   }
   const resolveDshHome = homePaths.resolveDshHome as (configured?: string) => string
   const anchor = fileURLToPath(new URL('../package.json', import.meta.url))
-  const home = resolveDshHome()
+  const resolvedHome = resolveDshHome(home)
   healProfilesModuleFallback(anchor)
-  const composed = loadProfile(NAME, profile, anchor, home, { userLayer: true })
-  const homePatches = loadOptionalPatches(NAME, join(home, HOME_PATCH_FILENAME)) ?? []
+  const composed = loadProfile(NAME, profile, anchor, resolvedHome, { userLayer: true })
+  const homePatches = loadOptionalPatches(NAME, join(resolvedHome, HOME_PATCH_FILENAME)) ?? []
   const overlays = patchFiles.flatMap(file => loadOverlayPatches(NAME, resolve(file)))
   const bundlePatches = composed.layers.flatMap(layer => layer.patches)
   const patches = [...bundlePatches, ...composed.patches, ...homePatches, ...overlays]

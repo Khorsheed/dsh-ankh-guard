@@ -25,9 +25,10 @@ import {
 } from '../src/restart-context.ts'
 import { preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
 import {
-  clearCredential, emptyState, lastGoodBootRevision, loadState, recordCredential, setCheckpoint,
+  clearCredential, emptyState, loadState, recordCredential, setCheckpoint,
   verifyCredential, type GuardState,
 } from '../src/state.ts'
+import { lastGoodBootRevision, STATE_FILES } from '../src/state-files.ts'
 
 const cleanups: Array<() => void> = []
 afterEach(() => {

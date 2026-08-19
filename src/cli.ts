@@ -27,8 +27,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resolveRepoDir, resolveStateDir } from './defaults.ts'
 import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
 import {
-  clearCredential, lastGoodBootRevision, loadState, recordCredential, setCheckpoint, verifyCredential,
+  clearCredential, loadState, recordCredential, setCheckpoint, verifyCredential,
 } from './state.ts'
+import { lastGoodBootRevision, stateFile } from './state-files.ts'
 
 /** Parsed CLI options; empty stateDir/repoDir mean "use defaults". */
 interface CliOptions {
@@ -759,7 +760,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // literally '$DSH_HOME/state' (an explicit --state-dir, or the
       // '<cwd>/.dsh-guard-state' fallback): the CLI would write '<cwd>/state'
       // while the plugin reads '<cwd>/.dsh-guard-state'.
-      const pidfile = join(stateDir, 'watchdog.pid')
+      const pidfile = stateFile(stateDir, 'watchdogPid')
       if (existsSync(pidfile)) {
         const existing = readFileSync(pidfile, 'utf8').trim()
         const existingPid = Number(existing)
@@ -802,7 +803,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stderr(`watchdog script not found at ${watchdog}\n`)
         return 1
       }
-      const logPath = options.log ?? join(stateDir, 'watchdog.log')
+      const logPath = options.log ?? stateFile(stateDir, 'watchdogLog')
       mkdirSync(dirname(logPath), { recursive: true })
       const env = {
         ...process.env,
@@ -864,7 +865,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // plugin reads (see the supervise case for why no home is derived).
       const initiator = options.initiator ?? process.env.DSH_SESSION_ID
       mkdirSync(stateDir, { recursive: true })
-      writeFileSync(join(stateDir, 'restart-requested.json'),
+      writeFileSync(stateFile(stateDir, 'restartRequested'),
         `${JSON.stringify({
           reason: 'scheduled self-restart',
           requestedAt: Date.now(),
@@ -874,8 +875,8 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // the sandbox/harness process group, so the scheduled kill actually
       // lands even after the scheduling turn ends — the fix for "the kill
       // never happened" seen with `(sleep N; kill) &` from a managed shell.
-      const resultFile = join(stateDir, 'last-restart.json')
-      const logPath = options.log ?? join(stateDir, 'schedule-exit.log')
+      const resultFile = stateFile(stateDir, 'lastRestart')
+      const logPath = options.log ?? stateFile(stateDir, 'scheduleExitLog')
       mkdirSync(dirname(logPath), { recursive: true })
       const script = [
         "const { execFileSync } = require('node:child_process');",

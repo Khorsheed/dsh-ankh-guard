@@ -10,7 +10,7 @@
  * the CLI, and the invariant companion all share this module.
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { stateFile } from './state-files.ts'
 
 /** A green-build credential: proof that HEAD {@link revision} passed {@link scope} at {@link recordedAt}. */
 export interface GuardCredential {
@@ -55,11 +55,10 @@ export interface VerifyResult {
 }
 
 const AUDIT_CAP = 50
-const STATE_FILE = 'self-restart-guard.json'
 
 /** Absolute path of the state file inside a state directory. */
 export function stateFilePath(stateDir: string): string {
-  return join(stateDir, STATE_FILE)
+  return stateFile(stateDir, 'guard')
 }
 
 /** A fresh, credential-less state. */
@@ -217,22 +216,5 @@ export function verifyCredential(
   return {
     ok: true,
     reason: `green credential valid (${credential.scope} @ ${credential.revision}, ${Math.round(leftMs / 60_000)} min left)`,
-  }
-}
-
-/**
- * The last deployment-proven revision, stamped by the watchdog on every
- * healthy boot (`last-good-boot.json` next to the guard state), or undefined.
- * A green credential proves build+test passed; only this stamp proves the
- * deployment composed and the instance came up.
- * @param stateDir - state directory.
- * @returns the stamped revision, or undefined.
- */
-export function lastGoodBootRevision(stateDir: string): string | undefined {
-  try {
-    const stamp = JSON.parse(readFileSync(join(stateDir, 'last-good-boot.json'), 'utf8')) as { revision?: unknown }
-    return typeof stamp.revision === 'string' && stamp.revision !== '' ? stamp.revision : undefined
-  } catch {
-    return undefined
   }
 }

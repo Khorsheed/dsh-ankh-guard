@@ -39,12 +39,16 @@ describe('preflight composition drift tripwire', () => {
     const tsx = join(harness, 'node_modules/tsx/dist/esm/index.mjs')
     // cwd matters: the dump must resolve the harness's workspace packages,
     // not this repo's published ones (a foreign @deepseek-ai/cordis lacks
-    // exports the harness source imports).
-    const dump = spawnSync('node', ['--import', tsx, join(harness, 'apps/cli/src/bin.ts'), '--profile', profile, '--dump-config'], { encoding: 'utf8', cwd: harness })
+    // exports the harness source imports). env matters just as much: both
+    // sides must compose the SAME home's tree — a green run against the wrong
+    // home is a blank round with a confident title.
+    const dump = spawnSync('node', ['--import', tsx, join(harness, 'apps/cli/src/bin.ts'), '--profile', profile, '--dump-config'], { encoding: 'utf8', cwd: harness, env: { ...process.env, DSH_HOME: home } })
     expect(dump.error).toBeUndefined()
     expect(dump.status).toBe(0)
     const dumpIds = new Set([...dump.stdout.matchAll(/^- id: (\S+)/gm)].map(match => match[1]))
-    const { rows } = await composePreflightPatches(profile, [], harness)
+    const { rows, profileDir } = await composePreflightPatches(profile, [], harness, home)
+    // Pin the target: the composition must actually have read this home.
+    expect(profileDir).toBe(join(home, 'profiles', profile))
     // The runner's two extra overlays reuse existing row ids (agent-presets
     // config, telemetry disable), so the id SETS must match exactly.
     expect([...rows.keys()].sort()).toEqual([...dumpIds].sort())
