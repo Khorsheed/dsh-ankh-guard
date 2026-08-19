@@ -847,9 +847,48 @@ describe('supervise', () => {
         await new Promise((resolve) => { setTimeout(resolve, 300) })
       }
       expect(await fetchBody(port)).toBe('new')
-      // Unplanned exit (SIGTERM, no restart marker): the watchdog leaves a
-      // report record so the recovery reaches a session instead of staying
-      // silent.
+      // First boot of this deployment (no last-good-boot stamp yet): the
+      // watchdog must NOT file a crash report — a guard that false-alarms on
+      // first contact loses its credibility.
+      await new Promise((resolve) => { setTimeout(resolve, 1500) })
+      expect(existsSync(join(env.home, 'state', 'last-restart.json'))).toBe(false)
+    } finally {
+      env.stop()
+      host.kill('SIGKILL')
+      await killListener(port)
+      env.restore()
+    }
+  }, 30_000)
+
+  it('takeover of a previously-healthy deployment leaves an unplanned-exit record', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = await freePort()
+    // The deployment has come up before: the stamp exists (written by any
+    // healthy boot), so recovering an unplanned exit files the report record.
+    mkdirSync(join(env.home, 'state'), { recursive: true })
+    writeFileSync(join(env.home, 'state', 'last-good-boot.json'),
+      `${JSON.stringify({ revision: currentHead(repo), at: Date.now() })}\n`)
+    const host = spawn(process.execPath, ['-e',
+      `require('http').createServer((q,s)=>s.end('host')).listen(${port},'127.0.0.1')`],
+    { detached: true, stdio: 'ignore' })
+    host.unref()
+    try {
+      await waitForPort(port)
+      const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', join(env.home, 'state'), '--repo', repo],
+        io().io,
+      )).toBe(0)
+      host.kill('SIGTERM')
+      const deadline = Date.now() + 20_000
+      let portDown = false
+      while (Date.now() < deadline) {
+        if (!portDown && !(await portListening(port))) portDown = true
+        if (portDown && (await portListening(port))) break
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      expect(await fetchBody(port)).toBe('new')
       const crashRecord = join(env.home, 'state', 'last-restart.json')
       const recordDeadline = Date.now() + 5000
       while (!existsSync(crashRecord) && Date.now() < recordDeadline) {
@@ -863,6 +902,20 @@ describe('supervise', () => {
       env.restore()
     }
   }, 30_000)
+
+  it('record-unexpected-exit writes once and never overwrites a pending record', async () => {
+    const stateDir = tmpDir('guard-cli-')
+    const first = io()
+    expect(await runCli(['record-unexpected-exit', '--state-dir', stateDir], first.io)).toBe(0)
+    expect(first.out.join('')).toContain('left a report record')
+    const record = JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))
+    expect(record.unexpected).toBe(true)
+    // A second recovery while the first still awaits its report: kept, not overwritten.
+    const second = io()
+    expect(await runCli(['record-unexpected-exit', '--state-dir', stateDir], second.io)).toBe(0)
+    expect(second.out.join('')).toContain('still pending')
+    expect(JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))).toEqual(record)
+  })
 
   it('reports an existing live watchdog instead of spawning a second', async () => {
     const env = supervisedEnv()

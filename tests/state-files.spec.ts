@@ -20,7 +20,7 @@ const systemd = read('install-systemd.sh')
 
 /** Roles each bash side is expected to reference, spelled exactly as declared. */
 const EXPECTED: ReadonlyArray<readonly [script: string, content: string, roles: readonly (keyof typeof STATE_FILES)[]]> = [
-  ['dsh-watchdog.sh', watchdog, ['guard', 'lastGoodBoot', 'restartRequested', 'lastRestart', 'watchdogPid', 'watchdogStop', 'watchdogGaveUp', 'bootAttemptLog']],
+  ['dsh-watchdog.sh', watchdog, ['guard', 'lastGoodBoot', 'restartRequested', 'watchdogPid', 'watchdogStop', 'watchdogGaveUp', 'bootAttemptLog']],
   ['install-launchd.sh', launchd, ['watchdogPid', 'watchdogLog', 'watchdogStderrLog']],
   ['install-systemd.sh', systemd, ['watchdogPid', 'watchdogLog', 'watchdogStderrLog']],
 ]

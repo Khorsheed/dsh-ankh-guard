@@ -132,6 +132,22 @@ export function acknowledgeRestartRecord(stateDir: string, record: RestartRecord
 }
 
 /**
+ * Record an unplanned-exit recovery (the watchdog respawned the instance with
+ * no restart marker), unless a record still awaits its report. Returns whether
+ * the record was written — the caller (CLI verb, invoked by the watchdog) logs
+ * either way, so the watchdog log must never claim a write that was skipped.
+ * @param stateDir - state directory.
+ * @param now - epoch milliseconds of the recovery.
+ * @returns true when the record was written, false when a pending record was kept.
+ */
+export function writeUnexpectedExitRecord(stateDir: string, now: number): boolean {
+  if (pendingRestartRecord(stateDir) !== null) return false
+  mkdirSync(stateDir, { recursive: true })
+  atomicWrite(restartRecordFile(stateDir), `${JSON.stringify({ exitAt: now, unexpected: true })}\n`)
+  return true
+}
+
+/**
  * Read the shutdown snapshot, or null when absent/unparseable. Malformed
  * snapshots are dropped by the caller's delete-after-read, never retried.
  * @param stateDir - state directory.

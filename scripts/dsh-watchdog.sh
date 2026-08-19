@@ -320,6 +320,13 @@ else
 fi
 
 while true; do
+  # Snapshot BEFORE this boot rewrites it: the stamp exists iff this
+  # deployment has ever come up healthy — the discriminator between
+  # "recovered an unplanned exit" and "first boot ever" (a first boot must
+  # not file a crash report). Durable (not a process flag) so a restarted
+  # watchdog still judges correctly.
+  had_boot_stamp=0
+  [ -f "$STATE_DIR/last-good-boot.json" ] && had_boot_stamp=1
   echo "[watchdog] starting instance on :$PORT (failures=$failures)"
   # Capture this attempt's output for failure-domain classification. Plain
   # redirection only — never > >(tee …) process substitution: a sandboxed or
@@ -444,19 +451,14 @@ while true; do
       continue
     fi
   else
-    # Unplanned exit (crash, or a stop outside the guard): the instance is
-    # back, but nobody knows — the report machinery only hears from the
-    # scheduled path. Leave a record the plugin reports on this boot, unless
-    # one still awaits its report (never overwrite a pending record).
-    node -e "
-      const fs = require('fs')
-      const file = '$STATE_DIR/last-restart.json'
-      try {
-        const r = JSON.parse(fs.readFileSync(file, 'utf8'))
-        if (r.reportedAt === undefined) process.exit(0)
-      } catch {}
-      fs.writeFileSync(file, JSON.stringify({ exitAt: Date.now(), unexpected: true }) + '\n')
-    " && echo "[watchdog] unplanned exit recovered — left a report record for the next session"
+    # Unplanned exit (crash, or a stop outside the guard): leave a record the
+    # plugin reports on this boot — crash recovery must not be silent. Only
+    # when the deployment has come up before (stamp snapshotted at the loop
+    # top); the record semantics (pending protection, atomic write) live in
+    # the guard CLI, where they typecheck and unit-test.
+    if [ "$had_boot_stamp" = "1" ]; then
+      guard_cmd record-unexpected-exit --state-dir "$STATE_DIR"
+    fi
   fi
 
   failures=0

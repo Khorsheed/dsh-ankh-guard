@@ -31,6 +31,7 @@ import {
 } from './state.ts'
 import { lastGoodBootRevision, stateFile } from './state-files.ts'
 import { findPidOnPort, killPidTree } from './processes.ts'
+import { writeUnexpectedExitRecord } from './restart-context.ts'
 
 /** Parsed CLI options; empty stateDir/repoDir mean "use defaults". */
 interface CliOptions {
@@ -70,6 +71,7 @@ commands:
   reset <sha> [--repo DIR]
   canary [--port N] [--state-dir DIR] [--repo DIR] [--max-age MIN]
   preflight [--profile NAME] [--timeout-ms MS]
+  record-unexpected-exit [--state-dir DIR]   # watchdog-facing: record an unplanned-exit recovery
   restart --port N --start "CMD" [--pid PID] [--timeout-ms MS] [--delay-ms MS] [--stop-timeout-ms MS] [--rollback]
           [--profile NAME] [--preflight-timeout-ms MS] [--state-dir DIR] [--repo DIR] [--max-age MIN]
   schedule-exit --port N --delay-ms MS [--initiator ID] [--log FILE] [--profile NAME]
@@ -645,6 +647,16 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       if (outcome.detail !== undefined) sink(`${outcome.detail}\n`)
       sink(summarizeOutput(outcome.output))
       return outcome.kind === 'pass' ? 0 : outcome.kind === 'composition-failed' ? 1 : 3
+    }
+    case 'record-unexpected-exit': {
+      // Invoked by the watchdog when it recovers an unplanned exit (no restart
+      // marker). Never overwrites a record that still awaits its report; the
+      // two messages keep the watchdog log truthful about which happened.
+      const written = writeUnexpectedExitRecord(stateDir, Date.now())
+      io.stdout(written
+        ? '[watchdog] unplanned exit recovered — left a report record for the next session\n'
+        : '[watchdog] unplanned exit recovered — a report record is still pending, left it untouched\n')
+      return 0
     }
     case 'restart': {
       const port = options.port
