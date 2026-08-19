@@ -220,6 +220,20 @@ function stubPreflightRunner(resolveRunner: (harnessRoot: string) => string | un
 describe('CLI', () => {
   const io = cliIo
 
+  it('verify and record warn while no watchdog supervises the instance', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    // The agent's first contacts in any restart flow: the bootstrap gap must
+    // surface HERE, before anyone considers a bare exit.
+    const rec = io()
+    expect(await runCli(['record', 'build', ...flags], rec.io)).toBe(0)
+    expect(rec.err.join('')).toContain('no live watchdog')
+    const ver = io()
+    expect(await runCli(['verify', ...flags], ver.io)).toBe(0)
+    expect(ver.err.join('')).toContain('no live watchdog')
+  })
+
   it('records and verifies, then denies after a new commit', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')

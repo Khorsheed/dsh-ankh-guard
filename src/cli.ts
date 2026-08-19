@@ -69,6 +69,22 @@ export interface CliIo {
  */
 const FULL_ACCESS_HINT = 'hint: the restart loop spawns detached processes and signals them — a sandboxed session (not full-access) will fail with EPERM; confirm full access with the user before restarting\n'
 
+/**
+ * Printed (by verify/record, and as a refusal-grade warning in schedule-exit)
+ * while no watchdog supervises the instance: a bare exit now leaves the
+ * service DOWN — the first-install bootstrap gap.
+ */
+const NO_WATCHDOG_HINT = 'warning: no live watchdog supervises the instance — a bare exit now leaves the service DOWN. Before the first restart, run `supervise --port N --start "CMD"` (it adopts the running instance and respawns ANY exit), or drive the restart with `restart` yourself\n'
+
+/** The live supervising watchdog's pid, or null when none is (pidfile + kill 0). */
+function liveWatchdogPid(stateDir: string): number | null {
+  try {
+    const pid = Number(readFileSync(stateFile(stateDir, 'watchdogPid'), 'utf8').trim())
+    if (Number.isInteger(pid)) { process.kill(pid, 0); return pid }
+  } catch { /* no pidfile or a dead owner */ }
+  return null
+}
+
 const USAGE = `usage: dsh-ankh-guard <command> [args] [flags]
 commands:
   verify [--state-dir DIR] [--repo DIR] [--max-age MIN]
@@ -576,7 +592,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
     case 'verify': {
       const result = verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), options.maxAgeMinutes)
       io.stdout(`${result.reason}\n`)
-      if (result.ok) io.stdout(FULL_ACCESS_HINT)
+      if (result.ok) {
+        io.stdout(FULL_ACCESS_HINT)
+        if (liveWatchdogPid(stateDir) === null) io.stderr(NO_WATCHDOG_HINT)
+      }
       return result.ok ? 0 : 1
     }
     case 'record': {
@@ -593,6 +612,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       recordCredential(stateDir, { scope, revision: head, command: options.command ?? '' }, Date.now())
       io.stdout(`recorded green credential: ${scope} @ ${head}\n`)
       io.stdout(FULL_ACCESS_HINT)
+      if (liveWatchdogPid(stateDir) === null) io.stderr(NO_WATCHDOG_HINT)
       return 0
     }
     case 'status': {
@@ -869,13 +889,8 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // Bootstrap guard: with no live watchdog the scheduled exit leaves the
       // service DOWN — the classic first-install gap (the running instance
       // has not loaded the plugin yet, and no supervisor exists yet).
-      let watchdogAlive = false
-      try {
-        const wdPid = Number(readFileSync(stateFile(stateDir, 'watchdogPid'), 'utf8').trim())
-        if (Number.isInteger(wdPid)) { process.kill(wdPid, 0); watchdogAlive = true }
-      } catch { /* no pidfile or a dead owner */ }
-      if (!watchdogAlive) {
-        io.stderr('warning: no live watchdog found — nothing will respawn the instance after this exit. For the FIRST restart after install use `restart` (it owns the whole stop→start→canary loop), or install the launchd/systemd supervisor first\n')
+      if (liveWatchdogPid(stateDir) === null) {
+        io.stderr(NO_WATCHDOG_HINT)
       }
       // Intentional-restart marker: the supervising watchdog runs the canary
       // after the respawn and clears this on pass. The initiator (the session
