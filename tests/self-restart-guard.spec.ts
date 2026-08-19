@@ -64,6 +64,22 @@ function commitChange(repoDir: string): void {
 
 const NOW = 1_000_000
 
+/**
+ * A currently-free loopback port: bind 0, read the assignment, close. The
+ * rebind race after close is far smaller than the alternative — a random
+ * high port can belong to a real service, and a guard test suite that flakes
+ * red teaches its owners to ignore it.
+ */
+async function freePort(): Promise<number> {
+  const server = await new Promise<Server>((resolve) => {
+    const s = createServer(() => {})
+    s.listen(0, '127.0.0.1', () => { resolve(s) })
+  })
+  const port = (server.address() as AddressInfo).port
+  await new Promise<void>((resolve) => { server.close(() => { resolve() }) })
+  return port
+}
+
 describe('state core', () => {
   it('records a credential and verifies it while fresh on the same revision', () => {
     const dir = tmpDir('guard-state-')
@@ -294,7 +310,7 @@ describe('CLI', () => {
   it('restart refuses to stop an instance without a credential (the gate)', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const server = spawnServer(port, 'old')
     try {
       await waitForPort(port)
@@ -314,7 +330,7 @@ describe('CLI', () => {
   it('restart stops the old instance, starts the new one detached, and canaries it', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const oldServer = spawnServer(port, 'old')
     try {
       await waitForPort(port)
@@ -338,7 +354,7 @@ describe('CLI', () => {
   it('restart --delay-ms waits before stopping (graceful self-restart)', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const server = spawnServer(port, 'old')
     try {
       await waitForPort(port)
@@ -364,7 +380,7 @@ describe('CLI', () => {
   it('restart escalates to SIGKILL after --stop-timeout-ms and reports the forced stop', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     // A listener that swallows SIGTERM: only the SIGKILL escalation can stop it.
     const stubborn = spawn(process.execPath, ['-e',
       `process.on('SIGTERM', () => {}); require('http').createServer((q, s) => s.end('stubborn')).listen(${port}, '127.0.0.1')`],
@@ -416,7 +432,7 @@ tryListen();
   it('restart --rollback resets to the checkpoint when the new instance never comes up', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const server = spawnServer(port, 'old')
     try {
       await waitForPort(port)
@@ -445,7 +461,7 @@ tryListen();
   it('restart --rollback skips the reset when the target already is HEAD', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const server = spawnServer(port, 'old')
     try {
       await waitForPort(port)
@@ -662,7 +678,7 @@ describe('composition preflight gate', () => {
   it('restart refuses on a composition preflight failure without stopping the instance', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const server = spawnServer(port, 'old')
     try {
       await waitForPort(port)
@@ -805,7 +821,7 @@ describe('supervise', () => {
   it('spawns a watchdog that idles, then takes over when the current owner exits', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const host = spawn(process.execPath, ['-e',
       `require('http').createServer((q,s)=>s.end('host')).listen(${port},'127.0.0.1')`],
     { detached: true, stdio: 'ignore' })
@@ -840,7 +856,7 @@ describe('supervise', () => {
   it('reports an existing live watchdog instead of spawning a second', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     try {
       const startCmd = `"${process.execPath}" -e "require('http').createServer().listen(${port},'127.0.0.1')"`
       const first = io()
@@ -876,7 +892,7 @@ describe('supervise', () => {
     mkdirSync(join(home, 'state'), { recursive: true })
     mkdirSync(join(home, 'home'), { recursive: true })
     const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const killTree = (pid: number): void => {
       let children: number[] = []
       try {
@@ -933,10 +949,30 @@ describe('supervise', () => {
     env.restore()
   })
 
+  it('supervise without DSH_HOME or --home fails loud instead of guessing a home', async () => {
+    // The watchdog exports the home as the instance's DSH_HOME — deriving it
+    // from --state-dir would silently boot the instance on the wrong
+    // profiles/credentials, so a missing home is a loud refusal.
+    const previous = process.env.DSH_HOME
+    delete process.env.DSH_HOME
+    try {
+      const out = io()
+      const code = await runCli(
+        ['supervise', '--port', '1', '--start', 'true', '--state-dir', tmpDir('guard-cli-'), '--repo', makeRepo()],
+        out.io,
+      )
+      expect(code).toBe(2)
+      expect(out.err.join('')).toContain('--home')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+
   it('schedule-exit fires a detached exit agent that kills the host; the watchdog takes over', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     // Green credential in the throwaway state (bound to the throwaway HEAD).
     const rec = io()
     expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', join(env.home, 'state')], rec.io)).toBe(0)
@@ -999,7 +1035,7 @@ describe('supervise', () => {
     // stateDir and re-appended 'state', landing markers in <cwd>/state while
     // the plugin read <cwd>/.dsh-guard-state — report and resume both lost.
     const stateDir = tmpDir('guard-cli-')
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     try {
       expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
       stubPreflight('true')
@@ -1026,7 +1062,7 @@ describe('supervise', () => {
   it('rolls back to the deployment-proven boot stamp, leaving HEAD and WIP anchors', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const stateDir = join(env.home, 'state')
     mkdirSync(stateDir, { recursive: true })
     const checkpointSha = currentHead(repo)
@@ -1092,7 +1128,7 @@ describe('supervise', () => {
   it('falls back to the pre-batch checkpoint when no boot stamp exists', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const stateDir = join(env.home, 'state')
     mkdirSync(stateDir, { recursive: true })
     const checkpointSha = currentHead(repo)
@@ -1133,7 +1169,7 @@ describe('supervise', () => {
   it('skips the repository rollback when the boot failure originates outside the repo', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const stateDir = join(env.home, 'state')
     mkdirSync(stateDir, { recursive: true })
     const head = currentHead(repo)
@@ -1186,7 +1222,7 @@ describe('supervise', () => {
   it('treats EADDRINUSE as a port race: frees the port and retries without counting toward rollback or give-up', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const stateDir = join(env.home, 'state')
     mkdirSync(stateDir, { recursive: true })
     const head = currentHead(repo)
@@ -1241,7 +1277,7 @@ describe('supervise', () => {
   it('counts an EADDRINUSE on a foreign port as a boot failure instead of retrying forever', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const foreign = port + 1
     const stateDir = join(env.home, 'state')
     mkdirSync(stateDir, { recursive: true })
@@ -1295,7 +1331,7 @@ describe('supervise', () => {
   it('skips the reset when the rollback target already is HEAD — uncommitted work survives', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
-    const port = 20000 + Math.floor(Math.random() * 15000)
+    const port = await freePort()
     const stateDir = join(env.home, 'state')
     mkdirSync(stateDir, { recursive: true })
     // No stamp, no credential: the chain falls to the checkpoint, which IS

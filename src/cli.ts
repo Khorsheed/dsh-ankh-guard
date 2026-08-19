@@ -34,6 +34,7 @@ import {
 interface CliOptions {
   stateDir: string
   repoDir: string
+  home: string
   maxAgeMinutes: number
   port: number | undefined
   command: string | undefined
@@ -71,7 +72,7 @@ commands:
           [--profile NAME] [--preflight-timeout-ms MS] [--state-dir DIR] [--repo DIR] [--max-age MIN]
   schedule-exit --port N --delay-ms MS [--initiator ID] [--log FILE] [--profile NAME]
           [--preflight-timeout-ms MS] [--state-dir DIR] [--repo DIR]
-  supervise --port N --start "CMD" [--foreground] [--log FILE] [--state-dir DIR] [--repo DIR]
+  supervise --port N --start "CMD" [--foreground] [--log FILE] [--state-dir DIR] [--repo DIR] [--home DIR]
 flags:
   --state-dir DIR  state directory (default: $DSH_HOME/state, else <cwd>/.dsh-guard-state)
   --repo DIR       repository the credential binds to (default: cwd)
@@ -89,7 +90,9 @@ flags:
   --delay-ms MS    restart: sleep before stopping, so the current turn can finish first
                    (agent-driven graceful self-restart: schedule, complete, then restart);
                    schedule-exit: delay before the detached exit agent kills the host
-  --log FILE       supervise/schedule-exit: watchdog/exit-agent log file (default: <home>/state/*.log)
+  --log FILE       supervise/schedule-exit: watchdog/exit-agent log file (default: <state-dir>/*.log)
+  --home DIR       supervise: the dsh home the supervised instance boots with (profiles,
+                   credentials — default: $DSH_HOME; required when that is unset)
   --initiator ID   schedule-exit: session id that requested the exit (default: $DSH_SESSION_ID);
                    recorded in last-restart.json so the restart report returns to that session
   --profile NAME   preflight/schedule-exit/restart: the dsh profile to dry-run (default:
@@ -107,7 +110,7 @@ export function parse(
   argv: readonly string[],
 ): { error: string } | { command: string; positionals: readonly string[]; options: CliOptions } {
   const options: CliOptions = {
-    stateDir: '', repoDir: '', maxAgeMinutes: 10, port: undefined, command: undefined, message: undefined,
+    stateDir: '', repoDir: '', home: '', maxAgeMinutes: 10, port: undefined, command: undefined, message: undefined,
     start: undefined, pid: undefined, timeoutMs: undefined, delayMs: undefined, stopTimeoutMs: undefined,
     log: undefined,
     foreground: false, rollback: false, initiator: undefined, profile: undefined, preflightTimeoutMs: undefined,
@@ -126,6 +129,7 @@ export function parse(
       const arg = argv[i] ?? ''
       switch (arg) {
         case '--state-dir': options.stateDir = flagValue(arg, true) ?? ''; i++; break
+        case '--home': options.home = flagValue(arg, true) ?? ''; i++; break
         case '--repo': options.repoDir = flagValue(arg, true) ?? ''; i++; break
         case '--max-age': {
           const raw = flagValue(arg, true)
@@ -727,13 +731,21 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stderr(`supervise requires --port N and --start "CMD"\n\n${USAGE}`)
         return 2
       }
+      // The supervised instance boots with THIS home (the watchdog exports it
+      // as DSH_HOME): a home derived from the state dir would silently point
+      // the instance at the wrong profiles/credentials, surfacing far from
+      // the cause — so a missing home is a loud misconfiguration, not a guess.
+      const wdHome = process.env.DSH_HOME ?? (options.home !== '' ? options.home : undefined)
+      if (wdHome === undefined) {
+        io.stderr('supervise needs the dsh home: set DSH_HOME or pass --home DIR — the supervised instance reads its profiles/credentials from there, and deriving one from --state-dir would guess wrong\n')
+        return 2
+      }
       // One state directory owns every marker and the pidfile; the plugin,
       // this CLI, and the watchdog must agree on it. Deriving a home from
       // stateDir and re-appending 'state' breaks whenever stateDir is not
       // literally '$DSH_HOME/state' (an explicit --state-dir, or the
       // '<cwd>/.dsh-guard-state' fallback): the CLI would write '<cwd>/state'
       // while the plugin reads '<cwd>/.dsh-guard-state'.
-      const wdHome = process.env.DSH_HOME ?? dirname(stateDir)
       const pidfile = join(stateDir, 'watchdog.pid')
       if (existsSync(pidfile)) {
         const existing = readFileSync(pidfile, 'utf8').trim()

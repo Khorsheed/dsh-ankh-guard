@@ -319,9 +319,16 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     // value and every turn of the resumed agent fails.
     const buildResumeOptions = async (id: string): Promise<ResumeAgentOptions> => {
       const agentOptions: AgentOptions = {}
-      const selection = (ctx.get('agentDefaultModel') as
+      const defaultModel = ctx.get('agentDefaultModel') as
         | { currentSelection(): { provider?: string; model?: string } }
-        | undefined)?.currentSelection()
+        | undefined
+      const selection = defaultModel?.currentSelection()
+      if (defaultModel !== undefined && (selection?.provider === undefined || selection?.model === undefined)) {
+        // The hand-copied structural type above degrades SILENTLY on host
+        // signature drift: the resume succeeds, the persona's {{model}} is
+        // empty, and every resumed turn fails. Say so when it happens.
+        ctx.logger(name).warn('agentDefaultModel present but yielded no complete provider/model selection — resumed sessions may fail every turn (host signature drift?)')
+      }
       if (selection?.provider !== undefined) agentOptions.provider = selection.provider
       if (selection?.model !== undefined) agentOptions.model = selection.model
       let setup: ResumeAgentOptions['setup']

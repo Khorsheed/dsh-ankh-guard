@@ -8,15 +8,19 @@
  *
  * Runs only where a harness checkout and the target profile both exist (CI
  * clones the harness and sets DSH_HARNESS/DSH_HOME per the repo AGENTS.md).
+ * The home defaults to the conventional ~/.dsh so the tripwire still fires on
+ * a deployment machine where DSH_HOME is simply not exported into the test
+ * process — a sentinel that skips everywhere is no sentinel.
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { composePreflightPatches, resolveHarnessRoot } from '../src/preflight-runner.ts'
 
 const harness = resolveHarnessRoot()
-const home = process.env.DSH_HOME ?? ''
+const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const profile = process.env.DSH_PREFLIGHT_PROFILE ?? 'web'
 const harnessPresent = existsSync(join(harness, 'apps/cli'))
 const profilePresent = home !== '' && existsSync(join(home, 'profiles', profile, 'package.json'))
