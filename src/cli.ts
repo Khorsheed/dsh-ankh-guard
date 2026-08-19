@@ -757,10 +757,12 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       // whose loser dies silently. The lock is held only until the stop
       // ONE restart at a time across sessions: two concurrent restarts would
       // both stop the listener and double-start the instance — a port race
-      // whose loser dies silently. Held to the END of the verb (boot watch
-      // and canary included): a second restart must not find and kill the
-      // instance this one just started. Crash safety comes from the stale
-      // reclaim in acquireRestartLock, not from an early release.
+      // whose loser dies silently. The lock covers the WHOLE verb, rollback
+      // included: reset --hard is the most destructive step here, and a
+      // second restart reading HEAD or preflighting mid-reset is exactly the
+      // accident the lock exists to prevent. try/finally so no return path
+      // or exception can strand the lock (a stranded lock in a same-process
+      // caller would refuse forever — its holder never dies).
       const restartLock = acquireRestartLock(stateDir)
       if (!restartLock.ok) {
         io.stderr(/^\d+$/.test(restartLock.holder)
@@ -768,65 +770,65 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
           : `restart refused: cannot claim the restart lock (${restartLock.holder}) — remove ${stateFile(stateDir, 'restartLock')} if it is stale\n`)
         return 1
       }
-      // Graceful self-restart: wait out the delay so the scheduling agent's
-      // turn completes and its final message is delivered before the stop.
-      if (options.delayMs !== undefined && options.delayMs > 0) {
-        io.stdout(`scheduled restart in ${options.delayMs} ms — current turn may finish first\n`)
-        await sleep(options.delayMs)
-      }
-      const pid = options.pid ?? findPidOnPort(port)
-      if (pid === null || pid === '') {
-        restartLock.release()
-        io.stderr(`nothing listening on 127.0.0.1:${port} — nothing to restart\n`)
-        return 1
-      }
-      const pidNumber = Number(pid)
       try {
-        process.kill(pidNumber, 'SIGTERM')
-      } catch (error) {
-        restartLock.release()
-        io.stderr(`stop ${pid} failed: ${String(error)}\n`)
-        return 1
-      }
-      // Graceful-exit deadline before the SIGKILL escalation: large sessions
-      // flushing out tens of thousands of log tokens can take longer than the
-      // old hardcoded 10 s. Configurable via --stop-timeout-ms.
-      const stopTimeoutMs = options.stopTimeoutMs ?? 30_000
-      const exited = await waitForExit(pidNumber, stopTimeoutMs, () => {
-        // This line lives in the CLI's stdout; the watchdog's own log carries
-        // the matching `Killed: 9` for the same pid — the two align on pid.
-        io.stdout(`pid ${pid} did not exit within ${stopTimeoutMs} ms of SIGTERM — sending SIGKILL (the watchdog log will show 'Killed: 9' for ${pid})\n`)
-      })
-      io.stdout(`stopped ${pid}${exited ? '' : ' (forced)'}\n`)
-      const child = spawn(options.start, { shell: true, detached: true, stdio: 'ignore' })
-      child.unref()
-      io.stdout(`started: ${options.start}\n`)
-      const timeoutMs = options.timeoutMs ?? 60_000
-      const deadline = Date.now() + timeoutMs
-      let listening = false
-      while (Date.now() < deadline) {
-        if (await checkPort(port)) {
-          listening = true
-          break
+        // Graceful self-restart: wait out the delay so the scheduling agent's
+        // turn completes and its final message is delivered before the stop.
+        if (options.delayMs !== undefined && options.delayMs > 0) {
+          io.stdout(`scheduled restart in ${options.delayMs} ms — current turn may finish first\n`)
+          await sleep(options.delayMs)
         }
-        await sleep(500)
-      }
-      if (!listening) {
+        const pid = options.pid ?? findPidOnPort(port)
+        if (pid === null || pid === '') {
+          io.stderr(`nothing listening on 127.0.0.1:${port} — nothing to restart\n`)
+          return 1
+        }
+        const pidNumber = Number(pid)
+        try {
+          process.kill(pidNumber, 'SIGTERM')
+        } catch (error) {
+          io.stderr(`stop ${pid} failed: ${String(error)}\n`)
+          return 1
+        }
+        // Graceful-exit deadline before the SIGKILL escalation: large sessions
+        // flushing out tens of thousands of log tokens can take longer than
+        // the old hardcoded 10 s. Configurable via --stop-timeout-ms.
+        const stopTimeoutMs = options.stopTimeoutMs ?? 30_000
+        const exited = await waitForExit(pidNumber, stopTimeoutMs, () => {
+          // This line lives in the CLI's stdout; the watchdog's own log carries
+          // the matching `Killed: 9` for the same pid — the two align on pid.
+          io.stdout(`pid ${pid} did not exit within ${stopTimeoutMs} ms of SIGTERM — sending SIGKILL (the watchdog log will show 'Killed: 9' for ${pid})\n`)
+        })
+        io.stdout(`stopped ${pid}${exited ? '' : ' (forced)'}\n`)
+        const child = spawn(options.start, { shell: true, detached: true, stdio: 'ignore' })
+        child.unref()
+        io.stdout(`started: ${options.start}\n`)
+        const timeoutMs = options.timeoutMs ?? 60_000
+        const deadline = Date.now() + timeoutMs
+        let listening = false
+        while (Date.now() < deadline) {
+          if (await checkPort(port)) {
+            listening = true
+            break
+          }
+          await sleep(500)
+        }
+        if (!listening) {
+          io.stderr(`new instance not listening on 127.0.0.1:${port} within ${timeoutMs}ms\n`)
+          if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
+          return 1
+        }
+        const post = verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), options.maxAgeMinutes)
+        io.stdout(`canary verify: ${post.ok ? 'PASS' : 'FAIL'} — ${post.reason}\n`)
+        io.stdout(`canary port: PASS — listening on 127.0.0.1:${port}\n`)
+        if (!post.ok) {
+          if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
+          return 1
+        }
+        io.stdout('restart + canary PASS\n')
+        return 0
+      } finally {
         restartLock.release()
-        io.stderr(`new instance not listening on 127.0.0.1:${port} within ${timeoutMs}ms\n`)
-        if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
-        return 1
       }
-      const post = verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), options.maxAgeMinutes)
-      io.stdout(`canary verify: ${post.ok ? 'PASS' : 'FAIL'} — ${post.reason}\n`)
-      io.stdout(`canary port: PASS — listening on 127.0.0.1:${port}\n`)
-      restartLock.release()
-      if (!post.ok) {
-        if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
-        return 1
-      }
-      io.stdout('restart + canary PASS\n')
-      return 0
     }
     case 'supervise': {
       const port = options.port
