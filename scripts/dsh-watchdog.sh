@@ -221,6 +221,9 @@ http.createServer((req, res) => {
     return;
   }
   res.setHeader('content-type', 'text/html; charset=utf-8');
+  // 503, never 200: a probe that treats any 200 as "service healthy" must not
+  // read the give-up page as the instance it replaced.
+  res.statusCode = 503;
   res.end('<!doctype html><meta charset="utf-8"><title>dsh 未能启动</title>'
     + '<body style="font-family:system-ui;display:flex;height:100vh;align-items:center;justify-content:center">'
     + '<div style="text-align:center"><h2>dsh 服务未能启动</h2>'
@@ -309,10 +312,14 @@ fi
 
 while true; do
   echo "[watchdog] starting instance on :$PORT (failures=$failures)"
-  # Capture this attempt's output for failure-domain classification while
-  # keeping the instance's output flowing to the watchdog log as before.
+  # Capture this attempt's output for failure-domain classification. Plain
+  # redirection only — never > >(tee …) process substitution: a sandboxed or
+  # detached spawner can EPERM on the /dev/fd/N that >() opens (workspace-write
+  # sandboxes do), killing the instance before it runs. On failure the attempt
+  # log is mirrored into this log below; a healthy run's boot message names
+  # the file its output lives in.
   : > "$ATTEMPT_LOG"
-  launch_instance > >(tee -a "$ATTEMPT_LOG") 2>&1 &
+  launch_instance > "$ATTEMPT_LOG" 2>&1 &
   child=$!
   # Boot window: the instance is up when the port answers 200.
   up=0
@@ -331,6 +338,10 @@ while true; do
     # Never came up (or died); stop a still-alive child and reap it.
     if kill -0 "$child" 2>/dev/null; then kill "$child" 2>/dev/null; fi
     wait "$child" 2>/dev/null
+    # Mirror the captured output into the watchdog log: with plain redirection
+    # (see the launch site) the attempt log is the only place the failure was
+    # written, and the watchdog log is where an operator looks first.
+    sed 's/^/[instance] /' "$ATTEMPT_LOG" 2>/dev/null
 
     if grep -q 'EADDRINUSE' "$ATTEMPT_LOG" 2>/dev/null; then
       if grep 'EADDRINUSE' "$ATTEMPT_LOG" | grep -qE "[:.]$PORT([^0-9]|$)"; then
@@ -406,7 +417,7 @@ while true; do
   fi
 
   # Instance is up.
-  echo "[watchdog] instance up on :$PORT"
+  echo "[watchdog] instance up on :$PORT — instance output: $ATTEMPT_LOG"
   stamp_last_good_boot
 
   # Intentional restart: run the guard canary (credential fresh + HEAD match).
