@@ -1,7 +1,14 @@
-# Self-mounting patch layer: `dsh plugin add @khorsheed/dsh-ankh-guard` applies
-# this layer to the profile, inserting the guard plugin into the loader tree.
-# Profiles that already compose ankh-guard through another bundle must NOT also
-# plugin-add it — the duplicate entry id fails loud at boot.
+# ankh-guard bundle patch: inserts the guard row into the composing profile,
+# so `dsh plugin --profile <name> add @khorsheed/dsh-ankh-guard` reconciles
+# it into the bundles layer (apps/cli plugin.ts reconcilePlugins). The row is
+# a bare mount — every config field has a schema default.
+#
+# NOTE: a composition must mount this row id exactly once. Official images
+# (the published npm line and upstream master) mount no ankh-guard row, so
+# plugin-adding this package is the install path there; a composition that
+# already mounts the id by other means (the pre-2026-08-16 deploy fork's base
+# bundle did) must NOT also add it — a duplicate loader entry id fails boot.
+# Check first: `dsh --profile <name> --dump-config | grep ankh-guard`.
 - insert:
     - id: ankh-guard
-      name: '@khorsheed/dsh-ankh-guard'
+      name: "@khorsheed/dsh-ankh-guard"

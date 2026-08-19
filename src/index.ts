@@ -14,7 +14,7 @@
  * credential), always leaving `guard-backup-*` anchors for whatever it
  * discards.
  *
- * @module @deepseek-ai/dsh-ankh-guard
+ * @module @khorsheed/dsh-ankh-guard
  */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'

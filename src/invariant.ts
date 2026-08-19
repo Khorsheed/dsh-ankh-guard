@@ -1,6 +1,6 @@
 /**
- * Package-owned invariant companion for `@deepseek-ai/dsh-ankh-guard`.
- * @module @deepseek-ai/dsh-ankh-guard/invariant
+ * Package-owned invariant companion for `@khorsheed/dsh-ankh-guard`.
+ * @module @khorsheed/dsh-ankh-guard/invariant
  */
 
 /* jscpd:ignore-start */
@@ -10,7 +10,7 @@ import type { InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 import { resolveStateDir } from './defaults.ts'
 import { loadState, stateFilePath } from './state.ts'
 
-const PACKAGE_NAME = '@deepseek-ai/dsh-ankh-guard'
+const PACKAGE_NAME = '@khorsheed/dsh-ankh-guard'
 
 /** Cordis companion plugin name. */
 export const name = 'ankh-guard-invariant'

@@ -1,7 +1,10 @@
 {
   "name": "@khorsheed/dsh-ankh-guard",
   "description": "Hard gate for self-modification restarts: a green-build credential bound to the git HEAD, checked before any restart of the running instance",
-  "version": "0.1.0-rc.6.5",
+  "version": "0.1.0-rc.7",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Khorsheed/dsh-ankh-guard.git"
@@ -31,42 +34,50 @@
     "lib/*.js",
     "lib/types/**/*.d.ts",
     "scripts/dsh-watchdog.sh",
-    "cordis.patch.yml",
-    "README.en.md"
+    "scripts/install-launchd.sh",
+    "scripts/install-systemd.sh",
+    "cordis.patch.yml"
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1-rc.4",
-    "@deepseek-ai/dsh-agent": "^0.0.1-rc.5 || ^0.1.0-rc.5",
-    "@deepseek-ai/dsh-agent-presets": "^0.0.1-rc.5 || ^0.1.0-rc.5",
-    "@deepseek-ai/dsh-invariants": "^0.0.1-rc.5 || ^0.1.0-rc.5",
-    "@deepseek-ai/dsh-llm": "^0.0.1-rc.5 || ^0.1.0-rc.5",
-    "@deepseek-ai/dsh-session-persistence": "^0.0.1-rc.5 || ^0.1.0-rc.5",
-    "@deepseek-ai/schemastery": "^3.18.1-rc.4"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-session-persistence": {
-      "optional": true
-    }
-  },
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
-  "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
     "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-agent-presets": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-invariants": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/cordis-plugin-include": "^1.0.6",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-presets": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-atomic-write": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-brand": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-home-paths": "^0.0.1-rc.3",
+    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-scope": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-session": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-settings": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-timeout": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.1",
-    "@types/node": "^26.2.0",
+    "@types/node": "^22.0.0",
     "tsdown": "^0.22.2",
     "typescript": "^5.9.0",
     "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && tsdown",
+    "prepare": "npm run build",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.build.json --noEmit"
   },
   "keywords": [
     "dsh",
@@ -79,13 +90,13 @@
     "canary",
     "rollback"
   ],
-  "scripts": {
-    "build": "tsc -p tsconfig.build.json && tsdown",
-    "prepare": "npm run build",
-    "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.build.json --noEmit"
-  },
-  "publishConfig": {
-    "access": "public"
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compat": {
+      "minHost": "0.1.0-rc.6",
+      "notes": "composition-preflight gate runs via the standalone preflight-runner (resolves official packages from a live harness checkout, no fork patch); on the npm line without a checkout it degrades to a notice, every other capability intact"
+    }
   }
 }

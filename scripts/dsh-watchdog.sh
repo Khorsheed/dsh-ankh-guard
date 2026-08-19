@@ -14,6 +14,15 @@
 # outside the protected process — spawned detached (setsid) by the guard CLI's
 # `supervise` verb or by a launcher, never by hand in normal operation.
 #
+# Process model: the watchdog reaps the instance it spawned, and on the way
+# out (EXIT/TERM/INT) anything it still owns (the instance child, the give-up
+# crash page) — supervision never leaves orphans. It does NOT assume a process
+# group: the instance is not setsid'd, so reaping walks the descendant tree
+# (pgrep -P) instead of killing a group. The supervised instance is expected to
+# manage its own children on graceful shutdown; the tree walk is the
+# best-effort net for the forced paths (SIGKILL cannot be trapped, and the next
+# start's free_port covers that case).
+#
 # Everything is parameterized by environment (the guard CLI's `supervise` verb
 # sets these); nothing here is machine-specific:
 #   WD_HOME=DIR        dsh root: markers, pidfile, state (default: $DSH_HOME)
@@ -24,6 +33,7 @@
 #   WD_WAIT_OWNER=1    don't adopt the port; wait for the current owner to exit
 #   WD_DELAY=N         sleep N seconds before adopting/observing the port
 #   WD_SUPERVISE=1     write/check the pidfile (one watchdog only)
+#   WD_BOOT_TIMEOUT=N  seconds to wait for the port to answer 200 (default 60)
 #   WD_TEST_FAKE=1     launch a throwaway http server instead of the instance
 #   WD_TEST_BREAK=1    launch a command that always fails (give-up testing)
 #
@@ -38,6 +48,7 @@ if [ "${1:-}" = "--supervise" ]; then SUPERVISE=1; else SUPERVISE=0; fi
 DSH_ROOT="${WD_HOME:-${DSH_HOME:-}}"
 PORT="${WD_PORT:-3080}"
 DELAY="${WD_DELAY:-0}"
+BOOT_TIMEOUT="${WD_BOOT_TIMEOUT:-60}"
 REPO="${WD_REPO:-}"
 GIVE_UP_MARKER="$DSH_ROOT/state/watchdog-gave-up"
 RESTART_MARKER="$DSH_ROOT/state/restart-requested.json"
@@ -64,14 +75,49 @@ healthy() {
   [ "$code" = "200" ]
 }
 
+# Reap a pid AND its descendants, deepest first (best effort). The watchdog
+# guarantees the direct child; the sweep keeps grandchildren from outliving
+# the instance — a single-pid kill is what orphaned listeners and left the
+# EADDRINUSE race behind.
+kill_tree() {
+  local pid=$1 sig=${2:-TERM} child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_tree "$child" "$sig"
+  done
+  kill -s "$sig" "$pid" 2>/dev/null || true
+}
+
+# Echo a pid and all its descendants, one per line.
+pid_tree() {
+  local pid=$1 child
+  echo "$pid"
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    pid_tree "$child"
+  done
+}
+
+# Every TCP port the instance tree is listening on, one per line. Used only to
+# explain a boot-window timeout: a `--start` command that omits the port flag
+# binds the application default instead of the supervised port, so the instance
+# is healthy on a port nobody is watching while this watchdog polls an empty
+# one. `lsof` takes the whole tree because the started command usually execs
+# into the server through a shell.
+instance_listen_ports() {
+  local pids
+  pids=$(pid_tree "$1" | paste -sd, -)
+  [ -n "$pids" ] || return 0
+  lsof -nP -a -p "$pids" -iTCP -sTCP:LISTEN 2>/dev/null \
+    | awk 'NR > 1 { n = split($9, a, ":"); print a[n] }' | sort -u
+}
+
 # Free the port: the watchdog is the declared owner, so it adopts an existing
 # listener (the one-time bounce that moves a running instance under supervision).
 free_port() {
-  local pid
+  local pid p
   pid=$(lsof -tiTCP:$PORT -sTCP:LISTEN -P 2>/dev/null)
   if [ -n "$pid" ]; then
     echo "[watchdog] freeing :$PORT from pid(s) $pid"
-    kill $pid 2>/dev/null
+    for p in $pid; do kill_tree "$p" TERM; done
     sleep 2
   fi
 }
@@ -190,15 +236,37 @@ retry_on_usrs() {
   if [ -n "${page_pid:-}" ]; then kill "$page_pid" 2>/dev/null; fi
   failures=0
   reset_done=0
+  port_races=0
 }
 
-# --supervise: one watchdog only.
+# --supervise: one watchdog only. The claim must be atomic — a check-then-write
+# (`[ -f ]` + `kill -0`, then `>`) is a TOCTOU window in which two watchdogs
+# starting together both find no live owner, both write, and both supervise the
+# same port. `set -C` (noclobber) makes the redirect itself fail when the file
+# exists, so exactly one racer creates it and the others take the exit path.
+# Note this runs BEFORE the cleanup trap is installed: a loser must not remove
+# the winner's pidfile on its way out.
 if [ "$SUPERVISE" = "1" ]; then
-  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "[watchdog] already supervised by pid $(cat "$PIDFILE"); exiting"
-    exit 0
+  mkdir -p "$(dirname "$PIDFILE")" 2>/dev/null || true
+  claimed=0
+  attempt=0
+  while [ "$attempt" -lt 5 ]; do
+    attempt=$((attempt + 1))
+    if (set -C; echo $$ > "$PIDFILE") 2>/dev/null; then claimed=1; break; fi
+    owner=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      echo "[watchdog] already supervised by pid $owner; exiting"
+      exit 0
+    fi
+    # Stale (owner gone) or empty pidfile: drop it and race for the claim
+    # again. Losing that race is correct — the next pass sees a live owner and
+    # exits through the branch above.
+    rm -f "$PIDFILE"
+  done
+  if [ "$claimed" != "1" ]; then
+    echo "[watchdog] could not claim $PIDFILE after $attempt attempts" >&2
+    exit 1
   fi
-  echo $$ > "$PIDFILE"
 fi
 
 # Graceful launch: let the scheduling turn finish before the adoption bounce.
@@ -207,8 +275,28 @@ if [ "$DELAY" -gt 0 ] 2>/dev/null; then sleep "$DELAY"; fi
 rm -f "$GIVE_UP_MARKER"
 failures=0
 reset_done=0
+port_races=0
 
 trap 'retry_on_usrs' USR1
+
+# Reap what we spawned on the way out — the instance child and the give-up
+# crash page. Without this, TERM/INT (or a plain exit) orphans them to PPID 1:
+# the leak that left three crash pages on 8/16, and the held port the
+# EADDRINUSE branch then had to free. SIGKILL cannot be trapped; the next
+# start's free_port covers that case. (`set -u` — guard every var.)
+cleanup() {
+  if [ -n "${page_pid:-}" ]; then kill "$page_pid" 2>/dev/null; fi
+  if [ -n "${child:-}" ]; then kill_tree "$child" TERM; fi
+  # Drop the pidfile ONLY while it names us: a successor watchdog may have
+  # already claimed it in the restart window, and deleting theirs would let a
+  # second supervisor in.
+  if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$PIDFILE"
+  fi
+  return 0
+}
+trap cleanup EXIT
+trap 'cleanup; exit 143' TERM INT
 
 if [ "${WD_WAIT_OWNER:-0}" = "1" ]; then
   # Adoption ahead of a self-restart: the current owner exits on its own.
@@ -228,7 +316,7 @@ while true; do
   child=$!
   # Boot window: the instance is up when the port answers 200.
   up=0
-  boot_limit=$(( $(date +%s) + 60 ))
+  boot_limit=$(( $(date +%s) + BOOT_TIMEOUT ))
   while [ "$(date +%s)" -lt "$boot_limit" ]; do
     if ! kill -0 "$child" 2>/dev/null; then break; fi
     if healthy; then up=1; break; fi
@@ -236,21 +324,51 @@ while true; do
   done
 
   if [ "$up" = "0" ]; then
+    # Read the bound ports BEFORE reaping — once the child is gone there is no
+    # way left to tell "never started" from "started on the wrong port".
+    bound=""
+    if kill -0 "$child" 2>/dev/null; then bound=$(instance_listen_ports "$child"); fi
     # Never came up (or died); stop a still-alive child and reap it.
     if kill -0 "$child" 2>/dev/null; then kill "$child" 2>/dev/null; fi
     wait "$child" 2>/dev/null
 
     if grep -q 'EADDRINUSE' "$ATTEMPT_LOG" 2>/dev/null; then
-      # The port was still held (a leftover process, a slow exit) — an
-      # operational race, not a code regression. The watchdog owns the port,
-      # so free it and retry WITHOUT counting toward rollback or give-up.
-      echo "[watchdog] boot hit EADDRINUSE on :$PORT — freeing the port and retrying (not a code failure)"
-      free_port
-      continue
+      if grep 'EADDRINUSE' "$ATTEMPT_LOG" | grep -qE "[:.]$PORT([^0-9]|$)"; then
+        # The supervised port was still held (a leftover process, a slow exit)
+        # — an operational race, not a code regression. The watchdog owns this
+        # port, so free it and retry WITHOUT counting toward rollback or
+        # give-up. Bounded: once freeing stops winning the port back, the owner
+        # is outside this watchdog's reach and retrying is a hot spin.
+        port_races=$((port_races + 1))
+        if [ "$port_races" -le 5 ]; then
+          echo "[watchdog] boot hit EADDRINUSE on :$PORT — freeing the port and retrying (not a code failure, attempt $port_races/5)"
+          free_port
+          continue
+        fi
+        echo "[watchdog] :$PORT is still held after 5 free attempts — counting this as a boot failure"
+      else
+        # EADDRINUSE on a port this watchdog does not own: the start command
+        # targets somewhere else, and freeing :$PORT cannot release it. The
+        # unconditional retry this replaces never counted the attempt, so a
+        # start command aimed at an occupied foreign port respawned the
+        # instance in a tight loop with no backoff and no give-up.
+        echo "[watchdog] boot hit EADDRINUSE on a port other than the supervised :$PORT — the --start command targets a port this watchdog does not own; freeing :$PORT cannot fix that"
+        reset_done=1
+      fi
     fi
 
     failures=$((failures + 1))
     echo "[watchdog] instance failed to come up (failure #$failures)"
+
+    # The instance came up on a port this watchdog does not own: a start-command
+    # argument, not a code regression. Resetting the checkout cannot change a
+    # command line, so mark the rollback spent (same escape hatch as a failure
+    # whose subject lives outside the repository) and keep counting toward the
+    # crash page, which is what makes the misconfiguration visible.
+    if [ -n "$bound" ] && ! printf '%s\n' "$bound" | grep -qx "$PORT"; then
+      echo "[watchdog] instance bound :$(printf '%s' "$bound" | paste -sd, -) but supervision owns :$PORT — the --start command does not bind the supervised port; a repository rollback cannot fix that"
+      reset_done=1
+    fi
 
     if [ "$failures" -ge 2 ] && [ "$reset_done" -eq 0 ]; then
       sha=$(rollback_sha)
@@ -309,6 +427,7 @@ while true; do
 
   failures=0
   reset_done=0
+  port_races=0
   wait "$child"
   exit_code=$?
 

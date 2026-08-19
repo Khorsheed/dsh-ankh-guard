@@ -10,7 +10,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { get as httpGet } from 'node:http'
 import { connect, createServer, type AddressInfo, type Server } from 'node:net'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -23,7 +23,7 @@ import {
   acknowledgeRestartRecord, pendingRestartRecord, readInterruptedSnapshot, restartContextText,
   writeInterruptedSnapshot,
 } from '../src/restart-context.ts'
-import { preflightInternals, resolvePreflightBin, runCli, type CliIo } from '../src/cli.ts'
+import { preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, runCli, type CliIo } from '../src/cli.ts'
 import {
   clearCredential, emptyState, lastGoodBootRevision, loadState, recordCredential, setCheckpoint,
   verifyCredential, type GuardState,
@@ -192,6 +192,13 @@ function stubPreflightBin(resolveBin: () => string | undefined): void {
   cleanups.push(() => { preflightInternals.resolveBin = original })
 }
 
+/** Point the standalone-runner resolution at a fixed answer, restored after the test. */
+function stubPreflightRunner(resolveRunner: (harnessRoot: string) => string | undefined): void {
+  const original = preflightInternals.resolveRunner
+  preflightInternals.resolveRunner = resolveRunner
+  cleanups.push(() => { preflightInternals.resolveRunner = original })
+}
+
 describe('CLI', () => {
   const io = cliIo
 
@@ -354,6 +361,58 @@ describe('CLI', () => {
     }
   })
 
+  it('restart escalates to SIGKILL after --stop-timeout-ms and reports the forced stop', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    // A listener that swallows SIGTERM: only the SIGKILL escalation can stop it.
+    const stubborn = spawn(process.execPath, ['-e',
+      `process.on('SIGTERM', () => {}); require('http').createServer((q, s) => s.end('stubborn')).listen(${port}, '127.0.0.1')`],
+    { stdio: 'ignore' })
+    try {
+      await waitForPort(port)
+      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      stubPreflight('true')
+      // The replacement retries binding: the stubborn listener's socket is
+      // released asynchronously after its SIGKILL, so a single immediate bind
+      // can race it (EADDRINUSE) and crash the replacement — a flake under
+      // load. Retrying makes the takeover deterministic.
+      const startCmd = `"${process.execPath}" -e "
+const http = require('http');
+const tryListen = () => http.createServer((q, s) => s.end('new')).listen(${port}, '127.0.0.1').on('error', (e) => { if (e.code === 'EADDRINUSE') setTimeout(tryListen, 100); else throw e; });
+tryListen();
+"`
+      const out = io()
+      const started = Date.now()
+      expect(await runCli(
+        ['restart', '--port', String(port), '--start', startCmd, '--stop-timeout-ms', '700',
+          '--state-dir', stateDir, '--repo', repo],
+        out.io,
+      )).toBe(0)
+      // The grace deadline was honored before the SIGKILL escalation.
+      expect(Date.now() - started).toBeGreaterThanOrEqual(600)
+      expect(out.out.join('')).toContain('sending SIGKILL')
+      expect(out.out.join('')).toContain('(forced)')
+      // The takeover window is real: `restart`'s port probe can succeed against
+      // the stubborn listener while it is still dying (SIGKILL delivery is
+      // asynchronous) — the port then goes quiet until the replacement's
+      // retrying bind wins. Probe until the NEW server answers.
+      const takeoverDeadline = Date.now() + 5000
+      let body = ''
+      while (Date.now() < takeoverDeadline) {
+        try {
+          body = await fetchBody(port)
+          if (body === 'new') break
+        } catch { /* not up yet — the takeover window */ }
+        await new Promise((resolve) => { setTimeout(resolve, 100) })
+      }
+      expect(body).toBe('new')
+    } finally {
+      await killListener(port)
+      stubborn.kill('SIGKILL')
+    }
+  })
+
   it('restart --rollback resets to the checkpoint when the new instance never comes up', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
@@ -416,11 +475,17 @@ describe('CLI', () => {
 describe('composition preflight gate', () => {
   const io = cliIo
 
-  it('resolvePreflightBin maps layouts (standalone: no sibling app → undefined)', () => {
-    // The standalone package has no sibling apps/cli — resolution must be
-    // undefined here (the documented out-of-layout contract); the monorepo
-    // checkout resolves the source form (tsx) or the built one instead.
-    expect(resolvePreflightBin()).toBeUndefined()
+  it('resolvePreflightBin finds the sibling app in this checkout and maps foreign layouts', () => {
+    // Self-checkout resolution only applies when the package lives inside a dsh
+    // repo checkout (a sibling apps/cli exists). In the standalone dsh-plugins
+    // monorepo there is no sibling app, so the no-arg form stays undefined and
+    // only the foreign-layout mapping is asserted.
+    const here = resolvePreflightBin()
+    if (here !== undefined) {
+      expect(here).toContain('apps')
+      // The production seam resolves the same bin.
+      expect(preflightInternals.resolveBin()).toBe(here)
+    }
     // Built-only layout: no src/bin.ts and no tsx, but lib/bin.js exists.
     const builtOnly = tmpDir('guard-layout-')
     mkdirSync(join(builtOnly, 'apps/cli/lib'), { recursive: true })
@@ -434,6 +499,33 @@ describe('composition preflight gate', () => {
     expect(resolvePreflightBin(foreignCli(noTsx))).toBeUndefined()
     // No app at all: unresolvable.
     expect(resolvePreflightBin(foreignCli(tmpDir('guard-layout-')))).toBeUndefined()
+  })
+
+  it('resolveHarnessRoot prefers the repo target, then DSH_HARNESS, then the conventional default', () => {
+    expect(resolveHarnessRoot('/repo')).toBe('/repo')
+    expect(resolveHarnessRoot(undefined, { DSH_HARNESS: '/env-harness' })).toBe('/env-harness')
+    expect(resolveHarnessRoot('', { DSH_HARNESS: '  ' })).toBe(join(homedir(), 'code/deepseek-harness'))
+  })
+
+  it('resolveRunnerCommand maps a harness with tsx, and degrades without it', () => {
+    // No tsx in the harness: unresolvable.
+    const noTsx = tmpDir('guard-harness-')
+    expect(resolveRunnerCommand(noTsx)).toBeUndefined()
+    // tsx present: the command forms, naming the harness tsx and this
+    // checkout's runner script (the runner always sits beside the CLI).
+    const withTsx = tmpDir('guard-harness-')
+    mkdirSync(join(withTsx, 'node_modules/tsx/dist/esm'), { recursive: true })
+    writeFileSync(join(withTsx, 'node_modules/tsx/dist/esm/index.mjs'), '')
+    const command = resolveRunnerCommand(withTsx)
+    expect(command).toBeDefined()
+    expect(command).toContain(withTsx)
+    expect(command).toContain('preflight-runner')
+    expect(command).toContain('tsx')
+    // The production seam resolves the same command for the live harness.
+    const live = preflightInternals.resolveRunner(resolveHarnessRoot(undefined, {}))
+    if (live !== undefined) {
+      expect(live).toContain('preflight-runner')
+    }
   })
 
   it('preflight maps the subprocess verdict onto exit codes', async () => {
@@ -456,6 +548,20 @@ describe('composition preflight gate', () => {
     expect(unexpected.err.join('')).toContain('unexpected code 2')
   })
 
+  it('gate treats a host CLI without the preflight subcommand as unavailable', async () => {
+    // An official checkout (or older npm host) has bin.ts but no `preflight`
+    // subcommand: commander answers exit 1 with an unknown-command error. The
+    // gate must degrade and proceed, not refuse restarts on a phantom verdict.
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    stubPreflight(`"${process.execPath}" -e "console.error(\\"error: unknown command 'preflight'\\"); process.exit(1)"`)
+    const out = io()
+    await runCli(['schedule-exit', '--port', '3099', '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo], out.io)
+    expect(out.err.join('')).not.toContain('composition preflight failed')
+    expect(out.out.join('')).toContain('unavailable')
+  })
+
   it('preflight resolves the profile from $DSH_PROFILE when no flag is given', async () => {
     stubPreflight('true')
     const previous = process.env.DSH_PROFILE
@@ -470,6 +576,7 @@ describe('composition preflight gate', () => {
   it('an empty DSH_PREFLIGHT_COMMAND falls back to the resolved app bin', async () => {
     stubPreflight('')
     stubPreflightBin(() => 'true')
+    stubPreflightRunner(() => undefined)
     const out = io()
     expect(await runCli(['preflight', '--profile', "it's"], out.io)).toBe(0)
   })
@@ -477,6 +584,7 @@ describe('composition preflight gate', () => {
   it('preflight exits 3 with a clear message when no sibling dsh app exists', async () => {
     stubPreflight(undefined)
     stubPreflightBin(() => undefined)
+    stubPreflightRunner(() => undefined)
     const out = io()
     expect(await runCli(['preflight'], out.io)).toBe(3)
     expect(out.err.join('')).toContain('preflight unavailable outside the dsh app layout')
@@ -541,6 +649,7 @@ describe('composition preflight gate', () => {
     await runCli(['record', 'build', '--state-dir', join(home, 'state'), '--repo', repo], io().io)
     stubPreflight(undefined)
     stubPreflightBin(() => undefined)
+    stubPreflightRunner(() => undefined)
     const out = io()
     expect(await runCli(
       ['schedule-exit', '--port', '3099', '--delay-ms', '60000', '--state-dir', join(home, 'state'), '--repo', repo],
@@ -680,6 +789,16 @@ describe('supervise', () => {
       if (previous === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previous
     }
+    // A watchdog is setsid'd and detached: nothing reaps it when a test fails
+    // before its own `stop()`, so it outlives the run and keeps respawning a
+    // fake instance forever. Registering here makes teardown unconditional;
+    // `stop` stays on the return value for tests that stop it mid-test (it is
+    // idempotent — killing an already-dead pid is caught).
+    // unshift, not push: `tmpDir` already registered the rmSync of `home`, and
+    // a watchdog that is still alive when its WD_HOME is removed recreates
+    // `state/` under the deleted directory.
+    cleanups.unshift(stop)
+    cleanups.push(restore)
     return { home, restore, stop }
   }
 
@@ -746,6 +865,61 @@ describe('supervise', () => {
       env.restore()
     }
   })
+
+  it('claims the pidfile atomically — concurrent watchdogs leave exactly one supervisor', async () => {
+    // The CLI check above serializes two SEQUENTIAL supervise calls. This
+    // covers the script's own claim, which is what a simultaneous start races
+    // on: with a check-then-write claim several racers pass the liveness test
+    // before any of them writes, and the port ends up with more than one
+    // supervisor.
+    const home = tmpDir('guard-race-')
+    mkdirSync(join(home, 'state'), { recursive: true })
+    mkdirSync(join(home, 'home'), { recursive: true })
+    const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const killTree = (pid: number): void => {
+      let children: number[] = []
+      try {
+        children = execFileSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' })
+          .split('\n').map(Number).filter((n) => Number.isInteger(n) && n > 0)
+      } catch { /* pgrep exits 1 when the pid has no children */ }
+      for (const child of children) killTree(child)
+      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    }
+    // One launcher backgrounding all racers from a single shell: they reach the
+    // claim within the same few milliseconds. Spawning them one-by-one from
+    // node staggers them by enough process-setup time that the first racer has
+    // already written the pidfile, which hides the very race under test.
+    const launcher = spawn('bash', ['-c', 'for _ in 1 2 3 4 5 6 7 8; do bash "$0" --supervise >/dev/null 2>&1 & done; wait', script], {
+      env: { ...process.env, WD_HOME: home, WD_PORT: String(port), WD_TEST_FAKE: '1' },
+      stdio: 'ignore',
+    })
+    // unshift for the same reason as `supervisedEnv`: the survivor must die
+    // before `tmpDir` removes the WD_HOME it keeps writing into. The racers are
+    // NOT setsid'd (they share this process's group), so reap the tree by pid.
+    cleanups.unshift(() => { if (launcher.pid !== undefined) killTree(launcher.pid) })
+    const survivors = (): number[] => {
+      try {
+        return execFileSync('pgrep', ['-P', String(launcher.pid)], { encoding: 'utf8' })
+          .split('\n').map(Number).filter((n) => Number.isInteger(n) && n > 0)
+      } catch { return [] } // pgrep exits 1 once every racer but the winner is gone
+    }
+    // Settle on a STABLE count rather than on the first reading of 1: while the
+    // launcher is still forking, `pgrep -P` legitimately reports one racer, and
+    // stopping there would pass before the race has even happened.
+    const start = Date.now()
+    let last = -1
+    let unchangedSince = start
+    while (Date.now() - start < 20_000) {
+      await new Promise((resolve) => { setTimeout(resolve, 500) })
+      const count = survivors().length
+      if (count !== last) { last = count; unchangedSince = Date.now() }
+      else if (Date.now() - unchangedSince >= 2_000 && Date.now() - start >= 3_000) break
+    }
+    expect(survivors()).toHaveLength(1)
+    expect(readFileSync(join(home, 'state', 'watchdog.pid'), 'utf8').trim())
+      .toBe(String(survivors()[0]))
+  }, 30_000)
 
   it('schedule-exit refuses without a credential (the gate)', async () => {
     const env = supervisedEnv()
@@ -1024,6 +1198,62 @@ describe('supervise', () => {
       expect(log).not.toContain('giving up')
       expect(currentHead(repo)).toBe(head)
       expect(existsSync(join(env.home, 'state', 'watchdog-gave-up'))).toBe(false)
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+    // Six spawn-and-fail cycles do not fit in vitest's 5 s default, which the
+    // 20 s deadline above already assumed.
+  }, 30_000)
+
+  it('counts an EADDRINUSE on a foreign port as a boot failure instead of retrying forever', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = 20000 + Math.floor(Math.random() * 15000)
+    const foreign = port + 1
+    const stateDir = join(env.home, 'state')
+    mkdirSync(stateDir, { recursive: true })
+    const head = currentHead(repo)
+    recordCredential(stateDir, { scope: 'build+test', revision: head ?? '', command: '' }, NOW)
+    // A start command aimed at a port this watchdog does not own. Freeing the
+    // supervised port cannot release the foreign one, so the port-race escape
+    // hatch must NOT apply: it skips the failure counter, and taking it here
+    // respawned the instance in a tight loop that never backed off, never gave
+    // up, and never surfaced the misconfiguration.
+    const counter = join(env.home, 'attempts')
+    const boom = join(env.home, 'foreign-eaddr.js')
+    writeFileSync(boom, `
+      const fs = require('node:fs')
+      const count = fs.existsSync(${JSON.stringify(counter)}) ? Number(fs.readFileSync(${JSON.stringify(counter)}, 'utf8')) : 0
+      fs.writeFileSync(${JSON.stringify(counter)}, String(count + 1))
+      console.error('Error: listen EADDRINUSE: address already in use 127.0.0.1:${foreign}')
+      process.exit(1)
+    `)
+    try {
+      const startCmd = `"${process.execPath}" "${boom}"`
+      const sup = io()
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        sup.io,
+      )).toBe(0)
+      const logPath = join(stateDir, 'watchdog.log')
+      const deadline = Date.now() + 20_000
+      let log = ''
+      while (Date.now() < deadline) {
+        log = existsSync(logPath) ? readFileSync(logPath, 'utf8') : ''
+        if (log.includes('other than the supervised')) break
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      expect(log).toContain('other than the supervised')
+      expect(log).toContain('instance failed to come up')
+      // The counted failures carry the backoff, so attempts stay in single
+      // digits over this window; the uncounted retry loop reached dozens.
+      const attempts = Number(readFileSync(counter, 'utf8'))
+      expect(attempts).toBeLessThanOrEqual(5)
+      // The command line is wrong, not the checkout — the rollback stays unspent.
+      expect(log).not.toContain('rolling repo back')
+      expect(currentHead(repo)).toBe(head)
     } finally {
       env.stop()
       await killListener(port)

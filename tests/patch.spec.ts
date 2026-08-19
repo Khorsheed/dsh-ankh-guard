@@ -10,7 +10,7 @@ describe('ankh-guard bundle patch', () => {
     // `dsh plugin --profile <name> add` reconciles it into the bundles layer.
     expect(patch).toContain('- id: ankh-guard')
     // Scoped names are quoted: a bare @-prefixed scalar is invalid YAML.
-    expect(patch).toContain("name: '@khorsheed/dsh-ankh-guard'")
+    expect(patch).toContain('name: "@khorsheed/dsh-ankh-guard"')
   })
 
   it('inserts exactly one row', () => {
