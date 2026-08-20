@@ -17,6 +17,53 @@ export function findPidOnPort(port: number): string | null {
   }
 }
 
+/** POSIX single-quote one word for a shell command line. */
+function shellQuote(word: string): string {
+  return `'${word.replace(/'/g, "'\\''")}'`
+}
+
+/**
+ * Discover how the process on a port was launched — its exact argv from
+ * `ps -o command=`, its cwd from lsof, and its DSH_* environment from
+ * `ps eww` — rendered as a shell command. This exists because the agent's
+ * sandbox blocks ps entirely, so every fresh-machine agent fell into a
+ * process-tree archaeology loop before its first restart; the CLI (running
+ * unsandboxed) answers the same question mechanically and reliably. Returns
+ * null when the process is gone or ps/lsof are unavailable.
+ * @param pid - the listener's pid.
+ */
+export function discoverLaunchCommand(pid: string): string | null {
+  let argv: string
+  let cwd: string
+  try {
+    argv = execFileSync('ps', ['-o', 'command=', '-p', pid], { encoding: 'utf8', stdio: 'pipe' }).trim()
+    if (argv === '') return null
+  } catch {
+    return null
+  }
+  try {
+    const out = execFileSync('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], { encoding: 'utf8', stdio: 'pipe' })
+    const match = /^n(.+)$/m.exec(out)
+    if (match === null) return null
+    cwd = match[1] ?? ''
+  } catch {
+    return null
+  }
+  const env: Record<string, string> = {}
+  try {
+    const out = execFileSync('ps', ['eww', '-o', 'command', '-p', pid], { encoding: 'utf8', stdio: 'pipe' })
+    for (const token of out.split(/\s+/)) {
+      const eq = token.indexOf('=')
+      if (eq > 0 && token.slice(0, eq).startsWith('DSH_')) env[token.slice(0, eq)] = token.slice(eq + 1)
+    }
+  } catch {
+    // env undiscoverable — the command still works when the instance's own
+    // environment carries the defaults.
+  }
+  const envPart = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ')
+  return `cd ${shellQuote(cwd)} && ${envPart !== '' ? `${envPart} ` : ''}${argv}`
+}
+
 /**
  * Kill a pid AND its descendants, deepest first (best effort). The supervised
  * instance may have forked children; a plain signal on the pid alone would

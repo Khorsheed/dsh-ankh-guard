@@ -77,7 +77,7 @@ export function pendingRestartRecord(stateDir: string): RestartRecord | null {
  * teardown reaped mid-flight, leaving the service down.
  */
 export function bootNoticeText(): string {
-  return '[ankh-guard] 本实例已挂载自重启守护。需要重启服务时必须使用守护 CLI：`dsh-ankh-guard restart --port <端口> --start "<启动命令>"`（自带 停→起→canary，驱动进程独立于实例存活），或先 `dsh-ankh-guard supervise` 建立 watchdog 再 `schedule-exit`。禁止手写 sleep/kill/nohup 类重启脚本——它们会被实例 teardown 回收，服务就此宕掉无人拉起。重启前先 `check-env` 检查环境并 `record` 绿色凭证。'
+  return '[ankh-guard] 本实例已挂载自重启守护。需要重启服务时必须使用守护 CLI：先 `dsh-ankh-guard check-env`（一次回答监管状态/重启命令/环境就绪），再 `record` 绿色凭证，然后 `dsh-ankh-guard restart`（`--start` 通常可省略——启动命令已自动记录；受 watchdog 监管时用 `schedule-exit`）。禁止手写 sleep/kill/nohup 类重启脚本——它们会被实例 teardown 回收，服务就此宕掉无人拉起。'
 }
 
 /**

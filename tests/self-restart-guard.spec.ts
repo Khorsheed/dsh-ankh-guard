@@ -969,27 +969,37 @@ describe('supervise', () => {
     }
   }, 30_000)
 
-  it('restart FALLBACK refuses a supervised launch record — points at schedule-exit', async () => {
+  it('restart FALLBACK refuses only when a watchdog is ALIVE; a dead-supervised record warns and rescues', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
     const stateDir = join(env.home, 'state')
     const flags = ['--state-dir', stateDir, '--repo', repo]
     try {
-      writeInstanceLaunchAsSupervisor(stateDir, { command: 'echo never-run', source: 'supervisor', supervised: true, recordedAt: Date.now() })
+      writeInstanceLaunchAsSupervisor(stateDir, { command: `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('ok')).listen(1,'127.0.0.1')"`, source: 'supervisor', supervised: true, recordedAt: Date.now() })
       expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
       stubPreflight('true')
-      // Spawning directly would fight the supervisor's respawn — refuse.
+      // Watchdog DEAD despite the supervised record: refusing here would send
+      // the agent to schedule-exit → the instance dies with nobody to respawn
+      // it. Warn and rescue with the recorded command instead.
+      const rescue = io()
+      await runCli(['restart', '--sync', '--port', '1', ...flags], rescue.io)
+      expect(rescue.err.join()).toContain('no live watchdog was found')
+      expect(rescue.err.join()).not.toContain('schedule-exit` (the watchdog respawns')
+      // Watchdog ALIVE (live pidfile): refuse all fallbacks, point at schedule-exit.
+      // (A SLEEPER's pid, never the test worker's own — env.stop() SIGKILLs
+      // whatever the pidfile names at teardown.)
+      mkdirSync(stateDir, { recursive: true })
+      const sleeper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' })
+      sleeper.unref()
+      writeFileSync(join(stateDir, 'watchdog.pid'), String(sleeper.pid))
       const out = io()
       expect(await runCli(['restart', '--sync', '--port', '1', ...flags], out.io)).toBe(2)
-      expect(out.err.join()).toContain('watchdog-supervised')
       expect(out.err.join()).toContain('schedule-exit')
-      // An explicit --start is still allowed (the operator takes responsibility).
-      const explicit = io()
-      await runCli(['restart', '--sync', '--port', '1', '--start', 'true', ...flags], explicit.io)
-      expect(explicit.err.join()).not.toContain('watchdog-supervised')
+      expect(out.err.join()).not.toContain('pass --start explicitly')
+      rmSync(join(stateDir, 'watchdog.pid'), { force: true })
+      try { process.kill(sleeper.pid ?? 0, 'SIGKILL') } catch { /* already gone */ }
       // The instance side never overwrites the supervisor's record.
       expect(writeInstanceLaunch(stateDir, { command: 'echo inner', source: 'instance', recordedAt: Date.now() })).toBe(false)
-      expect(readInstanceLaunch(stateDir)?.command).toBe('echo never-run')
     } finally {
       env.restore()
     }
@@ -1032,6 +1042,70 @@ describe('supervise', () => {
     } finally {
       env.stop()
       await killListener(port)
+      env.restore()
+    }
+  }, 30_000)
+
+  it('check-env reports supervision, the restart command, and the bare-exit warning', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    try {
+      // Unsupervised: warning present, and the start command discovered live.
+      const host = spawn(process.execPath, ['-e',
+        `require('http').createServer((q,s)=>s.end('x')).listen(${port},'127.0.0.1')`],
+      { detached: true, stdio: 'ignore', env: { ...process.env, DSH_PROBE_MARKER: 'discovered-1' } })
+      host.unref()
+      await waitForPort(port)
+      const out = io()
+      expect(await runCli(['check-env', '--state-dir', stateDir, '--repo', repo, '--port', String(port)], out.io)).toBe(0)
+      const text = out.out.join('')
+      expect(text).toContain('supervision: NOT supervised')
+      expect(text).toContain('leaves the service DOWN')
+      expect(text).toContain('live discovery')
+      expect(text).toContain(String(port))
+      host.kill('SIGKILL')
+      await killListener(port)
+      // Supervised: pidfile with a live pid → the chain names the watchdog.
+      // (A SLEEPER's pid, never the test worker's own — env.stop() SIGKILLs
+      // whatever the pidfile names at teardown.)
+      mkdirSync(stateDir, { recursive: true })
+      const sleeper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' })
+      sleeper.unref()
+      writeFileSync(join(stateDir, 'watchdog.pid'), String(sleeper.pid))
+      const out2 = io()
+      expect(await runCli(['check-env', '--state-dir', stateDir, '--repo', repo], out2.io)).toBe(0)
+      expect(out2.out.join('')).toContain(`supervised by ankh watchdog (pid ${sleeper.pid})`)
+      try { process.kill(sleeper.pid ?? 0, 'SIGKILL') } catch { /* already gone */ }
+    } finally {
+      env.restore()
+    }
+  }, 15_000)
+
+  it('restart without --start or a record discovers the launch live from the port listener', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    const port = await freePort()
+    const serverFile = join(env.home, 'server.js')
+    writeFileSync(serverFile, `require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')`)
+    try {
+      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      stubPreflight('true')
+      // The "instance": a node process running serverFile — discovery must
+      // reconstruct `node <serverFile>` and re-run it after the stop.
+      const host = spawn(process.execPath, [serverFile], { detached: true, stdio: 'ignore' })
+      host.unref()
+      await waitForPort(port)
+      const out = io()
+      expect(await runCli(['restart', '--sync', '--port', String(port), ...flags], out.io)).toBe(0)
+      expect(out.out.join('')).toContain('restart + canary PASS')
+      expect(await fetchBody(port)).toBe('new')
+      host.kill('SIGKILL')
+      await killListener(port)
+    } finally {
       env.restore()
     }
   }, 30_000)
@@ -1447,7 +1521,7 @@ describe('supervise', () => {
       expect(await runCli(['check-env', '--state-dir', stateDir, '--repo', repo], out.io)).toBe(0)
       const text = out.out.join('')
       expect(text).toContain('unsandboxed')
-      expect(text).toContain('watchdog: none')
+      expect(text).toContain('supervision: NOT supervised')
       expect(text).toContain('git repo: yes')
     } finally {
       env.restore()

@@ -18,7 +18,7 @@
  *              instance, so the post-restart canary runs even though the
  *              instance restart killed the session that used to own it.
  */
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { connect } from 'node:net'
 import { homedir } from 'node:os'
@@ -30,7 +30,7 @@ import {
   clearCredential, loadState, recordCredential, setCheckpoint, verifyCredential,
 } from './state.ts'
 import { lastGoodBootRevision, stateFile } from './state-files.ts'
-import { findPidOnPort, killPidTree } from './processes.ts'
+import { discoverLaunchCommand, findPidOnPort, killPidTree } from './processes.ts'
 import { readInstanceLaunch, writeInstanceLaunchAsSupervisor, writeRestartOutcome, writeUnexpectedExitRecord } from './restart-context.ts'
 
 /** Parsed CLI options; empty stateDir/repoDir mean "use defaults". */
@@ -536,15 +536,32 @@ function shellQuote(word: string): string {
  * the fallback: spawning the instance directly would fight the supervisor's
  * respawn (double-start race) — schedule-exit is the supervised path.
  */
-function resolveStartCommand(flag: string | undefined, stateDir: string, verb: 'restart' | 'supervise', io: CliIo): string | undefined {
+function resolveStartCommand(flag: string | undefined, stateDir: string, verb: 'restart' | 'supervise', io: CliIo, port: number | undefined): string | undefined {
   if (flag !== undefined && flag !== '') return flag
-  const launch = readInstanceLaunch(stateDir)
-  if (launch === null) return undefined
-  if (verb === 'restart' && launch.supervised === true) {
-    io.stderr('restart: this instance is watchdog-supervised — a bare restart would fight the supervisor\'s respawn. Drive the restart with `schedule-exit` (the watchdog respawns and canaries), or pass --start explicitly\n')
+  // A LIVE supervisor owns every respawn; a bare restart would fight it —
+  // refuse all fallbacks, whatever their source.
+  if (verb === 'restart' && liveWatchdogPid(stateDir) !== null) {
+    io.stderr('restart: a watchdog is alive and owns this port — a bare restart would fight its respawn. Drive the restart with `schedule-exit` (the watchdog respawns and canaries)\n')
     return undefined
   }
-  return launch.command
+  const launch = readInstanceLaunch(stateDir)
+  if (launch?.supervised === true) {
+    // The record says supervised but the watchdog is DEAD: refusing here
+    // sends the agent to schedule-exit, which kills the instance with nobody
+    // to respawn it — the documented dead-end. Warn and rescue instead.
+    io.stderr('warning: the launch record says this instance was watchdog-supervised, but no live watchdog was found — proceeding with the recorded command as a rescue; re-establish `supervise` after this restart\n')
+  }
+  if (launch !== null) return launch.command
+  // No record (plugin never booted here): discover the launch live from the
+  // port's listener — the CLI reads ps/lsof the agent's sandbox denies.
+  if (port !== undefined) {
+    const pid = findPidOnPort(port)
+    if (pid !== null) {
+      const discovered = discoverLaunchCommand(pid)
+      if (discovered !== null) return discovered
+    }
+  }
+  return undefined
 }
 
 /** check-env display: redact credential-shaped env values inside the command. */
@@ -863,21 +880,44 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       return 0
     }
     case 'check-env': {
-      // The environment readiness probe for an agent planning a restart:
-      // sandbox (detached processes survive?), watchdog (a bare exit
-      // respawns?), git (the credential can bind?). Run this FIRST.
+      // THE one-call readiness answer for an agent planning a restart: (1) is
+      // this instance supervised and by whom, (2) what command a restart
+      // should use, (3) the bare-exit warning when unsupervised — plus the
+      // sandbox verdict. An agent's FIRST hop; it must never need ps.
       const sandboxed = envInternals.sandboxedByProbe()
       io.stdout(`sandbox: ${sandboxed
         ? 'SANDBOXED — detached processes are reaped when the turn ends; ask the user for /permission danger-full-access in THIS session'
         : 'unsandboxed (full access)'}\n`)
-      io.stdout(`watchdog: ${liveWatchdogPid(stateDir) !== null
-        ? 'alive'
-        : 'none — a bare exit leaves the service DOWN; run supervise or drive the restart with the restart verb'}\n`)
+      const watchdogPid = liveWatchdogPid(stateDir)
+      if (watchdogPid !== null) {
+        let chain = `supervised by ankh watchdog (pid ${watchdogPid})`
+        if (existsSync(join(homedir(), 'Library', 'LaunchAgents', 'com.dsh.watchdog.plist'))) chain += '; the watchdog itself is supervised (launchd com.dsh.watchdog)'
+        else {
+          try {
+            const units = execFileSync('systemctl', ['--user', 'list-unit-files', 'dsh-watchdog.service'], { encoding: 'utf8', stdio: 'pipe' })
+            if (units.includes('dsh-watchdog.service')) chain += '; the watchdog itself is supervised (systemd dsh-watchdog.service)'
+          } catch { /* no systemd on this host */ }
+        }
+        io.stdout(`supervision: ${chain}\n`)
+      } else {
+        io.stdout('supervision: NOT supervised — a bare exit leaves the service DOWN with nothing to respawn it; establish the watchdog with `supervise` first, or drive the restart with the `restart` verb (self-contained stop→start→canary)\n')
+      }
+      const launch = readInstanceLaunch(stateDir)
+      const probePort = options.port ?? launch?.port
+      let startLine: string
+      if (launch !== null) {
+        startLine = `${redactLaunchCommand(launch.command)}  (source: launch record${launch.supervised === true ? ', watchdog-supervised' : ''})`
+      } else if (probePort !== undefined) {
+        const pid = findPidOnPort(probePort)
+        const discovered = pid === null ? null : discoverLaunchCommand(pid)
+        startLine = discovered === null ? 'unknown — pass --start explicitly' : `${redactLaunchCommand(discovered)}  (source: live discovery from the port listener)`
+      } else {
+        startLine = 'unknown — pass --start explicitly (no launch record yet; give --port for live discovery)'
+      }
+      io.stdout(`start: ${startLine}\n`)
       io.stdout(`git repo: ${currentHead(repoDir) !== null
         ? `yes (${repoDir})`
         : `no (${repoDir}) — git init + initial commit before record`}\n`)
-      const launch = readInstanceLaunch(stateDir)
-      io.stdout(`launch: ${launch === null ? 'not recorded (the plugin writes one at boot once loaded)' : redactLaunchCommand(launch.command)}${launch?.supervised === true ? ' (watchdog-supervised)' : ''}\n`)
       return sandboxed ? 1 : 0
     }
     case 'restart': {
@@ -886,7 +926,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stderr(`restart requires --port N and --start "CMD"\n\n${USAGE}`)
         return 2
       }
-      const start = resolveStartCommand(options.start, stateDir, 'restart', io)
+      const start = resolveStartCommand(options.start, stateDir, 'restart', io, port)
       if (start === undefined) {
         return 2
       }
@@ -1032,13 +1072,13 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stderr(`supervise requires --port N and --start "CMD"\n\n${USAGE}`)
         return 2
       }
-      const start = resolveStartCommand(options.start, stateDir, 'supervise', io)
+      const start = resolveStartCommand(options.start, stateDir, 'supervise', io, port)
       if (start === undefined) {
         return 2
       }
       // The supervisor's record is authoritative: the FULL chain (watchdog +
       // launch wrapper), not the inner argv the instance would self-record.
-      writeInstanceLaunchAsSupervisor(stateDir, { command: start, source: 'supervisor', supervised: true, recordedAt: Date.now() })
+      writeInstanceLaunchAsSupervisor(stateDir, { command: start, source: 'supervisor', supervised: true, ...(port !== undefined ? { port } : {}), recordedAt: Date.now() })
       // The supervised instance boots with THIS home (the watchdog exports it
       // as DSH_HOME): a home derived from the state dir would silently point
       // the instance at the wrong profiles/credentials, surfacing far from
@@ -1150,7 +1190,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       return 0
     }
     case 'schedule-exit': {
-      const port = options.port
+      const port = options.port ?? readInstanceLaunch(stateDir)?.port
       const delayMs = options.delayMs
       if (port === undefined || delayMs === undefined) {
         io.stderr(`schedule-exit requires --port N and --delay-ms MS\n\n${USAGE}`)
