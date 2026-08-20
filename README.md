@@ -50,7 +50,7 @@ dsh plugin --profile web add github:Khorsheed/dsh-ankh-guard
 ## 自我重启的前提（给驱动重启的 agent）
 
 - **git 必需。** 凭证、检查点、回滚全部基于 git：凭证绑定 HEAD，checkpoint 是真实提交，rollback 是 reset。部署目录不是 git 仓库时，先 `git init` 并做一次初始提交，再 `record`——否则门禁以 "current git HEAD unavailable" 拒绝重启。`git init` 不是仪式：有了仓库，checkpoint/rollback 的恢复锚点才真正生效。
-- **需要 full-access（无沙箱）权限。** 重启链路要 spawn detached 进程、kill 进程、绑定端口；沙箱化的 tool runner（workspace-write 之类）会以 EPERM 拒绝其中操作，实例在 shell 层就起不来（真实事故：`> >(tee …)` 的 `/dev/fd` open 被拒，连续四次"启动失败"进崩溃页）。**agent 自己无法切换沙箱**——这正是沙箱的意义：`/permission` 是用户输入的命令，单命令提权也要用户审批。发起自我重启前，请用户把**当前会话**切到 full-access：`/permission danger-full-access`——设置页只影响**新**会话；有打开中的持久终端（PTY）时会先被 fence 拒绝，须先关闭终端。（`verify` 和 `record` 的输出也会带这条提示。）
+- **需要 full-access（无沙箱）权限。** 重启链路要 spawn detached 进程、kill 进程、绑定端口；沙箱化的 tool runner（workspace-write 之类）会以 EPERM 拒绝其中操作，实例在 shell 层就起不来（真实事故：`> >(tee …)` 的 `/dev/fd` open 被拒，连续四次"启动失败"进崩溃页）。**agent 自己无法切换沙箱**——这正是沙箱的意义：`/permission` 是用户输入的命令，单命令提权也要用户审批。长期部署更省事的官方做法：启动实例时设 `DSH_PERMISSION_MODE=danger-full-access`（base bundle 的部署级开关，沙箱与审批策略同时放开），所有会话默认无沙箱。或者发起自我重启前，请用户把**当前会话**切到 full-access：`/permission danger-full-access`——设置页只影响**新**会话；有打开中的持久终端（PTY）时会先被 fence 拒绝，须先关闭终端。（`verify` 和 `record` 的输出也会带这条提示。）
 - **安装后的第一次重启必须用 CLI 驱动。** 正在运行的实例还没加载插件（组合变更要重启才生效），watchdog 也还不存在——此时直接退出实例，服务就躺在地上没人拉。add 之后立刻跑 `dsh-ankh-guard supervise --port N --start "CMD"`（它会接管正在运行的实例，之后任何退出都会被拉起），或用 `dsh-ankh-guard restart --port N --start "CMD" --rollback` 驱动首次重启（它在 detached 进程里完成 停→起→canary 全循环），或安装 launchd/systemd 监督器。没有存活 watchdog 时 `verify`/`record`/`schedule-exit` 都会警告。
 
 ## 已知安装坑
