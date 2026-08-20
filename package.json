@@ -34,6 +34,7 @@
     "lib/*.js",
     "lib/types/**/*.d.ts",
     "scripts/dsh-watchdog.sh",
+    "scripts/on-install.js",
     "scripts/install-launchd.sh",
     "scripts/install-systemd.sh",
     "cordis.patch.yml"
@@ -75,9 +76,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsdown",
-    "prepare": "npm run build",
+    "prepare": "npm run build && node scripts/on-install.js",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.build.json --noEmit"
+    "typecheck": "tsc -p tsconfig.build.json --noEmit",
+    "postinstall": "node scripts/on-install.js"
   },
   "keywords": [
     "dsh",
