@@ -59,6 +59,7 @@ dsh plugin --profile web add github:Khorsheed/dsh-ankh-guard
 - **pnpm 默认拦截依赖的构建脚本。** add 因构建脚本拦截失败时，把工具链条目加进 `allowBuilds` 后重试。
 - **npm 缓存有 root 属主文件**（历史上用过一次 `sudo npm …`）会让 prepare 构建 EPERM：`sudo chown -R $(id -u):$(id -g) ~/.npm`。
 - **`--start` 不在你的 cwd 里跑。** watchdog 启动前会 `cd` 到 dsh home（否则 `/tmp`），所以启动命令必须自包含——绝对路径，或命令里显式 `cd`。
+- **启动命令里带上 `--no-open`。** 不带的话，每次拉起（watchdog 接管、计划重启）都会在宿主机上弹一个浏览器标签。preflight 干跑任何时候都不会弹。
 - **从沙箱会话里采用的监督会继承沙箱。** 从 workspace-write 沙箱里 spawn 的 watchdog 会把沙箱 profile 传给之后每次拉起的实例（嵌套 sandbox-exec 失败，每条命令退化成审批）。长期部署请用分层形态（launchd/systemd 安装器），让 watchdog 链从沙箱外启动。
 
 ## 命令行
@@ -84,7 +85,7 @@ dsh-ankh-guard supervise --port 3080 --start "CMD"   # hand the port to a watchd
 - `1`——组合结论：重启将要 boot 的树是坏的；输出会指明坏在哪一层。
 - `3`——preflight 自身没能执行（缺 app 布局、基础设施崩溃）——**不是**对组合的结论。
 
-`schedule-exit` 和 `restart` 在凭证检查之后、停止任何东西之前运行这道闸门。组合失败会带着 preflight 的诊断拒绝；基础设施失败同样拒绝——措辞不同，并附手动绕行路径（手动停实例，让 watchdog 重新拉起）——因为 guard 不会停掉一个它无法证明能回来的健康实例。在 dsh app 布局之外（独立发布的安装）没有 profile 可查：闸门警告一行后放行。参数：`--profile NAME`（默认 `$DSH_PROFILE`，否则 `web`）和 `--preflight-timeout-ms MS`（默认 120000）；`DSH_PREFLIGHT_COMMAND` 整体替换解析出的 app bin（测试钩子）。随时可手动跑：`dsh-ankh-guard preflight --profile web`。
+`schedule-exit` 和 `restart` 在凭证检查之后、停止任何东西之前运行这道闸门。组合失败会带着 preflight 的诊断拒绝；基础设施失败同样拒绝——措辞不同，并附手动绕行路径（手动停实例，让 watchdog 重新拉起）——因为 guard 不会停掉一个它无法证明能回来的健康实例。闸门按 `--repo` → `DSH_HARNESS` → 约定路径 `~/code/deepseek-harness` 的顺序定位用于干跑的 dsh app；三者都解析不到时（没有 harness 检出的纯 npm 部署）没有引擎可以 boot 这棵树，闸门警告一行后放行。参数：`--profile NAME`（默认 `$DSH_PROFILE`，否则 `web`）和 `--preflight-timeout-ms MS`（默认 120000）；`DSH_PREFLIGHT_COMMAND` 整体替换解析出的 app bin（测试钩子）。随时可手动跑：`dsh-ankh-guard preflight --profile web`。
 
 ### 自我重启协议
 
@@ -160,7 +161,7 @@ dsh-ankh-guard restart \
 
 ## Compatibility
 
-- npm 发布线(`@deepseek-ai/dsh@0.1.0-rc.7`):⚠️ 降级——组合 preflight 门禁需要一份 harness checkout 来解析官方包;独立 npm 安装没有它时守护放行并提示,其余能力(restart/supervise 门禁、watchdog、回滚到已知良好点)全部完整。
+- npm 发布线（`@deepseek-ai/dsh@0.1.0-rc.8`）：⚠️ 降级——一切可用；composition-preflight 门禁通过独立的 `preflight-runner` 运行（rc.8 仍未导出 `composeProfile`，runner 改经已发布的 `@deepseek-ai/dsh-app-boot` 原语组装，带漂移绊线测试），只要能解析到 dsh app 布局——`--repo`、`DSH_HARNESS` 或默认检出路径——就完整运行。没有 harness 检出的纯 npm 部署下门禁退化为提示后放行；其余能力（restart/supervise 门禁、watchdog、回滚到已知良好点）在 npm 线上完整。
 - 源码线(deepseek-harness master,fork 或上游):✅——门禁通过独立的 `preflight-runner` 运行(从在线 checkout 解析已发布的 `@deepseek-ai/dsh-app-boot` 等),不再需要 fork 补丁。
 
 ## Known Limitations and Deferred Work
