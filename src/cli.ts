@@ -67,7 +67,7 @@ export interface CliIo {
  * sandboxed tool runner denies (EPERM). Runtime hint, because the README
  * prerequisite section is not reliably read.
  */
-const FULL_ACCESS_HINT = 'hint: the restart loop spawns detached processes and signals them — a sandboxed session (not full-access) will fail with EPERM. Before restarting, ask the user to switch THIS session to full access: /permission danger-full-access (the settings page only affects NEW sessions; close any persistent terminals first — an open PTY fences the switch)\n'
+const FULL_ACCESS_HINT = 'hint: the restart loop spawns detached processes and signals them — a sandboxed session (not full-access) will fail with EPERM. You CANNOT switch the sandbox yourself (that is the point of it): ask the user to run /permission danger-full-access in THIS session (the settings page only affects NEW sessions; an open persistent terminal fences the switch)\n'
 
 /**
  * Printed (by verify/record, and as a refusal-grade warning in schedule-exit)
