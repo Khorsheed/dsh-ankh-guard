@@ -70,6 +70,17 @@ export function pendingRestartRecord(stateDir: string): RestartRecord | null {
 }
 
 /**
+ * The model-visible boot notice: how restarts must be driven in this
+ * deployment. Injected (no wake) into every root session at creation —
+ * the README is not reliably read, and a fresh-machine agent once
+ * hand-rolled a sleep/kill/nohup restart script, which the instance's
+ * teardown reaped mid-flight, leaving the service down.
+ */
+export function bootNoticeText(): string {
+  return '[ankh-guard] 本实例已挂载自重启守护。需要重启服务时必须使用守护 CLI：`dsh-ankh-guard restart --port <端口> --start "<启动命令>"`（自带 停→起→canary，驱动进程独立于实例存活），或先 `dsh-ankh-guard supervise` 建立 watchdog 再 `schedule-exit`。禁止手写 sleep/kill/nohup 类重启脚本——它们会被实例 teardown 回收，服务就此宕掉无人拉起。重启前先 `check-env` 检查环境并 `record` 绿色凭证。'
+}
+
+/**
  * The model-visible restart report (Chinese product copy, factual).
  * @param record - the pending restart record.
  * @param canaryPending - whether the restart marker is still present (the

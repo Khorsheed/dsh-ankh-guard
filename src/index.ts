@@ -29,7 +29,7 @@ import { resolveRepoDir, resolveStateDir, SRC_ARTIFACT_PATTERN } from './default
 import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
 import { stateFile } from './state-files.ts'
 import {
-  acknowledgeRestartRecord, continueAndReportText, continueInterruptedText, interruptedSnapshotFile,
+  acknowledgeRestartRecord, bootNoticeText, continueAndReportText, continueInterruptedText, interruptedSnapshotFile,
   pendingRestartRecord, readInterruptedSnapshot, restartContextText, writeInterruptedSnapshot,
   type RestartRecord,
 } from './restart-context.ts'
@@ -223,6 +223,19 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
   // `reportRestartContext: 'step'/'off'` silently disabled session recovery
   // (default-on!) with no warning — a misconfiguration failing silent.
   const followupReport = reportMode === 'followup'
+  // Boot notice: every root session hears once (injected at creation, claimed
+  // at its next step — no wake) that restarts go through the guard CLI. This
+  // is the discovery channel for agents that never read the package README —
+  // the failure mode where a fresh-machine agent hand-rolls a restart script.
+  ctx.on('agent/created', ({ agent }) => {
+    if (!ctx.agents.roots().includes(agent)) return
+    const text = bootNoticeText()
+    ;(agent as { inject?: (message: ReturnType<typeof createUserMessage>) => void }).inject?.(createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: name, form: 'snapshot', sections: [{ name: 'restart', text }] },
+    }))
+  })
+
   if (followupReport || resumeInterrupted) {
     type FollowupAgent = { followup: (message: ReturnType<typeof createUserMessage>) => void }
     const pluginMessage = (text: string): ReturnType<typeof createUserMessage> => createUserMessage({

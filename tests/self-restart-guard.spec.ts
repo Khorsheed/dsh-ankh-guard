@@ -128,6 +128,34 @@ describe('state core', () => {
     expect(cleared.checkpoint?.revision).toBe('cp1')
   })
 
+  it('injects the boot notice into every root session at creation (no wake)', async () => {
+    // The discovery channel for agents that never read the README: restarts
+    // must go through the guard CLI, never hand-rolled scripts.
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const rootAgent = { id: 'session-root', followup: vi.fn(), inject: vi.fn() } as never
+    const otherAgent = { id: 'session-other', followup: vi.fn(), inject: vi.fn() } as never
+    const liveAgents: unknown[] = [rootAgent, otherAgent]
+    ctx.provide('agents', {
+      roots: () => [liveAgents[0]],
+      list: () => liveAgents,
+    } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
+    await fiber.await()
+    ctx.emit('agent/created', { agent: rootAgent } as never)
+    ctx.emit('agent/created', { agent: otherAgent } as never)
+    const rootInject = (rootAgent as { inject: ReturnType<typeof vi.fn> }).inject
+    const otherInject = (otherAgent as { inject: ReturnType<typeof vi.fn> }).inject
+    expect(rootInject).toHaveBeenCalledTimes(1)
+    const message = rootInject.mock.calls[0]?.[0] as { content: Array<{ text: string }> }
+    expect(message.content[0]?.text).toContain('dsh-ankh-guard restart')
+    expect(message.content[0]?.text).toContain('禁止手写')
+    expect(otherInject).not.toHaveBeenCalled()
+    await fiber.dispose()
+  })
+
   it('fails loud on a malformed state file', () => {
     const dir = tmpDir('guard-state-')
     writeFileSync(join(dir, 'self-restart-guard.json'), '{ nope')

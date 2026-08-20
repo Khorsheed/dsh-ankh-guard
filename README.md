@@ -152,7 +152,7 @@ dsh-ankh-guard restart \
 
 ## Model Experience
 
-无。guard 是宿主侧基础设施；不给任何模型请求增加工具 schema、提示词或结果。
+两条注入上下文，无工具 schema：每个 root 会话一次性的 boot 须知（重启必须走守护 CLI，禁止手写重启脚本），以及重启后的报告与被中断会话的续跑注入。都是插件来源的 snapshot 用户消息；boot 须知经 `agent.inject` 注入（不唤醒）。
 
 #### KV Cache effect
 

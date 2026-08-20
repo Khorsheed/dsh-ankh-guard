@@ -148,7 +148,7 @@ Mounted as a cordis plugin (base bundle), the same surface is available as the `
 
 ## Model Experience
 
-None. The guard is host-side infrastructure; it adds no tool schema, prompt, or result to any model request.
+Two injected context messages, no tool schema: a one-time boot notice per root session (restarts must go through the guard CLI — never hand-rolled scripts), and the restart report / interrupted-session continuation after a restart. Both are plugin-sourced snapshot user messages; the boot notice rides `agent.inject` (no wake).
 
 #### KV Cache effect
 
