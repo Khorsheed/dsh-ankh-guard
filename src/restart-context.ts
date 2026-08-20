@@ -172,31 +172,62 @@ export function writeRestartOutcome(stateDir: string, record: { exitAt: number; 
   atomicWrite(restartRecordFile(stateDir), `${JSON.stringify(record)}\n`)
 }
 
-/** How the current instance was launched, recorded by the plugin at apply. */
+/** How the current instance was launched, recorded at boot. */
 export interface InstanceLaunch {
-  /** Absolute node executable (process.execPath). */
-  execPath: string
-  /** process.argv entries after the executable (script + args). */
-  args: string[]
-  /** process.cwd() of the instance. */
-  cwd: string
-  /** DSH_* environment the instance was launched with. */
-  env: Record<string, string>
+  /** The shell command that starts the instance. */
+  command: string
+  /** Who wrote the record: the instance itself, or its supervisor. */
+  source: 'instance' | 'supervisor'
+  /**
+   * The instance runs under a watchdog (the supervisor's respawn owns the
+   * port). A restart FALLING BACK to a bare per-instance command would spawn
+   * the instance directly and fight the supervisor's respawn — the fallback
+   * must refuse and point at schedule-exit instead.
+   */
+  supervised?: boolean
   /** The instance's listening port, when discovered at apply time. */
   port?: number
-  /** Epoch milliseconds when recorded (plugin apply). */
+  /** Epoch milliseconds when recorded. */
   recordedAt: number
 }
 
 /**
- * Persist the launch record (atomic; best-effort callers). The record is what
- * lets `restart`/`supervise` default --start instead of the agent having to
- * reconstruct its own launch command (ps is sandbox-blocked, and the
- * who-supervises-me question sent fresh-machine agents into loops).
+ * Persist the launch record (atomic). The instance-facing side of
+ * {@link writeInstanceLaunch}: only an `instance`-sourced record may be
+ * replaced by another — a `supervisor` record carries the FULL supervision
+ * chain (watchdog, launch wrapper) and the inner process must not overwrite
+ * it with its own bare argv.
  * @param stateDir - state directory.
- * @param launch - the launch facts captured from the running instance.
+ * @param launch - the launch facts.
+ * @returns whether the record was written.
  */
-export function writeInstanceLaunch(stateDir: string, launch: InstanceLaunch): void {
+export function writeInstanceLaunch(stateDir: string, launch: InstanceLaunch): boolean {
+  const existing = readInstanceLaunch(stateDir)
+  if (existing?.source === 'supervisor') return false
+  mkdirSync(stateDir, { recursive: true })
+  atomicWrite(stateFile(stateDir, 'instanceLaunch'), `${JSON.stringify(launch)}\n`)
+  return true
+}
+
+/** POSIX single-quote one word for a shell command line. */
+function shellQuote(word: string): string {
+  return `'${word.replace(/'/g, "'\\''")}'`
+}
+
+/**
+ * Render the instance's launch as a shell command: cwd, DSH_* env, and the
+ * FULL node invocation — execArgv included, because a tsx chain
+ * (`node --import tsx …`) rendered without it becomes a bare `node bin.ts`
+ * that cannot load TypeScript sources.
+ */
+export function buildLaunchCommand(execPath: string, execArgv: readonly string[], args: readonly string[], cwd: string, env: Record<string, string>): string {
+  const envPart = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ')
+  const argv = [execPath, ...execArgv, ...args].map(shellQuote).join(' ')
+  return `cd ${shellQuote(cwd)} && ${envPart !== '' ? `${envPart} ` : ''}${argv}`
+}
+
+/** Replace any record unconditionally (the supervisor's own write path). */
+export function writeInstanceLaunchAsSupervisor(stateDir: string, launch: InstanceLaunch): void {
   mkdirSync(stateDir, { recursive: true })
   atomicWrite(stateFile(stateDir, 'instanceLaunch'), `${JSON.stringify(launch)}\n`)
 }
@@ -210,7 +241,7 @@ export function writeInstanceLaunch(stateDir: string, launch: InstanceLaunch): v
 export function readInstanceLaunch(stateDir: string): InstanceLaunch | null {
   try {
     const launch = JSON.parse(readFileSync(stateFile(stateDir, 'instanceLaunch'), 'utf8')) as InstanceLaunch
-    return typeof launch.execPath === 'string' && Array.isArray(launch.args) && typeof launch.cwd === 'string' ? launch : null
+    return typeof launch.command === 'string' ? launch : null
   } catch {
     return null
   }

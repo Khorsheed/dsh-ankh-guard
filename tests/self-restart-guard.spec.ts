@@ -20,8 +20,9 @@ import * as selfRestartGuard from '../src/index.ts'
 import { currentHead } from '../src/git.ts'
 import { install as installInvariant } from '../src/invariant.ts'
 import {
-  acknowledgeRestartRecord, continueAndReportText, pendingRestartRecord, readInterruptedSnapshot,
-  restartContextText, writeInterruptedSnapshot,
+  acknowledgeRestartRecord, buildLaunchCommand, continueAndReportText, pendingRestartRecord,
+  readInstanceLaunch, readInterruptedSnapshot, restartContextText, writeInstanceLaunch,
+  writeInstanceLaunchAsSupervisor, writeInterruptedSnapshot,
 } from '../src/restart-context.ts'
 import { performExit } from '../src/exit-agent.ts'
 import { envInternals, preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
@@ -912,6 +913,12 @@ describe('supervise', () => {
   it('apply records how the instance was launched (instance-launch.json)', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-ctx-')
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = stateDir
+    cleanups.push(() => {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    })
     const ctx = new Context()
     await ctx.plugin(Loader)
     ctx.provide('agents', { roots: () => [], list: () => [] } as never)
@@ -923,10 +930,10 @@ describe('supervise', () => {
       await new Promise((resolve) => { setTimeout(resolve, 50) })
     }
     const launch = JSON.parse(readFileSync(file, 'utf8'))
-    expect(launch.execPath).toBe(process.execPath)
-    expect(launch.cwd).toBe(process.cwd())
-    expect(Array.isArray(launch.args)).toBe(true)
-    expect(launch.env.DSH_HOME).toBe(process.env.DSH_HOME)
+    expect(launch.source).toBe('instance')
+    expect(launch.command).toContain(process.execPath)
+    expect(launch.command.startsWith(`cd '`)).toBe(true)
+    expect(launch.command).toContain(`DSH_HOME='${stateDir}'`)
     await fiber.dispose()
   })
 
@@ -939,10 +946,8 @@ describe('supervise', () => {
     try {
       mkdirSync(stateDir, { recursive: true })
       writeFileSync(join(stateDir, 'instance-launch.json'), JSON.stringify({
-        execPath: process.execPath,
-        args: ['-e', `require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')`],
-        cwd: repo,
-        env: {},
+        command: buildLaunchCommand(process.execPath, [], ['-e', `require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')`], repo, {}),
+        source: 'instance',
         recordedAt: Date.now(),
       }))
       expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
@@ -960,6 +965,73 @@ describe('supervise', () => {
       host.kill('SIGKILL')
       await killListener(port)
     } finally {
+      env.restore()
+    }
+  }, 30_000)
+
+  it('restart FALLBACK refuses a supervised launch record — points at schedule-exit', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    try {
+      writeInstanceLaunchAsSupervisor(stateDir, { command: 'echo never-run', source: 'supervisor', supervised: true, recordedAt: Date.now() })
+      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      stubPreflight('true')
+      // Spawning directly would fight the supervisor's respawn — refuse.
+      const out = io()
+      expect(await runCli(['restart', '--sync', '--port', '1', ...flags], out.io)).toBe(2)
+      expect(out.err.join()).toContain('watchdog-supervised')
+      expect(out.err.join()).toContain('schedule-exit')
+      // An explicit --start is still allowed (the operator takes responsibility).
+      const explicit = io()
+      await runCli(['restart', '--sync', '--port', '1', '--start', 'true', ...flags], explicit.io)
+      expect(explicit.err.join()).not.toContain('watchdog-supervised')
+      // The instance side never overwrites the supervisor's record.
+      expect(writeInstanceLaunch(stateDir, { command: 'echo inner', source: 'instance', recordedAt: Date.now() })).toBe(false)
+      expect(readInstanceLaunch(stateDir)?.command).toBe('echo never-run')
+    } finally {
+      env.restore()
+    }
+  }, 15_000)
+
+  it('buildLaunchCommand preserves execArgv (tsx chains stay bootable)', () => {
+    const command = buildLaunchCommand(
+      '/usr/local/bin/node',
+      ['--import', '/repo/node_modules/tsx/dist/esm/index.mjs'],
+      ['/repo/apps/cli/src/bin.ts', 'web', '--port', '8801'],
+      '/repo',
+      { DSH_HOME: '/home/user/.dsh' },
+    )
+    expect(command).toContain("--import")
+    expect(command).toContain('tsx/dist/esm/index.mjs')
+    expect(command.indexOf('--import')).toBeLessThan(command.indexOf('bin.ts'))
+    expect(command).toContain("DSH_HOME='/home/user/.dsh'")
+    expect(command.startsWith("cd '/repo' && ")).toBe(true)
+  })
+
+  it('supervise without --start falls back to the record and writes the supervisor record', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    try {
+      writeInstanceLaunch(stateDir, { command: `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('ok')).listen(${port},'127.0.0.1')"`, source: 'instance', recordedAt: Date.now() })
+      const out = io()
+      // No --start: supervise resolves the record, writes its own authoritative
+      // supervisor record, and spawns the watchdog.
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--state-dir', stateDir, '--repo', repo],
+        out.io,
+      )).toBe(0)
+      expect(out.out.join('')).toContain('watchdog spawned')
+      const record = readInstanceLaunch(stateDir)
+      expect(record?.source).toBe('supervisor')
+      expect(record?.supervised).toBe(true)
+      expect(record?.command).toContain(String(port))
+    } finally {
+      env.stop()
+      await killListener(port)
       env.restore()
     }
   }, 30_000)

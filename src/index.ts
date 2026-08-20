@@ -30,7 +30,7 @@ import { resolveRepoDir, resolveStateDir, SRC_ARTIFACT_PATTERN } from './default
 import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
 import { stateFile } from './state-files.ts'
 import {
-  acknowledgeRestartRecord, bootNoticeText, continueAndReportText, continueInterruptedText, interruptedSnapshotFile,
+  acknowledgeRestartRecord, bootNoticeText, buildLaunchCommand, continueAndReportText, continueInterruptedText, interruptedSnapshotFile,
   writeInstanceLaunch,
   pendingRestartRecord, readInterruptedSnapshot, restartContextText, writeInterruptedSnapshot,
   type RestartRecord,
@@ -484,7 +484,11 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
   // Record how this instance was launched: restart/supervise can then default
   // --start instead of the agent reconstructing the command (ps is
   // sandbox-blocked, and the who-supervises-me question sent fresh-machine
-  // agents into loops). Best-effort and fire-and-forget — never a boot cost.
+  // agents into loops). execArgv is recorded too — a tsx chain
+  // (`node --import tsx …`) rendered without it becomes a bare `node bin.ts`
+  // that cannot load the source. A SUPERVISED instance marks the record so the
+  // fallback refuses to bypass its watchdog; a supervisor's own record is
+  // never overwritten by the inner process (writeInstanceLaunch enforces it).
   void (async () => {
     try {
       const env: Record<string, string> = {}
@@ -500,10 +504,9 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
         // lsof unavailable or nothing listening yet — the record still helps.
       }
       writeInstanceLaunch(stateDir, {
-        execPath: process.execPath,
-        args: process.argv.slice(1),
-        cwd: process.cwd(),
-        env,
+        command: buildLaunchCommand(process.execPath, process.execArgv, process.argv.slice(1), process.cwd(), env),
+        source: 'instance',
+        ...(process.env.DSH_ANKH_SUPERVISED === '1' ? { supervised: true } : {}),
         ...(port !== undefined ? { port } : {}),
         recordedAt: Date.now(),
       })

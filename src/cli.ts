@@ -31,7 +31,7 @@ import {
 } from './state.ts'
 import { lastGoodBootRevision, stateFile } from './state-files.ts'
 import { findPidOnPort, killPidTree } from './processes.ts'
-import { type InstanceLaunch, readInstanceLaunch, writeRestartOutcome, writeUnexpectedExitRecord } from './restart-context.ts'
+import { readInstanceLaunch, writeInstanceLaunchAsSupervisor, writeRestartOutcome, writeUnexpectedExitRecord } from './restart-context.ts'
 
 /** Parsed CLI options; empty stateDir/repoDir mean "use defaults". */
 interface CliOptions {
@@ -528,23 +528,28 @@ function shellQuote(word: string): string {
   return `'${word.replace(/'/g, "'\\''")}'`
 }
 
-/** Render a launch record as a shell command (cwd + DSH_* env + exec argv). */
-export function renderLaunchCommand(launch: InstanceLaunch): string {
-  const envPart = Object.entries(launch.env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ')
-  const argv = [launch.execPath, ...launch.args].map(shellQuote).join(' ')
-  return `cd ${shellQuote(launch.cwd)} && ${envPart !== '' ? `${envPart} ` : ''}${argv}`
-}
-
 /**
- * The --start command: the flag, else the launch record the plugin writes at
- * every boot. The record is what lets an agent restart without reconstructing
- * the instance's launch command (ps is sandbox-blocked; "who supervises me"
- * sent fresh-machine agents into loops).
+ * The --start command: the flag, else the launch record written at boot. The
+ * record is what lets an agent restart without reconstructing the instance's
+ * launch command (ps is sandbox-blocked; "who supervises me" sent
+ * fresh-machine agents into loops). On `restart`, a SUPERVISED record refuses
+ * the fallback: spawning the instance directly would fight the supervisor's
+ * respawn (double-start race) — schedule-exit is the supervised path.
  */
-function resolveStartCommand(flag: string | undefined, stateDir: string): string | undefined {
+function resolveStartCommand(flag: string | undefined, stateDir: string, verb: 'restart' | 'supervise', io: CliIo): string | undefined {
   if (flag !== undefined && flag !== '') return flag
   const launch = readInstanceLaunch(stateDir)
-  return launch === null ? undefined : renderLaunchCommand(launch)
+  if (launch === null) return undefined
+  if (verb === 'restart' && launch.supervised === true) {
+    io.stderr('restart: this instance is watchdog-supervised — a bare restart would fight the supervisor\'s respawn. Drive the restart with `schedule-exit` (the watchdog respawns and canaries), or pass --start explicitly\n')
+    return undefined
+  }
+  return launch.command
+}
+
+/** check-env display: redact credential-shaped env values inside the command. */
+function redactLaunchCommand(command: string): string {
+  return command.replace(/([A-Z_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z_]*=)'(?:[^'\\]|\\')*'/g, "$1'<redacted>'")
 }
 
 /**
@@ -872,18 +877,17 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         ? `yes (${repoDir})`
         : `no (${repoDir}) — git init + initial commit before record`}\n`)
       const launch = readInstanceLaunch(stateDir)
-      io.stdout(`launch: ${launch === null ? 'not recorded (the plugin writes one at boot once loaded)' : renderLaunchCommand(launch)}\n`)
+      io.stdout(`launch: ${launch === null ? 'not recorded (the plugin writes one at boot once loaded)' : redactLaunchCommand(launch.command)}${launch?.supervised === true ? ' (watchdog-supervised)' : ''}\n`)
       return sandboxed ? 1 : 0
     }
     case 'restart': {
-      const port = options.port
+      const port = options.port ?? readInstanceLaunch(stateDir)?.port
       if (port === undefined) {
         io.stderr(`restart requires --port N and --start "CMD"\n\n${USAGE}`)
         return 2
       }
-      const start = resolveStartCommand(options.start, stateDir)
+      const start = resolveStartCommand(options.start, stateDir, 'restart', io)
       if (start === undefined) {
-        io.stderr(`restart requires --start "CMD" — no instance-launch.json recorded in ${stateDir} (the plugin writes one at boot once it is loaded)\n`)
         return 2
       }
       const isDriver = process.env.DSH_ANKH_RESTART_DRIVER === '1'
@@ -1028,11 +1032,13 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stderr(`supervise requires --port N and --start "CMD"\n\n${USAGE}`)
         return 2
       }
-      const start = resolveStartCommand(options.start, stateDir)
+      const start = resolveStartCommand(options.start, stateDir, 'supervise', io)
       if (start === undefined) {
-        io.stderr(`supervise requires --start "CMD" — no instance-launch.json recorded in ${stateDir} (the plugin writes one at boot once it is loaded)\n`)
         return 2
       }
+      // The supervisor's record is authoritative: the FULL chain (watchdog +
+      // launch wrapper), not the inner argv the instance would self-record.
+      writeInstanceLaunchAsSupervisor(stateDir, { command: start, source: 'supervisor', supervised: true, recordedAt: Date.now() })
       // The supervised instance boots with THIS home (the watchdog exports it
       // as DSH_HOME): a home derived from the state dir would silently point
       // the instance at the wrong profiles/credentials, surfacing far from
@@ -1110,6 +1116,9 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         WD_STATE_DIR: stateDir,
         WD_REPO: repoDir,
         WD_START: start,
+        // Let the instance mark its own launch record as supervised (the
+        // watchdog passes its env to the instance it spawns).
+        DSH_ANKH_SUPERVISED: '1',
         // Foreground (launchd-supervised) mode: the watchdog owns the port by
         // adoption; the detached form waits for the current owner to exit.
         WD_WAIT_OWNER: options.foreground ? '0' : '1',
