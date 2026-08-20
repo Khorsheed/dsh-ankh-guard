@@ -24,12 +24,14 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent'
 import type { AgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
 import { resolveSessionPreset, type PresetBearingSession } from '@deepseek-ai/dsh-agent-presets'
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { resolveRepoDir, resolveStateDir, SRC_ARTIFACT_PATTERN } from './defaults.ts'
 import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
 import { stateFile } from './state-files.ts'
 import {
   acknowledgeRestartRecord, bootNoticeText, continueAndReportText, continueInterruptedText, interruptedSnapshotFile,
+  writeInstanceLaunch,
   pendingRestartRecord, readInterruptedSnapshot, restartContextText, writeInterruptedSnapshot,
   type RestartRecord,
 } from './restart-context.ts'
@@ -478,4 +480,35 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     },
   }
   ctx.provide('selfRestartGuard', service)
+
+  // Record how this instance was launched: restart/supervise can then default
+  // --start instead of the agent reconstructing the command (ps is
+  // sandbox-blocked, and the who-supervises-me question sent fresh-machine
+  // agents into loops). Best-effort and fire-and-forget — never a boot cost.
+  void (async () => {
+    try {
+      const env: Record<string, string> = {}
+      for (const [key, value] of Object.entries(process.env)) {
+        if (key.startsWith('DSH_') && value !== undefined) env[key] = value
+      }
+      let port: number | undefined
+      try {
+        const out = execFileSync('lsof', ['-a', '-p', String(process.pid), '-iTCP', '-sTCP:LISTEN', '-P'], { encoding: 'utf8', stdio: 'pipe' })
+        const match = /:(\d+) \(LISTEN\)/.exec(out)
+        if (match !== null) port = Number(match[1])
+      } catch {
+        // lsof unavailable or nothing listening yet — the record still helps.
+      }
+      writeInstanceLaunch(stateDir, {
+        execPath: process.execPath,
+        args: process.argv.slice(1),
+        cwd: process.cwd(),
+        env,
+        ...(port !== undefined ? { port } : {}),
+        recordedAt: Date.now(),
+      })
+    } catch {
+      // Best-effort: the launch record is an optimization, never a boot blocker.
+    }
+  })()
 }

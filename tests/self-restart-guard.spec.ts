@@ -909,6 +909,61 @@ describe('supervise', () => {
     }
   }, 30_000)
 
+  it('apply records how the instance was launched (instance-launch.json)', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    ctx.provide('agents', { roots: () => [], list: () => [] } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
+    await fiber.await()
+    const deadline = Date.now() + 5000
+    const file = join(stateDir, 'instance-launch.json')
+    while (!existsSync(file) && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 50) })
+    }
+    const launch = JSON.parse(readFileSync(file, 'utf8'))
+    expect(launch.execPath).toBe(process.execPath)
+    expect(launch.cwd).toBe(process.cwd())
+    expect(Array.isArray(launch.args)).toBe(true)
+    expect(launch.env.DSH_HOME).toBe(process.env.DSH_HOME)
+    await fiber.dispose()
+  })
+
+  it('restart without --start uses the recorded launch command', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    const port = await freePort()
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, 'instance-launch.json'), JSON.stringify({
+        execPath: process.execPath,
+        args: ['-e', `require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')`],
+        cwd: repo,
+        env: {},
+        recordedAt: Date.now(),
+      }))
+      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      stubPreflight('true')
+      const host = spawn(process.execPath, ['-e',
+        `require('http').createServer((q,s)=>s.end('old')).listen(${port},'127.0.0.1')`],
+      { detached: true, stdio: 'ignore' })
+      host.unref()
+      await waitForPort(port)
+      // No --start: the launch record drives the respawn.
+      const out = io()
+      expect(await runCli(['restart', '--sync', '--port', String(port), ...flags], out.io)).toBe(0)
+      expect(out.out.join('')).toContain('restart + canary PASS')
+      expect(await fetchBody(port)).toBe('new')
+      host.kill('SIGKILL')
+      await killListener(port)
+    } finally {
+      env.restore()
+    }
+  }, 30_000)
+
   it('restart self-detaches by default: the driver survives the caller and completes the loop', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()

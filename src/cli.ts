@@ -31,7 +31,7 @@ import {
 } from './state.ts'
 import { lastGoodBootRevision, stateFile } from './state-files.ts'
 import { findPidOnPort, killPidTree } from './processes.ts'
-import { writeRestartOutcome, writeUnexpectedExitRecord } from './restart-context.ts'
+import { type InstanceLaunch, readInstanceLaunch, writeRestartOutcome, writeUnexpectedExitRecord } from './restart-context.ts'
 
 /** Parsed CLI options; empty stateDir/repoDir mean "use defaults". */
 interface CliOptions {
@@ -218,6 +218,8 @@ flags:
   --command CMD    record: the command that produced the green state
   --message MSG    checkpoint: batch description
   --start "CMD"    restart/supervise: the shell command that starts the instance
+                   (optional once the plugin has booted — it records the launch
+                   command to <state-dir>/instance-launch.json)
   --pid PID        restart: process to stop (default: the listener on --port)
   --timeout-ms MS  restart: how long to wait for the new instance to listen (default 60000);
                    preflight: how long the dry-run boot may take (default 120000)
@@ -524,6 +526,25 @@ export interface PreflightOutcome {
 /** POSIX single-quote one word for the shell command line. */
 function shellQuote(word: string): string {
   return `'${word.replace(/'/g, "'\\''")}'`
+}
+
+/** Render a launch record as a shell command (cwd + DSH_* env + exec argv). */
+export function renderLaunchCommand(launch: InstanceLaunch): string {
+  const envPart = Object.entries(launch.env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ')
+  const argv = [launch.execPath, ...launch.args].map(shellQuote).join(' ')
+  return `cd ${shellQuote(launch.cwd)} && ${envPart !== '' ? `${envPart} ` : ''}${argv}`
+}
+
+/**
+ * The --start command: the flag, else the launch record the plugin writes at
+ * every boot. The record is what lets an agent restart without reconstructing
+ * the instance's launch command (ps is sandbox-blocked; "who supervises me"
+ * sent fresh-machine agents into loops).
+ */
+function resolveStartCommand(flag: string | undefined, stateDir: string): string | undefined {
+  if (flag !== undefined && flag !== '') return flag
+  const launch = readInstanceLaunch(stateDir)
+  return launch === null ? undefined : renderLaunchCommand(launch)
 }
 
 /**
@@ -850,12 +871,19 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       io.stdout(`git repo: ${currentHead(repoDir) !== null
         ? `yes (${repoDir})`
         : `no (${repoDir}) — git init + initial commit before record`}\n`)
+      const launch = readInstanceLaunch(stateDir)
+      io.stdout(`launch: ${launch === null ? 'not recorded (the plugin writes one at boot once loaded)' : renderLaunchCommand(launch)}\n`)
       return sandboxed ? 1 : 0
     }
     case 'restart': {
       const port = options.port
-      if (port === undefined || options.start === undefined || options.start === '') {
+      if (port === undefined) {
         io.stderr(`restart requires --port N and --start "CMD"\n\n${USAGE}`)
+        return 2
+      }
+      const start = resolveStartCommand(options.start, stateDir)
+      if (start === undefined) {
+        io.stderr(`restart requires --start "CMD" — no instance-launch.json recorded in ${stateDir} (the plugin writes one at boot once it is loaded)\n`)
         return 2
       }
       const isDriver = process.env.DSH_ANKH_RESTART_DRIVER === '1'
@@ -955,9 +983,9 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         })
         io.stdout(`stopped ${pid}${exited ? '' : ' (forced)'}\n`)
         const stoppedAt = Date.now()
-        const child = spawn(options.start, { shell: true, detached: true, stdio: 'ignore' })
+        const child = spawn(start, { shell: true, detached: true, stdio: 'ignore' })
         child.unref()
-        io.stdout(`started: ${options.start}\n`)
+        io.stdout(`started: ${start}\n`)
         const timeoutMs = options.timeoutMs ?? 60_000
         const deadline = Date.now() + timeoutMs
         let listening = false
@@ -996,8 +1024,13 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
     }
     case 'supervise': {
       const port = options.port
-      if (port === undefined || options.start === undefined || options.start === '') {
+      if (port === undefined) {
         io.stderr(`supervise requires --port N and --start "CMD"\n\n${USAGE}`)
+        return 2
+      }
+      const start = resolveStartCommand(options.start, stateDir)
+      if (start === undefined) {
+        io.stderr(`supervise requires --start "CMD" — no instance-launch.json recorded in ${stateDir} (the plugin writes one at boot once it is loaded)\n`)
         return 2
       }
       // The supervised instance boots with THIS home (the watchdog exports it
@@ -1076,7 +1109,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         WD_HOME: wdHome,
         WD_STATE_DIR: stateDir,
         WD_REPO: repoDir,
-        WD_START: options.start,
+        WD_START: start,
         // Foreground (launchd-supervised) mode: the watchdog owns the port by
         // adoption; the detached form waits for the current owner to exit.
         WD_WAIT_OWNER: options.foreground ? '0' : '1',

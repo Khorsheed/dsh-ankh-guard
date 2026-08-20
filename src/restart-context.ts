@@ -172,6 +172,50 @@ export function writeRestartOutcome(stateDir: string, record: { exitAt: number; 
   atomicWrite(restartRecordFile(stateDir), `${JSON.stringify(record)}\n`)
 }
 
+/** How the current instance was launched, recorded by the plugin at apply. */
+export interface InstanceLaunch {
+  /** Absolute node executable (process.execPath). */
+  execPath: string
+  /** process.argv entries after the executable (script + args). */
+  args: string[]
+  /** process.cwd() of the instance. */
+  cwd: string
+  /** DSH_* environment the instance was launched with. */
+  env: Record<string, string>
+  /** The instance's listening port, when discovered at apply time. */
+  port?: number
+  /** Epoch milliseconds when recorded (plugin apply). */
+  recordedAt: number
+}
+
+/**
+ * Persist the launch record (atomic; best-effort callers). The record is what
+ * lets `restart`/`supervise` default --start instead of the agent having to
+ * reconstruct its own launch command (ps is sandbox-blocked, and the
+ * who-supervises-me question sent fresh-machine agents into loops).
+ * @param stateDir - state directory.
+ * @param launch - the launch facts captured from the running instance.
+ */
+export function writeInstanceLaunch(stateDir: string, launch: InstanceLaunch): void {
+  mkdirSync(stateDir, { recursive: true })
+  atomicWrite(stateFile(stateDir, 'instanceLaunch'), `${JSON.stringify(launch)}\n`)
+}
+
+/**
+ * Read the launch record, or null when absent/unparseable (older deployments,
+ * or the plugin never applied in this home).
+ * @param stateDir - state directory.
+ * @returns the record, or null.
+ */
+export function readInstanceLaunch(stateDir: string): InstanceLaunch | null {
+  try {
+    const launch = JSON.parse(readFileSync(stateFile(stateDir, 'instanceLaunch'), 'utf8')) as InstanceLaunch
+    return typeof launch.execPath === 'string' && Array.isArray(launch.args) && typeof launch.cwd === 'string' ? launch : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Read the shutdown snapshot, or null when absent/unparseable. Malformed
  * snapshots are dropped by the caller's delete-after-read, never retried.
