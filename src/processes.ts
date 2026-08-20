@@ -38,16 +38,16 @@ export function discoverLaunchCommand(pid: string): string | null {
   try {
     argv = execFileSync('ps', ['-o', 'command=', '-p', pid], { encoding: 'utf8', stdio: 'pipe' }).trim()
     if (argv === '') return null
-  } catch {
-    return null
+  } catch (error) {
+    throw new Error(`ps unavailable: ${String(error)}`)
   }
   try {
     const out = execFileSync('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], { encoding: 'utf8', stdio: 'pipe' })
     const match = /^n(.+)$/m.exec(out)
     if (match === null) return null
     cwd = match[1] ?? ''
-  } catch {
-    return null
+  } catch (error) {
+    throw new Error(`lsof cwd unavailable: ${String(error)}`)
   }
   const env: Record<string, string> = {}
   try {

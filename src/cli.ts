@@ -557,8 +557,12 @@ function resolveStartCommand(flag: string | undefined, stateDir: string, verb: '
   if (port !== undefined) {
     const pid = findPidOnPort(port)
     if (pid !== null) {
-      const discovered = discoverLaunchCommand(pid)
-      if (discovered !== null) return discovered
+      try {
+        const discovered = discoverLaunchCommand(pid)
+        if (discovered !== null) return discovered
+      } catch (error) {
+        io.stderr(`live launch discovery failed (${String(error)}) — ps is sandbox-blocked in this turn; rerun this command escalated (sandbox_permissions) or pass --start explicitly\n`)
+      }
     }
   }
   return undefined
@@ -909,8 +913,12 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         startLine = `${redactLaunchCommand(launch.command)}  (source: launch record${launch.supervised === true ? ', watchdog-supervised' : ''})`
       } else if (probePort !== undefined) {
         const pid = findPidOnPort(probePort)
-        const discovered = pid === null ? null : discoverLaunchCommand(pid)
-        startLine = discovered === null ? 'unknown — pass --start explicitly' : `${redactLaunchCommand(discovered)}  (source: live discovery from the port listener)`
+        try {
+          const discovered = pid === null ? null : discoverLaunchCommand(pid)
+          startLine = discovered === null ? 'unknown — pass --start explicitly' : `${redactLaunchCommand(discovered)}  (source: live discovery from the port listener)`
+        } catch (error) {
+          startLine = `unknown — live discovery failed (${String(error)}); rerun escalated (sandbox_permissions) or pass --start explicitly`
+        }
       } else {
         startLine = 'unknown — pass --start explicitly (no launch record yet; give --port for live discovery)'
       }

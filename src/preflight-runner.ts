@@ -33,8 +33,8 @@
  * @module @khorsheed/dsh-ankh-guard/preflight-runner
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { isDirectInvocation } from './defaults.ts'
@@ -185,6 +185,21 @@ export async function composePreflightPatches(
       config: {
         ...(rows.get('agent-presets')?.config ?? {}) as Record<string, unknown>,
         roots: [{ path: join(root, 'apps/cli/config/agent-presets/'), trust: 'system' }],
+      },
+    })
+  }
+  if (rows.has('ankh-guard')) {
+    // The guard plugin writes state at apply (the instance-launch record,
+    // snapshots). A dry-run is NOT the real instance — isolate its state to a
+    // throwaway dir so a preflight can never poison the deployment's records
+    // (observed: a dry-run wrote instance-launch.json naming the preflight
+    // runner itself as the launch command; a restart falling back to that
+    // record would have spawned a preflight process instead of the instance).
+    composedOverlays.push({
+      id: 'ankh-guard',
+      config: {
+        ...(rows.get('ankh-guard')?.config ?? {}) as Record<string, unknown>,
+        stateDir: mkdtempSync(join(tmpdir(), 'ankh-guard-dry-run-')),
       },
     })
   }
