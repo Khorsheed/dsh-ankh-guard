@@ -939,6 +939,15 @@ describe('supervise', () => {
         await new Promise((resolve) => { setTimeout(resolve, 300) })
       }
       expect(body).toBe('new')
+      const recordDeadline2 = Date.now() + 10_000
+      const outcomeFile = join(stateDir, 'last-restart.json')
+      while (!existsSync(outcomeFile) && Date.now() < recordDeadline2) {
+        await new Promise((resolve) => { setTimeout(resolve, 200) })
+      }
+      // The restart verb records its outcome so the next boot reports it.
+      const outcome = JSON.parse(readFileSync(outcomeFile, 'utf8'))
+      expect(outcome.pid).toBe(host.pid)
+      expect(outcome.error).toBeUndefined()
       const lockFile = join(stateDir, 'restart.lock')
       const lockDeadline = Date.now() + 10_000
       while (existsSync(lockFile) && Date.now() < lockDeadline) {

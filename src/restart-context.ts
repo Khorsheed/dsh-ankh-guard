@@ -159,6 +159,20 @@ export function writeUnexpectedExitRecord(stateDir: string, now: number): boolea
 }
 
 /**
+ * Record the restart verb's outcome for the report machinery (the restart
+ * verb is otherwise invisible to it: it writes no marker and no record, so a
+ * restart it drove would never be reported to any session). Mirrors the exit
+ * agent's record semantics; a still-pending earlier record is replaced only
+ * by a completed newer restart.
+ * @param stateDir - state directory.
+ * @param record - the outcome fields (exitAt/pid for a stop, error on failure).
+ */
+export function writeRestartOutcome(stateDir: string, record: { exitAt: number; pid?: number; error?: string; initiator?: string }): void {
+  mkdirSync(stateDir, { recursive: true })
+  atomicWrite(restartRecordFile(stateDir), `${JSON.stringify(record)}\n`)
+}
+
+/**
  * Read the shutdown snapshot, or null when absent/unparseable. Malformed
  * snapshots are dropped by the caller's delete-after-read, never retried.
  * @param stateDir - state directory.

@@ -31,7 +31,7 @@ import {
 } from './state.ts'
 import { lastGoodBootRevision, stateFile } from './state-files.ts'
 import { findPidOnPort, killPidTree } from './processes.ts'
-import { writeUnexpectedExitRecord } from './restart-context.ts'
+import { writeRestartOutcome, writeUnexpectedExitRecord } from './restart-context.ts'
 
 /** Parsed CLI options; empty stateDir/repoDir mean "use defaults". */
 interface CliOptions {
@@ -954,6 +954,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
           io.stdout(`pid ${pid} did not exit within ${stopTimeoutMs} ms of SIGTERM — sending SIGKILL (the watchdog log will show 'Killed: 9' for ${pid})\n`)
         })
         io.stdout(`stopped ${pid}${exited ? '' : ' (forced)'}\n`)
+        const stoppedAt = Date.now()
         const child = spawn(options.start, { shell: true, detached: true, stdio: 'ignore' })
         child.unref()
         io.stdout(`started: ${options.start}\n`)
@@ -967,8 +968,13 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
           }
           await sleep(500)
         }
+        // The restart verb must not be invisible to the report machinery:
+        // record the outcome (the exit agent's semantics) so the next boot's
+        // pendingRestartRecord delivers the report to its initiator.
+        const initiator = options.initiator ?? process.env.DSH_SESSION_ID
         if (!listening) {
           io.stderr(`new instance not listening on 127.0.0.1:${port} within ${timeoutMs}ms\n`)
+          writeRestartOutcome(stateDir, { exitAt: stoppedAt, pid: pidNumber, error: `new instance not listening on :${port}`, ...(initiator !== undefined ? { initiator } : {}) })
           if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
           return 1
         }
@@ -976,9 +982,11 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stdout(`canary verify: ${post.ok ? 'PASS' : 'FAIL'} — ${post.reason}\n`)
         io.stdout(`canary port: PASS — listening on 127.0.0.1:${port}\n`)
         if (!post.ok) {
+          writeRestartOutcome(stateDir, { exitAt: stoppedAt, pid: pidNumber, error: `canary failed: ${post.reason}`, ...(initiator !== undefined ? { initiator } : {}) })
           if (options.rollback) rollbackToKnownGood(stateDir, repoDir, io)
           return 1
         }
+        writeRestartOutcome(stateDir, { exitAt: stoppedAt, pid: pidNumber, ...(initiator !== undefined ? { initiator } : {}) })
         io.stdout('restart + canary PASS\n')
         return 0
       } finally {

@@ -42,6 +42,8 @@ export const STATE_FILES = {
   watchdogStderrLog: 'watchdog.stderr.log',
   /** The exit agent's log. */
   scheduleExitLog: 'schedule-exit.log',
+  /** How the current instance was launched (recorded by the plugin at apply). */
+  instanceLaunch: 'instance-launch.json',
 } as const
 
 /** A STATE_FILES key. */
