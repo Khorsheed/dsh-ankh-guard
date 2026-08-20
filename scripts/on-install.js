@@ -5,9 +5,14 @@
  * first install, before the plugin is loaded — every other hint (README,
  * boot notice, CLI hints) fires only after the first boot or first CLI call,
  * and fresh-machine agents kept hand-rolling restart scripts in exactly that
- * vacuum.
+ * vacuum. Consumer installs only: a monorepo/workspace developer building
+ * the package is not the audience, so the message stays silent unless the
+ * package directory sits inside a node_modules.
  */
-console.log(`[ankh-guard] installed. The FIRST restart after install must go through the guard CLI —
+import { sep } from 'node:path'
+
+if (process.cwd().includes(`${sep}node_modules${sep}`)) {
+  console.log(`[ankh-guard] installed. The FIRST restart after install must go through the guard CLI —
 the running instance has not loaded the plugin and no watchdog exists yet, so a bare
 exit leaves the service DOWN:
   node_modules/@khorsheed/dsh-ankh-guard/lib/cli.js check-env
@@ -17,3 +22,4 @@ or establish the watchdog first with \`supervise\`. NEVER hand-roll sleep/kill/n
 scripts — they die with the instance (its teardown reaps managed processes).
 首次安装后的第一次重启必须走守护 CLI（见上）；禁止手写 sleep/kill/nohup 重启脚本。
 `)
+}
