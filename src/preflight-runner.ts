@@ -188,6 +188,19 @@ export async function composePreflightPatches(
       },
     })
   }
+  if (rows.has('web-runtime')) {
+    // A dry-run must not have user-visible side effects: the real apply of
+    // the web-app row opens a browser tab on every preflight (openBrowser
+    // defaults true). Suppress it for the dry-run; the port stays 0 either
+    // way.
+    composedOverlays.push({
+      id: 'web-runtime',
+      config: {
+        ...(rows.get('web-runtime')?.config ?? {}) as Record<string, unknown>,
+        openBrowser: false,
+      },
+    })
+  }
   if (rows.has('ankh-guard')) {
     // The guard plugin writes state at apply (the instance-launch record,
     // snapshots). A dry-run is NOT the real instance — isolate its state to a

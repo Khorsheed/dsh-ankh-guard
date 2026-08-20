@@ -46,11 +46,22 @@ describe('preflight composition drift tripwire', () => {
     expect(dump.error).toBeUndefined()
     expect(dump.status).toBe(0)
     const dumpIds = new Set([...dump.stdout.matchAll(/^- id: (\S+)/gm)].map(match => match[1]))
-    const { rows, profileDir } = await composePreflightPatches(profile, [], harness, home)
+    const { rows, patches, profileDir } = await composePreflightPatches(profile, [], harness, home)
     // Pin the target: the composition must actually have read this home.
     expect(profileDir).toBe(join(home, 'profiles', profile))
-    // The runner's two extra overlays reuse existing row ids (agent-presets
-    // config, telemetry disable), so the id SETS must match exactly.
+    // The runner's extra overlays reuse existing row ids (agent-presets
+    // config, telemetry disable, dry-run suppressions), so the id SETS must
+    // match exactly.
     expect([...rows.keys()].sort()).toEqual([...dumpIds].sort())
+    // A dry-run must not have user-visible side effects: no browser, and the
+    // guard's state is isolated from the deployment's real stateDir.
+    const overlayRow = (id: string): Record<string, unknown> | undefined =>
+      patches.find(row => (row as { id?: unknown }).id === id) as Record<string, unknown> | undefined
+    if (dumpIds.has('web-runtime')) {
+      expect((overlayRow('web-runtime')?.config as Record<string, unknown> | undefined)?.openBrowser).toBe(false)
+    }
+    if (dumpIds.has('ankh-guard')) {
+      expect(String((overlayRow('ankh-guard')?.config as Record<string, unknown> | undefined)?.stateDir)).toContain('ankh-guard-dry-run-')
+    }
   }, 60_000)
 })
