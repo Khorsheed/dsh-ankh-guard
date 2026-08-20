@@ -36,7 +36,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { isDirectInvocation } from './defaults.ts'
 
 const NAME = 'dsh'
@@ -160,7 +160,13 @@ export async function composePreflightPatches(
     layers: Array<{ patches: unknown[] }>
   }
   const resolveDshHome = homePaths.resolveDshHome as (configured?: string) => string
-  const anchor = fileURLToPath(new URL('../package.json', import.meta.url))
+  // The heal/load anchor mirrors the real launcher's INSTALL_ANCHOR (the dsh
+  // app's own manifest) — never this runner's package: an installed runner's
+  // dependency closure resolves through the profile fallback itself, and
+  // healing then re-points fallback links into self-referential loops
+  // (observed on a second preflight from the installed CLI: ~20 links looped,
+  // the next real boot would have failed).
+  const anchor = join(root, 'apps', 'cli', 'package.json')
   const resolvedHome = resolveDshHome(home)
   healProfilesModuleFallback(anchor)
   const composed = loadProfile(NAME, profile, anchor, resolvedHome, { userLayer: true })
