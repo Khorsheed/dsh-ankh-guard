@@ -1035,7 +1035,9 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         })
         io.stdout(`stopped ${pid}${exited ? '' : ' (forced)'}\n`)
         const stoppedAt = Date.now()
-        const child = spawn(start, { shell: true, detached: true, stdio: 'ignore' })
+        const startEnv = { ...process.env }
+        delete startEnv.DSH_ANKH_RESTART_DRIVER
+        const child = spawn(start, { shell: true, detached: true, stdio: 'ignore', env: startEnv })
         child.unref()
         io.stdout(`started: ${start}\n`)
         const timeoutMs = options.timeoutMs ?? 60_000

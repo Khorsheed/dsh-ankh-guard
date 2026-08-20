@@ -220,8 +220,17 @@ function shellQuote(word: string): string {
  * (`node --import tsx …`) rendered without it becomes a bare `node bin.ts`
  * that cannot load TypeScript sources.
  */
+/**
+ * Per-invocation transients, never launch configuration: the restart driver's
+ * own marker, the calling session's identity, and the shell/web hand-off
+ * vars. A recorded launch must not leak them into the next instance (a
+ * restart driver reading DSH_ANKH_RESTART_DRIVER would misbehave; a stale
+ * DSH_SESSION_ID misattributes reports).
+ */
+const TRANSIENT_ENV_KEYS = new Set(['DSH_ANKH_RESTART_DRIVER', 'DSH_SESSION_ID', 'DSH_SESSION_JSONL', 'DSH_WEB_URL', 'DSH_SHELL'])
+
 export function buildLaunchCommand(execPath: string, execArgv: readonly string[], args: readonly string[], cwd: string, env: Record<string, string>): string {
-  const envPart = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ')
+  const envPart = Object.entries(env).filter(([key]) => !TRANSIENT_ENV_KEYS.has(key)).map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ')
   const argv = [execPath, ...execArgv, ...args].map(shellQuote).join(' ')
   return `cd ${shellQuote(cwd)} && ${envPart !== '' ? `${envPart} ` : ''}${argv}`
 }

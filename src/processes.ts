@@ -49,12 +49,13 @@ export function discoverLaunchCommand(pid: string): string | null {
   } catch (error) {
     throw new Error(`lsof cwd unavailable: ${String(error)}`)
   }
+  const TRANSIENT = new Set(['DSH_ANKH_RESTART_DRIVER', 'DSH_SESSION_ID', 'DSH_SESSION_JSONL', 'DSH_WEB_URL', 'DSH_SHELL'])
   const env: Record<string, string> = {}
   try {
     const out = execFileSync('ps', ['eww', '-o', 'command', '-p', pid], { encoding: 'utf8', stdio: 'pipe' })
     for (const token of out.split(/\s+/)) {
       const eq = token.indexOf('=')
-      if (eq > 0 && token.slice(0, eq).startsWith('DSH_')) env[token.slice(0, eq)] = token.slice(eq + 1)
+      if (eq > 0 && token.slice(0, eq).startsWith('DSH_') && !TRANSIENT.has(token.slice(0, eq))) env[token.slice(0, eq)] = token.slice(eq + 1)
     }
   } catch {
     // env undiscoverable — the command still works when the instance's own
