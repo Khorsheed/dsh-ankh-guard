@@ -24,7 +24,7 @@ import {
   restartContextText, writeInterruptedSnapshot,
 } from '../src/restart-context.ts'
 import { performExit } from '../src/exit-agent.ts'
-import { preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
+import { envInternals, preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
 import {
   clearCredential, emptyState, loadState, recordCredential, setCheckpoint,
   verifyCredential, type GuardState,
@@ -217,6 +217,13 @@ function stubPreflightRunner(resolveRunner: (harnessRoot: string) => string | un
   cleanups.push(() => { preflightInternals.resolveRunner = original })
 }
 
+/** Fake the sandbox probe, restored after the test. */
+function stubSandboxProbe(sandboxed: boolean): void {
+  const original = envInternals.sandboxedByProbe
+  envInternals.sandboxedByProbe = () => sandboxed
+  cleanups.push(() => { envInternals.sandboxedByProbe = original })
+}
+
 describe('CLI', () => {
   const io = cliIo
 
@@ -332,7 +339,7 @@ describe('CLI', () => {
       await waitForPort(port)
       const io2 = io()
       expect(await runCli(
-        ['restart', '--port', String(port), '--start', 'true', '--state-dir', stateDir, '--repo', repo],
+        ['restart', '--sync', '--port', String(port), '--start', 'true', '--state-dir', stateDir, '--repo', repo],
         io2.io,
       )).toBe(1)
       expect(io2.err.join('')).toContain('restart refused')
@@ -355,7 +362,7 @@ describe('CLI', () => {
       const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
       const restarted = io()
       expect(await runCli(
-        ['restart', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        ['restart', '--sync', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
         restarted.io,
       )).toBe(0)
       expect(restarted.out.join('')).toContain('restart + canary PASS')
@@ -380,7 +387,7 @@ describe('CLI', () => {
       const started = Date.now()
       const out = io()
       expect(await runCli(
-        ['restart', '--port', String(port), '--start', startCmd, '--delay-ms', '500',
+        ['restart', '--sync', '--port', String(port), '--start', startCmd, '--delay-ms', '500',
           '--state-dir', stateDir, '--repo', repo],
         out.io,
       )).toBe(0)
@@ -417,7 +424,7 @@ tryListen();
       const out = io()
       const started = Date.now()
       expect(await runCli(
-        ['restart', '--port', String(port), '--start', startCmd, '--stop-timeout-ms', '700',
+        ['restart', '--sync', '--port', String(port), '--start', startCmd, '--stop-timeout-ms', '700',
           '--state-dir', stateDir, '--repo', repo],
         out.io,
       )).toBe(0)
@@ -461,7 +468,7 @@ tryListen();
       const broken = `"${process.execPath}" -e "process.exit(3)"`
       const failed = io()
       expect(await runCli(
-        ['restart', '--port', String(port), '--start', broken, '--rollback', '--timeout-ms', '2000',
+        ['restart', '--sync', '--port', String(port), '--start', broken, '--rollback', '--timeout-ms', '2000',
           '--state-dir', stateDir, '--repo', repo],
         failed.io,
       )).toBe(1)
@@ -491,7 +498,7 @@ tryListen();
       const broken = `"${process.execPath}" -e "process.exit(3)"`
       const failed = io()
       expect(await runCli(
-        ['restart', '--port', String(port), '--start', broken, '--rollback', '--timeout-ms', '2000',
+        ['restart', '--sync', '--port', String(port), '--start', broken, '--rollback', '--timeout-ms', '2000',
           '--state-dir', stateDir, '--repo', repo],
         failed.io,
       )).toBe(1)
@@ -702,7 +709,7 @@ describe('composition preflight gate', () => {
       stubPreflight('false')
       const out = io()
       expect(await runCli(
-        ['restart', '--port', String(port), '--start', 'true', '--state-dir', stateDir, '--repo', repo],
+        ['restart', '--sync', '--port', String(port), '--start', 'true', '--state-dir', stateDir, '--repo', repo],
         out.io,
       )).toBe(1)
       expect(out.err.join('')).toContain('restart refused: composition preflight failed')
@@ -874,6 +881,50 @@ describe('supervise', () => {
     }
   }, 30_000)
 
+  it('restart self-detaches by default: the driver survives the caller and completes the loop', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    const port = await freePort()
+    const host = spawn(process.execPath, ['-e',
+      `require('http').createServer((q,s)=>s.end('old')).listen(${port},'127.0.0.1')`],
+    { detached: true, stdio: 'ignore' })
+    host.unref()
+    try {
+      await waitForPort(port)
+      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      stubPreflight('true')
+      const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
+      // No --sync: the caller returns as soon as the driver is detached.
+      const out = io()
+      expect(await runCli(['restart', '--port', String(port), '--start', startCmd, ...flags], out.io)).toBe(0)
+      expect(out.out.join('')).toContain('driver detached')
+      // The driver does the real work: old stops, new comes up, lock released.
+      const deadline = Date.now() + 20_000
+      let body = ''
+      while (Date.now() < deadline) {
+        try {
+          body = await fetchBody(port)
+          if (body === 'new') break
+        } catch { /* mid-restart */ }
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      expect(body).toBe('new')
+      const lockFile = join(stateDir, 'restart.lock')
+      const lockDeadline = Date.now() + 10_000
+      while (existsSync(lockFile) && Date.now() < lockDeadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 200) })
+      }
+      expect(existsSync(lockFile)).toBe(false)
+      expect(readFileSync(join(stateDir, 'restart.log'), 'utf8')).toContain('restart + canary PASS')
+    } finally {
+      host.kill('SIGKILL')
+      await killListener(port)
+      env.restore()
+    }
+  }, 30_000)
+
   it('restart refuses while another restart holds the lock; a stale lock is reclaimed', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
@@ -888,28 +939,28 @@ describe('supervise', () => {
       writeFileSync(join(stateDir, 'restart.lock'), String(process.pid))
       const refused = io()
       expect(await runCli(
-        ['restart', '--port', String(port), '--start', 'true', ...flags], refused.io,
+        ['restart', '--sync', '--port', String(port), '--start', 'true', ...flags], refused.io,
       )).toBe(1)
       expect(refused.err.join('')).toContain('already in flight')
       // A STALE holder (dead pid): reclaimed, the restart proceeds (here it
       // reaches the port check and finds nothing to restart).
       writeFileSync(join(stateDir, 'restart.lock'), '999999')
       const proceeded = io()
-      await runCli(['restart', '--port', String(port), '--start', 'true', ...flags], proceeded.io)
+      await runCli(['restart', '--sync', '--port', String(port), '--start', 'true', ...flags], proceeded.io)
       expect(proceeded.err.join()).not.toContain('already in flight')
       // An EMPTY lock (a writer SIGKILLed mid-create): nobody's claim —
       // Number('') is 0 and kill(0, 0) always succeeds, which once read as
       // "alive" and refused every restart forever.
       writeFileSync(join(stateDir, 'restart.lock'), '')
       const emptyLock = io()
-      await runCli(['restart', '--port', String(port), '--start', 'true', ...flags], emptyLock.io)
+      await runCli(['restart', '--sync', '--port', String(port), '--start', 'true', ...flags], emptyLock.io)
       expect(emptyLock.err.join()).not.toContain('already in flight')
       // A FRESH pending marker (schedule-exit in flight): restart must see
       // the other pending stop and refuse — the exit agent would otherwise
       // SIGTERM the instance this restart just started.
       writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({ requestedAt: Date.now() }))
       const marked = io()
-      expect(await runCli(['restart', '--port', String(port), '--start', 'true', ...flags], marked.io)).toBe(1)
+      expect(await runCli(['restart', '--sync', '--port', String(port), '--start', 'true', ...flags], marked.io)).toBe(1)
       expect(marked.err.join()).toContain('scheduled exit is still pending')
     } finally {
       env.restore()
@@ -1201,6 +1252,43 @@ describe('supervise', () => {
       env.restore()
     }
   }, 15_000)
+
+  it('restart refuses in a sandboxed environment; --force overrides', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    try {
+      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      stubSandboxProbe(true)
+      const refused = io()
+      expect(await runCli(['restart', '--sync', '--port', '1', '--start', 'true', ...flags], refused.io)).toBe(1)
+      expect(refused.err.join()).toContain('/permission danger-full-access')
+      stubPreflight('true')
+      const forced = io()
+      await runCli(['restart', '--sync', '--port', '1', '--start', 'true', '--force', ...flags], forced.io)
+      expect(forced.err.join()).not.toContain('/permission danger-full-access')
+    } finally {
+      env.restore()
+    }
+  }, 15_000)
+
+  it('check-env reports sandbox, watchdog, and git readiness', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    try {
+      const out = io()
+      // This test process is unsandboxed → exit 0 with the full readout.
+      expect(await runCli(['check-env', '--state-dir', stateDir, '--repo', repo], out.io)).toBe(0)
+      const text = out.out.join('')
+      expect(text).toContain('unsandboxed')
+      expect(text).toContain('watchdog: none')
+      expect(text).toContain('git repo: yes')
+    } finally {
+      env.restore()
+    }
+  })
 
   it('schedule-exit fires a detached exit agent that kills the host; the watchdog takes over', async () => {
     const env = supervisedEnv()

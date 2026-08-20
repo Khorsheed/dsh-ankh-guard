@@ -13,8 +13,7 @@
  *   WD_INITIATOR=ID    session that scheduled the exit (rides into the record)
  */
 import { writeFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
-import { resolve } from 'node:path'
+import { isDirectInvocation } from './defaults.ts'
 import { findPidOnPort } from './processes.ts'
 
 /** The exit agent's environment input. */
@@ -59,6 +58,6 @@ export function exitAgentMain(env: ExitAgentEnv = process.env): void {
 }
 
 // Direct invocation only: imported (tests, bundling) it must never fire.
-if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+if (isDirectInvocation(import.meta.url)) {
   exitAgentMain()
 }

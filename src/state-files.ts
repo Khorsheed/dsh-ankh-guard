@@ -28,6 +28,8 @@ export const STATE_FILES = {
   watchdogPid: 'watchdog.pid',
   /** Cross-session mutual exclusion for the restart verb. */
   restartLock: 'restart.lock',
+  /** The detached restart driver's log. */
+  restartLog: 'restart.log',
   /** Marker: exit the watchdog without respawn. */
   watchdogStop: 'watchdog-stop',
   /** Marker: the watchdog gave up; a crash page holds the port. */

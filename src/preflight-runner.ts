@@ -37,6 +37,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { isDirectInvocation } from './defaults.ts'
 
 const NAME = 'dsh'
 const PROFILE_ROOT_FILENAME = 'cordis.yml'
@@ -321,7 +322,7 @@ export function parsePreflightArgs(argv: readonly string[]): { profile: string; 
 }
 
 // Standalone entry: only when executed directly (not imported by the CLI).
-if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+if (isDirectInvocation(import.meta.url)) {
   const { profile, patchFiles, error } = parsePreflightArgs(process.argv.slice(2))
   if (error !== undefined) {
     process.stderr.write(`${error}\n`)

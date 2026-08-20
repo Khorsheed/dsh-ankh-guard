@@ -4,7 +4,24 @@
  * lives. The state file must survive a restart, so it anchors to DSH_HOME (or
  * the checkout) rather than any process-lifetime directory.
  */
+import { realpathSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/**
+ * True when this module is the process entry point — symlink-proof: a plain
+ * path/URL comparison never fires when the invocation path goes through a
+ * symlink (macOS /tmp → /private/tmp), and the CLI then exits 0 having done
+ * NOTHING, with no error (observed while diagnosing a restart failure).
+ */
+export function isDirectInvocation(metaUrl: string, argv1: string | undefined = process.argv[1]): boolean {
+  if (argv1 === undefined) return false
+  try {
+    return realpathSync(fileURLToPath(metaUrl)) === realpathSync(argv1)
+  } catch {
+    return false
+  }
+}
 
 /**
  * Resolve the state directory: an explicit value wins, then $DSH_HOME/state,
