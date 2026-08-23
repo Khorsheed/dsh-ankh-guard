@@ -1,6 +1,6 @@
 # @khorsheed/dsh-ankh-guard
 
-> **本仓是 [@khorsheed/dsh-ankh-guard](https://www.npmjs.com/package/@khorsheed/dsh-ankh-guard) 的单插件镜像**：代码与 [Khorsheed/dsh-plugins](https://github.com/Khorsheed/dsh-plugins) monorepo 的 `packages/ankh-guard` 同步（每次发布/变更自动推送），clone 后 `pnpm install` 即可构建使用。issue 直接提在本仓；PR 请提到 monorepo（历史不同构，镜像只收同步提交）。
+> 镜像仓：与 [Khorsheed/dsh-plugins](https://github.com/Khorsheed/dsh-plugins) 的 `packages/ankh-guard` 自动同步。Issue 欢迎提在本仓；PR 请提交到 monorepo。
 >
 > [English](README.en.md) | 中文
 
