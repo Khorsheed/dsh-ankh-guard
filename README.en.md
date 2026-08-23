@@ -6,6 +6,8 @@ Let an agent change its own code and restart its own service — without taking 
 
 When the agent wants to restart after editing code, this plugin asks one question first: did the build and tests pass? Yes, go ahead. No, blocked — so broken code can't take the service, and the conversation running inside it, down with it.
 
+<img src="https://raw.githubusercontent.com/Khorsheed/dsh-web-basic/main/docs/screenshots/ankh-guard.JPG" width="640" alt="a guarded restart: the agent announces its verification plan beforehand, and the canary reactivates the session afterwards to keep verifying">
+
 ## How it works
 
 One rule at the core: **prove the code is good before you allow a restart.**
@@ -31,12 +33,6 @@ npm install @deepseek-ai/dsh                                 # the host (dsh web
 dsh plugin --profile web add @khorsheed/dsh-ankh-guard       # this plugin
 ```
 
-Or install straight from this GitHub mirror — the `prepare` script builds it on install:
-
-```sh
-dsh plugin --profile web add github:Khorsheed/dsh-ankh-guard
-```
-
 The package declares `dsh.bundle`, so the add reconciles its `cordis.patch.yml` row (a bare `ankh-guard` mount) into the profile's bundles layer — no hand-edited cordis.yml. One caveat: a composition may mount the `ankh-guard` row id only once. Official images (the published npm line and upstream master) mount no such row, so the add above is the install path; a composition that already mounts the id by other means — the pre-2026-08-16 deploy fork's base bundle did — must not also add the package, because a duplicate loader entry id fails boot. When in doubt, check the composed tree first: `dsh --profile web --dump-config | grep ankh-guard` printing nothing means the add is safe. From source: clone the monorepo; the package lives at `packages/ankh-guard` (`pnpm install && pnpm run build`).
 
 Config (all optional): `stateDir` (default `$DSH_HOME/state`, else `<cwd>/.dsh-guard-state`), `repoDir` (default the process cwd), `maxAgeMinutes` (credential freshness, default 10), `reportRestartContext` (`followup` autonomous report / `step` ride the next turn / `off`, default `followup`), `resumeInterrupted` (resume restart-interrupted sessions and queue a continue turn, default true), `resumeDelayMs` (default 5000), `resumeMaxSnapshotAgeMs` (default 600000).
@@ -46,8 +42,8 @@ Runtime needs: `node`, `bash`, `lsof` on macOS/Linux for listener discovery (`--
 ## Prerequisites for a self-restart (for the agent driving it)
 
 - **git is required.** The credential, checkpoints, and rollback are all git-based: the credential binds HEAD, a checkpoint is a real commit, rollback is a reset. If the deployment directory is not a git repository, `git init` it and make an initial commit before `record` — otherwise the gate refuses with "current git HEAD unavailable". The `git init` is not ceremony: with a repository in place, the checkpoint/rollback recovery anchors actually work.
-- **Full-access (unsandboxed) permissions.** The restart loop spawns detached processes, kills processes, and binds ports; sandboxed tool runners (workspace-write and the like) deny those operations with EPERM and the instance dies at the shell layer (a real incident: the `/dev/fd` open of `> >(tee …)` was refused, four "boot failures" straight to the crash page). The agent CANNOT switch its own sandbox — that is the point of the sandbox; `/permission` is a user-typed command, and per-command escalation prompts the user for approval. For a permanent deployment the easier official path is starting the instance with `DSH_PERMISSION_MODE=danger-full-access` (the base bundle's deployment-level switch — sandbox and approval policy both open), so every session starts unsandboxed. Otherwise, before initiating a self-restart, ask the user to switch THIS session: `/permission danger-full-access` — the settings page only affects NEW sessions, and an open persistent terminal (PTY) fences the switch until closed. (`verify` and `record` print this hint too.)
-- **The first restart after install must be driven by the CLI.** The running instance has not loaded the plugin yet — composition changes need a boot — and no watchdog exists yet, so a bare exit leaves the service DOWN with nothing to bring it back. Right after the add, run `dsh-ankh-guard supervise --port N --start "CMD"` (it adopts the running instance and respawns ANY exit from then on), or drive the first restart with `dsh-ankh-guard restart --port N --start "CMD" --rollback` (it owns the whole stop→start→canary loop in a detached process), or install the launchd/systemd supervisor. `verify`/`record`/`schedule-exit` all warn while no live watchdog exists.
+- **Full-access (unsandboxed) permissions.** The restart loop spawns detached processes, kills processes, and binds ports; sandboxed tool runners (workspace-write and the like) deny those operations with EPERM and the instance dies at the shell layer. The agent CANNOT switch its own sandbox — that is the point of the sandbox; `/permission` is a user-typed command, and per-command escalation prompts the user for approval. For a permanent deployment the easier official path is starting the instance with `DSH_PERMISSION_MODE=danger-full-access` (the base bundle's deployment-level switch — sandbox and approval policy both open), so every session starts unsandboxed. Otherwise, before initiating a self-restart, ask the user to switch THIS session: `/permission danger-full-access` — the settings page only affects NEW sessions, and an open persistent terminal (PTY) fences the switch until closed. (`verify` and `record` print this hint too.)
+- **The first restart after install must be driven by the CLI.** The running instance has not loaded the plugin yet — composition changes need a boot — and no watchdog exists yet, so a bare exit leaves the service DOWN with nothing to bring it back. Right after the add, run `dsh-ankh-guard supervise --port N --start "CMD"` (it adopts the running instance and respawns ANY exit from then on), or drive the first restart with `dsh-ankh-guard restart --port N --start "CMD" --rollback` (it owns the whole stop→start→canary loop in a detached process), or install the launchd/systemd supervisor. The adoption takeover files a report record addressed to the session that ran `supervise` (via `$DSH_SESSION_ID`), so that first bounce reports back like a scheduled restart — the driving session does not park silently. `verify`/`record`/`schedule-exit` all warn while no live watchdog exists.
 
 ## Known install pitfalls
 
@@ -149,7 +145,7 @@ Mounted as a cordis plugin (base bundle), the same surface is available as the `
 
 ## Model Experience
 
-Two injected context messages, no tool schema: a one-time boot notice per root session (restarts must go through the guard CLI — never hand-rolled scripts), and the restart report / interrupted-session continuation after a restart. Both are plugin-sourced snapshot user messages; the boot notice rides `agent.inject` (no wake).
+A shipped skill, plus two followup messages, no tool schema. The `dsh-self-restart-guard` skill is registered at apply: the full restart protocol rides the skill catalog, so an agent discovers it exactly when a task involves restarting the instance — no per-session push notice. Every boot records the registration outcome (`skill-registration.json`), surfaced as the `skill:` line in `check-env`, and a composition without the skill capability now warns in the boot log — a migration or repackaging that drops the skill shows up there instead of vanishing silently. After a restart, the restart report / interrupted-session continuation reaches only the initiating session and the sessions the restart interrupted, as plugin-sourced followup user messages; every other session stays untouched.
 
 #### KV Cache effect
 
@@ -157,7 +153,7 @@ None.
 
 ## Compatibility
 
-- npm release line (`@deepseek-ai/dsh@0.1.0-rc.8`): ⚠️ degraded — everything works; the composition-preflight gate runs through the standalone `preflight-runner` (composing through the published `@deepseek-ai/dsh-app-boot` primitives with a drift tripwire, since rc.8 still does not export `composeProfile`) wherever a dsh app layout resolves — `--repo`, `DSH_HARNESS`, or the default checkout. On a pure npm deployment with no harness checkout the gate reports a notice and proceeds instead; every other capability (restart/supervise gating, watchdog, rollback-to-known-good) stays fully intact on the npm line.
+- npm release line (`@deepseek-ai/dsh@0.1.1-rc.2`): ⚠️ degraded — everything works; the composition-preflight gate runs through the standalone `preflight-runner` (composing through the published `@deepseek-ai/dsh-app-boot` primitives with a drift tripwire, since 0.1.1-rc.2 still does not export `composeProfile`) wherever a dsh app layout resolves — `--repo`, `DSH_HARNESS`, or the default checkout. On a pure npm deployment with no harness checkout the gate reports a notice and proceeds instead; every other capability is intact on the npm line; re-audited for rc.2 (2026-08-22): consumed surface unchanged, full build+test green.
 - source line (deepseek-harness master, fork or upstream): ✅ — the gate runs through the standalone `preflight-runner` (resolves the published `@deepseek-ai/dsh-app-boot` etc. from the live checkout), so no fork patch is required.
 
 ## Known Limitations and Deferred Work
@@ -171,3 +167,7 @@ None.
 - **Checkpoint commits sweep the whole working tree** — intended (a checkpoint is a full rollback point), but note it also captures unrelated uncommitted work.
 - **`restart`/`supervise` discover the listener via `lsof`** (macOS/Linux with lsof); other platforms need `--pid`.
 - **Kills are per-pid with a descendant sweep, never per process group** — the instance is not setsid'd, so `restart`, `schedule-exit`'s exit agent, and the watchdog's `free_port` target the listener pid and (on the forced paths: the `restart` SIGKILL escalation, the watchdog's port adoption and exit cleanup) walk `pgrep -P` descendants instead of killing a group. The supervised instance is expected to manage its own children on graceful shutdown; the sweep is the best-effort net for the forced paths.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).

@@ -22,7 +22,7 @@ import { install as installInvariant } from '../src/invariant.ts'
 import {
   acknowledgeRestartRecord, buildLaunchCommand, continueAndReportText, pendingRestartRecord,
   readInstanceLaunch, readInterruptedSnapshot, restartContextText, writeInstanceLaunch,
-  writeInstanceLaunchAsSupervisor, writeInterruptedSnapshot,
+  writeInstanceLaunchAsSupervisor, writeInterruptedSnapshot, writeSkillRegistration,
 } from '../src/restart-context.ts'
 import { performExit } from '../src/exit-agent.ts'
 import { envInternals, preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
@@ -129,31 +129,75 @@ describe('state core', () => {
     expect(cleared.checkpoint?.revision).toBe('cp1')
   })
 
-  it('injects the boot notice into every root session at creation (no wake)', async () => {
-    // The discovery channel for agents that never read the README: restarts
-    // must go through the guard CLI, never hand-rolled scripts.
+  it('registers the restart-protocol skill when the skills service is present', async () => {
+    // The pull-based discovery channel: agents find the protocol through the
+    // skill catalog when a task involves restarting the instance — no
+    // per-session push notice.
     const repo = makeRepo()
     const stateDir = tmpDir('guard-ctx-')
     const ctx = new Context()
     await ctx.plugin(Loader)
-    const rootAgent = { id: 'session-root', followup: vi.fn(), inject: vi.fn() } as never
-    const otherAgent = { id: 'session-other', followup: vi.fn(), inject: vi.fn() } as never
-    const liveAgents: unknown[] = [rootAgent, otherAgent]
-    ctx.provide('agents', {
-      roots: () => [liveAgents[0]],
-      list: () => liveAgents,
+    ctx.provide('agents', { roots: () => [], list: () => [] } as never)
+    const registrations: Array<{ name: string; description: string; content: string; source?: string }> = []
+    let disposed = false
+    ctx.provide('skills', {
+      register: (skill: { name: string; description: string; content: string }) => {
+        registrations.push(skill)
+        return () => { disposed = true }
+      },
     } as never)
     const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
     await fiber.await()
-    ctx.emit('agent/created', { agent: rootAgent } as never)
-    ctx.emit('agent/created', { agent: otherAgent } as never)
-    const rootInject = (rootAgent as { inject: ReturnType<typeof vi.fn> }).inject
-    const otherInject = (otherAgent as { inject: ReturnType<typeof vi.fn> }).inject
-    expect(rootInject).toHaveBeenCalledTimes(1)
-    const message = rootInject.mock.calls[0]?.[0] as { content: Array<{ text: string }> }
-    expect(message.content[0]?.text).toContain('dsh-ankh-guard restart')
-    expect(message.content[0]?.text).toContain('禁止手写')
-    expect(otherInject).not.toHaveBeenCalled()
+    expect(registrations.map(skill => skill.name)).toEqual(['dsh-self-restart-guard'])
+    expect(registrations[0]?.description).toContain('restart')
+    expect(registrations[0]?.content).toContain('check-env')
+    // The shipped skill must not carry machine-specific paths from the
+    // development environment it was written on.
+    expect(registrations[0]?.content).not.toContain('code/dsh-plugins')
+    // The registry validates `source` at LOAD time — a registration without
+    // it lists fine in the catalog but explodes on invocation ("loaded skill
+    // ... source must be a string", published 8.9). Pin it here.
+    expect(registrations[0]?.source).toBe('runtime')
+    // The registration outcome is on disk for check-env to surface.
+    const marker = JSON.parse(readFileSync(join(stateDir, 'skill-registration.json'), 'utf8'))
+    expect(marker.registered).toBe(true)
+    await fiber.dispose()
+    expect(disposed).toBe(true)
+  })
+
+  it('the registered skill survives the real registry round-trip (catalog list + body load)', async () => {
+    // The catalog lists registrations even when a required field is missing;
+    // the registry validates at LOAD time — published 8.9 failed exactly here
+    // ("loaded skill ... source must be a string"). Exercise the real
+    // registry so a payload contract drift cannot pass on a recording stub.
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    ctx.provide('agents', { roots: () => [], list: () => [] } as never)
+    const { SkillRegistry } = await import('@deepseek-ai/dsh-skill')
+    const registry = new SkillRegistry(ctx as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
+    await fiber.await()
+    const names = (await registry.list({ cwd: repo })).map((skill: { name: string }) => skill.name)
+    expect(names).toContain('dsh-self-restart-guard')
+    const loaded = await registry.get('dsh-self-restart-guard', { cwd: repo })
+    expect(loaded?.content).toContain('check-env')
+    await fiber.dispose()
+  })
+
+  it('records the failure loudly when the skills service is absent (host migrations must not lose the skill silently)', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    ctx.provide('agents', { roots: () => [], list: () => [] } as never)
+    // No skills service provided — the composition lacks the capability.
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
+    await fiber.await()
+    const marker = JSON.parse(readFileSync(join(stateDir, 'skill-registration.json'), 'utf8'))
+    expect(marker.registered).toBe(false)
+    expect(marker.reason).toContain('skills service absent')
     await fiber.dispose()
   })
 
@@ -897,14 +941,46 @@ describe('supervise', () => {
         await new Promise((resolve) => { setTimeout(resolve, 300) })
       }
       expect(await fetchBody(port)).toBe('new')
-      // First boot of this deployment (no last-good-boot stamp yet): the
-      // watchdog must NOT file a crash report — a guard that false-alarms on
-      // first contact loses its credibility.
+      // A live owner existed at supervise time: this takeover is an ADOPTION
+      // restart, and the watchdog files a report record addressed to the
+      // supervising session (empty initiator here — no DSH_SESSION_ID in this
+      // test's env). The no-false-positive guard covers the first-EVER boot
+      // (no owner), asserted by the next test.
+      const record = join(env.home, 'state', 'last-restart.json')
+      const recordDeadline = Date.now() + 5000
+      while (!existsSync(record) && Date.now() < recordDeadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 200) })
+      }
+      const outcome = JSON.parse(readFileSync(record, 'utf8'))
+      expect(outcome.unexpected).toBeUndefined()
+      expect(typeof outcome.exitAt).toBe('number')
+    } finally {
+      env.stop()
+      host.kill('SIGKILL')
+      await killListener(port)
+      env.restore()
+    }
+  }, 30_000)
+
+  it('a first-EVER boot (no previous owner) files no report record', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = await freePort()
+    try {
+      // Nothing listens on the port: supervise boots the instance directly.
+      // No owner was stopped, nothing was interrupted — a record here would be
+      // a false alarm on first contact.
+      const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', join(env.home, 'state'), '--repo', repo],
+        io().io,
+      )).toBe(0)
+      await waitForPort(port)
+      expect(await fetchBody(port)).toBe('new')
       await new Promise((resolve) => { setTimeout(resolve, 1500) })
       expect(existsSync(join(env.home, 'state', 'last-restart.json'))).toBe(false)
     } finally {
       env.stop()
-      host.kill('SIGKILL')
       await killListener(port)
       env.restore()
     }
@@ -1232,6 +1308,9 @@ describe('supervise', () => {
         stale.io,
       )).toBe(0)
       expect(stale.err.join()).toContain('stale restart marker')
+      // schedule-exit holds the restart lock only across its check→write→spawn
+      // critical section: a completed schedule leaves no lock behind.
+      expect(existsSync(join(stateDir, 'restart.lock'))).toBe(false)
       // And the reverse direction: a live restart lock means an instance is
       // being restarted right now — the exit agent would kill the one it starts.
       rmSync(join(stateDir, 'restart-requested.json'), { force: true })
@@ -1304,6 +1383,63 @@ describe('supervise', () => {
     expect(second.out.join('')).toContain('still pending')
     expect(JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))).toEqual(record)
   })
+
+  it('record-adoption carries the initiator and never overwrites a pending record', async () => {
+    const stateDir = tmpDir('guard-cli-')
+    const first = io()
+    expect(await runCli(['record-adoption', '--state-dir', stateDir, '--initiator', 'session-x'], first.io)).toBe(0)
+    expect(first.out.join('')).toContain('adoption takeover')
+    const record = JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))
+    expect(record.initiator).toBe('session-x')
+    expect(record.unexpected).toBeUndefined()
+    expect(typeof record.exitAt).toBe('number')
+    const second = io()
+    expect(await runCli(['record-adoption', '--state-dir', stateDir, '--initiator', 'session-y'], second.io)).toBe(0)
+    expect(second.out.join('')).toContain('still pending')
+    expect(JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))).toEqual(record)
+  })
+
+  it('the adoption takeover reports back to the session that established supervision', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = await freePort()
+    // No last-good-boot stamp: this deployment has never come up — the first
+    // takeover must file an ADOPTION record (addressed to the supervising
+    // session), never an unexpected-exit one.
+    const host = spawn(process.execPath, ['-e',
+      `require('http').createServer((q,s)=>s.end('host')).listen(${port},'127.0.0.1')`],
+    { detached: true, stdio: 'ignore' })
+    host.unref()
+    const previousSession = process.env.DSH_SESSION_ID
+    process.env.DSH_SESSION_ID = 'session-supervisor'
+    try {
+      await waitForPort(port)
+      const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', join(env.home, 'state'), '--repo', repo],
+        io().io,
+      )).toBe(0)
+      // The detached watchdog waits for the owner to exit, then takes over.
+      host.kill('SIGTERM')
+      const record = join(env.home, 'state', 'last-restart.json')
+      const deadline = Date.now() + 20_000
+      while (!existsSync(record) && Date.now() < deadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 300) })
+      }
+      const outcome = JSON.parse(readFileSync(record, 'utf8'))
+      expect(outcome.initiator).toBe('session-supervisor')
+      expect(outcome.unexpected).toBeUndefined()
+      expect(await fetchBody(port)).toBe('new')
+    } finally {
+      if (previousSession === undefined) delete process.env.DSH_SESSION_ID
+      else process.env.DSH_SESSION_ID = previousSession
+      env.stop()
+      host.kill('SIGKILL')
+      await killListener(port)
+      env.restore()
+    }
+  }, 30_000)
+
 
   it('reports an existing live watchdog instead of spawning a second', async () => {
     const env = supervisedEnv()
@@ -1523,6 +1659,18 @@ describe('supervise', () => {
       expect(text).toContain('unsandboxed')
       expect(text).toContain('supervision: NOT supervised')
       expect(text).toContain('git repo: yes')
+      // No skill-registration marker in this throwaway state: reported as absent.
+      expect(text).toContain('skill: not recorded')
+      // A registered marker surfaces as the catalog confirmation.
+      writeSkillRegistration(stateDir, { registered: true, at: Date.now() })
+      const second = io()
+      expect(await runCli(['check-env', '--state-dir', stateDir, '--repo', repo], second.io)).toBe(0)
+      expect(second.out.join('')).toContain('skill: dsh-self-restart-guard registered')
+      // And a failure marker names the reason.
+      writeSkillRegistration(stateDir, { registered: false, reason: 'skills service absent in this composition', at: Date.now() })
+      const third = io()
+      expect(await runCli(['check-env', '--state-dir', stateDir, '--repo', repo], third.io)).toBe(0)
+      expect(third.out.join('')).toContain('skill: NOT registered (skills service absent')
     } finally {
       env.restore()
     }
@@ -2518,5 +2666,9 @@ describe('pack smoke', () => {
     }
     // The bin entry is a runnable shebang script, not just a bundled file.
     expect(readFileSync(join(artifactLib, 'cli.js'), 'utf8')).toMatch(/^#!\/usr\/bin\/env node/)
+    // The restart-protocol skill ships with the package — apply() reads it
+    // from <pkg>/skills/ and degrades to a bare warning when it is missing.
+    expect(existsSync(join(unpack, 'package', 'skills', 'dsh-self-restart-guard', 'SKILL.md')),
+      'the restart-protocol skill is missing from the tarball').toBe(true)
   })
 })

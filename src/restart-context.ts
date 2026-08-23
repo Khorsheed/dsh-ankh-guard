@@ -70,17 +70,6 @@ export function pendingRestartRecord(stateDir: string): RestartRecord | null {
 }
 
 /**
- * The model-visible boot notice: how restarts must be driven in this
- * deployment. Injected (no wake) into every root session at creation —
- * the README is not reliably read, and a fresh-machine agent once
- * hand-rolled a sleep/kill/nohup restart script, which the instance's
- * teardown reaped mid-flight, leaving the service down.
- */
-export function bootNoticeText(): string {
-  return '[ankh-guard] 本实例已挂载自重启守护。需要重启服务时必须使用守护 CLI：先 `dsh-ankh-guard check-env`（一次回答监管状态/重启命令/环境就绪），再 `record` 绿色凭证，然后 `dsh-ankh-guard restart`（`--start` 通常可省略——启动命令已自动记录；受 watchdog 监管时用 `schedule-exit`）。禁止手写 sleep/kill/nohup 类重启脚本——它们会被实例 teardown 回收，服务就此宕掉无人拉起。'
-}
-
-/**
  * The model-visible restart report (Chinese product copy, factual).
  * @param record - the pending restart record.
  * @param canaryPending - whether the restart marker is still present (the
@@ -170,6 +159,29 @@ export function writeUnexpectedExitRecord(stateDir: string, now: number): boolea
 export function writeRestartOutcome(stateDir: string, record: { exitAt: number; pid?: number; error?: string; initiator?: string }): void {
   mkdirSync(stateDir, { recursive: true })
   atomicWrite(restartRecordFile(stateDir), `${JSON.stringify(record)}\n`)
+}
+
+/**
+ * Record the watchdog's ADOPTION takeover — the first restart a deployment
+ * ever sees: `supervise` handed the port to the watchdog, which stopped the
+ * pre-existing owner and booted the supervised instance. The session that
+ * established supervision promised the user a verification report; without
+ * this record nothing wakes it after the bounce (the adoption writes no
+ * restart marker and no outcome record). Never overwrites a record that still
+ * awaits its report.
+ * @param stateDir - state directory.
+ * @param now - epoch milliseconds of the takeover boot.
+ * @param initiator - the session that established supervision, when known.
+ * @returns whether the record was written.
+ */
+export function writeAdoptionRecord(stateDir: string, now: number, initiator: string | undefined): boolean {
+  if (pendingRestartRecord(stateDir) !== null) return false
+  mkdirSync(stateDir, { recursive: true })
+  atomicWrite(restartRecordFile(stateDir), `${JSON.stringify({
+    exitAt: now,
+    ...(initiator !== undefined && initiator !== '' ? { initiator } : {}),
+  })}\n`)
+  return true
 }
 
 /** How the current instance was launched, recorded at boot. */
@@ -296,4 +308,45 @@ function atomicWrite(file: string, content: string): void {
   const tmp = `${file}.${process.pid}.tmp`
   writeFileSync(tmp, content)
   renameSync(tmp, file)
+}
+
+/** The plugin's skill-registration outcome, rewritten at every boot. */
+export interface SkillRegistrationRecord {
+  /** Whether the restart-protocol skill is in the skill catalog. */
+  registered: boolean
+  /** Why registration was skipped/failed, when registered is false. */
+  reason?: string
+  /** Epoch milliseconds of this boot's attempt. */
+  at: number
+}
+
+/**
+ * Persist the skill-registration outcome (atomic, best-effort). A migration
+ * or repackaging that drops the skill is otherwise invisible until someone
+ * notices the catalog entry missing — this record lets `check-env` surface it.
+ * @param stateDir - state directory.
+ * @param record - the outcome of this boot's registration attempt.
+ */
+export function writeSkillRegistration(stateDir: string, record: SkillRegistrationRecord): void {
+  try {
+    mkdirSync(stateDir, { recursive: true })
+    atomicWrite(stateFile(stateDir, 'skillRegistration'), `${JSON.stringify(record)}\n`)
+  } catch {
+    // Best-effort: the marker is an observability aid, never a boot blocker.
+  }
+}
+
+/**
+ * Read the skill-registration record, or null when absent/unparseable (the
+ * plugin never applied with this state dir, or predates the record).
+ * @param stateDir - state directory.
+ * @returns the record, or null.
+ */
+export function readSkillRegistration(stateDir: string): SkillRegistrationRecord | null {
+  try {
+    const record = JSON.parse(readFileSync(stateFile(stateDir, 'skillRegistration'), 'utf8')) as SkillRegistrationRecord
+    return typeof record.registered === 'boolean' && typeof record.at === 'number' ? record : null
+  } catch {
+    return null
+  }
 }

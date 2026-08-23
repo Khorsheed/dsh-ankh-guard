@@ -44,6 +44,8 @@ export const STATE_FILES = {
   scheduleExitLog: 'schedule-exit.log',
   /** How the current instance was launched (recorded by the plugin at apply). */
   instanceLaunch: 'instance-launch.json',
+  /** Whether the restart-protocol skill registered at apply (and why not). */
+  skillRegistration: 'skill-registration.json',
 } as const
 
 /** A STATE_FILES key. */

@@ -33,6 +33,10 @@
 #   WD_GUARD="CMD"     how to invoke the guard CLI (default: dsh-ankh-guard)
 #   WD_WAIT_OWNER=1    don't adopt the port; wait for the current owner to exit
 #   WD_DELAY=N         sleep N seconds before adopting/observing the port
+#   WD_INITIATOR=ID    session that established supervision; the adoption
+#                      takeover's report record is addressed to it
+#   WD_ADOPTION=1      the CLI saw a live owner at supervise time — the first
+#                      boot is a takeover (report it), not a first-ever boot
 #   WD_SUPERVISE=1     write/check the pidfile (one watchdog only)
 #   WD_BOOT_TIMEOUT=N  seconds to wait for the port to answer 200 (default 60)
 #   WD_TEST_FAKE=1     launch a throwaway http server instead of the instance
@@ -475,6 +479,13 @@ while true; do
     # the guard CLI, where they typecheck and unit-test.
     if [ "$had_boot_stamp" = "1" ]; then
       guard_cmd record-unexpected-exit --state-dir "$STATE_DIR"
+    elif [ "${WD_ADOPTION:-0}" = "1" ]; then
+      # Adoption takeover — the first restart this deployment ever saw (the
+      # CLI detected the previous owner at supervise time; probing here would
+      # race the owner's exit). The session that established supervision
+      # promised a verification report; this record wakes it after the bounce.
+      # A first-EVER boot (WD_ADOPTION=0) reports nothing.
+      guard_cmd record-adoption --state-dir "$STATE_DIR" --initiator "${WD_INITIATOR:-}"
     fi
   fi
 

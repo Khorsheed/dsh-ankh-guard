@@ -1,13 +1,14 @@
 {
   "name": "@khorsheed/dsh-ankh-guard",
   "description": "Hard gate for self-modification restarts: a green-build credential bound to the git HEAD, checked before any restart of the running instance",
-  "version": "0.1.0-rc.8.9",
+  "version": "0.1.1",
   "publishConfig": {
     "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Khorsheed/dsh-ankh-guard.git"
+    "url": "git+https://github.com/Khorsheed/dsh-plugins.git",
+    "directory": "packages/ankh-guard"
   },
   "type": "module",
   "main": "lib/index.js",
@@ -32,53 +33,45 @@
   },
   "files": [
     "lib/*.js",
+    "lib/types/**/*.js",
     "lib/types/**/*.d.ts",
     "scripts/dsh-watchdog.sh",
     "scripts/on-install.js",
     "scripts/install-launchd.sh",
     "scripts/install-systemd.sh",
+    "skills/**/*.md",
     "cordis.patch.yml"
   ],
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-agent-presets": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-presets": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/cordis-plugin-include": "^1.0.6",
     "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-agent-presets": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-atomic-write": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-brand": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-scope": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-session": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-timeout": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-agent": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-agent-presets": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "^0.1.1-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^22.0.0",
     "tsdown": "^0.22.2",
     "typescript": "^5.9.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.0",
+    "@deepseek-ai/dsh-skill": "^0.1.0-rc.8"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsdown",
-    "prepare": "npm run build && node scripts/on-install.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.build.json --noEmit",
+    "prepare": "npm run build && node scripts/on-install.js",
     "postinstall": "node scripts/on-install.js"
   },
   "keywords": [
@@ -98,7 +91,8 @@
     },
     "compat": {
       "minHost": "0.1.0-rc.6",
-      "notes": "composition-preflight gate runs via the standalone preflight-runner (resolves official packages from a live harness checkout, no fork patch); on the npm line without a checkout it degrades to a notice, every other capability intact"
+      "notes": "composition-preflight gate runs via the standalone preflight-runner (resolves official packages from a live harness checkout, no fork patch); on the npm line without a checkout it degrades to a notice, every other capability intact",
+      "verifiedHost": "0.1.1-rc.2"
     }
   }
 }

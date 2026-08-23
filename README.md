@@ -1,14 +1,14 @@
 # @khorsheed/dsh-ankh-guard
 
-[English](README.en.md) | 中文
+> **本仓是 [@khorsheed/dsh-ankh-guard](https://www.npmjs.com/package/@khorsheed/dsh-ankh-guard) 的单插件镜像**：代码与 [Khorsheed/dsh-plugins](https://github.com/Khorsheed/dsh-plugins) monorepo 的 `packages/ankh-guard` 同步（每次发布/变更自动推送），clone 后 `pnpm install` 即可构建使用。issue 直接提在本仓；PR 请提到 monorepo（历史不同构，镜像只收同步提交）。
+>
+> [English](README.en.md) | 中文
 
 让 agent 自己改代码、自己重启，还不把服务搞挂。
 
 agent 改完代码想重启的时候，这个插件会先问一句：这次改动，构建和测试都过了吗？过了才放行，没过就拦下来——免得改坏的代码把整个服务、连同正在进行的对话一起带走。
 
-![重启闭环演示](assets/restart-loop-demo.png)
-
-一次真实的自我重启：agent 重启前先告知验证计划（1）；宿主退出，进行中的 tool call 被安全中断并落盘（2）；watchdog 在 10 秒内拉回实例，ankh-guard 把重启上下文注入原会话（3）——agent 醒来后继续执行重启前宣布的验证，用户全程无感知。
+<img src="https://raw.githubusercontent.com/Khorsheed/dsh-web-basic/main/docs/screenshots/ankh-guard.JPG" width="640" alt="一次受守护的重启:重启前告知验证项,重启后金丝雀自动激活会话并注入上下文继续验证">
 
 ## 工作原理
 
@@ -35,12 +35,6 @@ npm install @deepseek-ai/dsh                                 # the host (dsh web
 dsh plugin --profile web add @khorsheed/dsh-ankh-guard       # this plugin
 ```
 
-也可以直接从本 GitHub 镜像安装——`prepare` 脚本会在安装时自动构建：
-
-```sh
-dsh plugin --profile web add github:Khorsheed/dsh-ankh-guard
-```
-
 包声明了 `dsh.bundle`，add 会把它的 `cordis.patch.yml` 行（一个裸 `ankh-guard` 挂载行）自动并入 profile 的 bundles 层——不用手改 cordis.yml。一个 caveat：一个组合里 `ankh-guard` 行 id 只能挂一次。官方镜像（已发布的 npm 线和 upstream master）都不挂这行，所以上面的 add 就是安装路径；而已经用其他方式挂了该 id 的组合——2026-08-16 之前的部署 fork 的 base bundle 就挂过——不能再 add 这个包，重复的 loader entry id 会炸 boot。拿不准就先查组合树：`dsh --profile web --dump-config | grep ankh-guard` 无输出即说明可以安全 add。源码安装：clone monorepo，包在 `packages/ankh-guard`（`pnpm install && pnpm run build`）。
 
 配置（全部可选）：`stateDir`（默认 `$DSH_HOME/state`，否则 `<cwd>/.dsh-guard-state`）、`repoDir`（默认进程 cwd）、`maxAgeMinutes`（凭证新鲜窗口，默认 10）、`reportRestartContext`（`followup` 自主报告 / `step` 骑下一次回合 / `off`，默认 `followup`）、`resumeInterrupted`（恢复被重启中断的会话并排入继续回合，默认 true）、`resumeDelayMs`（默认 5000）、`resumeMaxSnapshotAgeMs`（默认 600000）。
@@ -50,8 +44,8 @@ dsh plugin --profile web add github:Khorsheed/dsh-ankh-guard
 ## 自我重启的前提（给驱动重启的 agent）
 
 - **git 必需。** 凭证、检查点、回滚全部基于 git：凭证绑定 HEAD，checkpoint 是真实提交，rollback 是 reset。部署目录不是 git 仓库时，先 `git init` 并做一次初始提交，再 `record`——否则门禁以 "current git HEAD unavailable" 拒绝重启。`git init` 不是仪式：有了仓库，checkpoint/rollback 的恢复锚点才真正生效。
-- **需要 full-access（无沙箱）权限。** 重启链路要 spawn detached 进程、kill 进程、绑定端口；沙箱化的 tool runner（workspace-write 之类）会以 EPERM 拒绝其中操作，实例在 shell 层就起不来（真实事故：`> >(tee …)` 的 `/dev/fd` open 被拒，连续四次"启动失败"进崩溃页）。**agent 自己无法切换沙箱**——这正是沙箱的意义：`/permission` 是用户输入的命令，单命令提权也要用户审批。长期部署更省事的官方做法：启动实例时设 `DSH_PERMISSION_MODE=danger-full-access`（base bundle 的部署级开关，沙箱与审批策略同时放开），所有会话默认无沙箱。或者发起自我重启前，请用户把**当前会话**切到 full-access：`/permission danger-full-access`——设置页只影响**新**会话；有打开中的持久终端（PTY）时会先被 fence 拒绝，须先关闭终端。（`verify` 和 `record` 的输出也会带这条提示。）
-- **安装后的第一次重启必须用 CLI 驱动。** 正在运行的实例还没加载插件（组合变更要重启才生效），watchdog 也还不存在——此时直接退出实例，服务就躺在地上没人拉。add 之后立刻跑 `dsh-ankh-guard supervise --port N --start "CMD"`（它会接管正在运行的实例，之后任何退出都会被拉起），或用 `dsh-ankh-guard restart --port N --start "CMD" --rollback` 驱动首次重启（它在 detached 进程里完成 停→起→canary 全循环），或安装 launchd/systemd 监督器。没有存活 watchdog 时 `verify`/`record`/`schedule-exit` 都会警告。
+- **需要 full-access（无沙箱）权限。** 重启链路要 spawn detached 进程、kill 进程、绑定端口；沙箱化的 tool runner（workspace-write 之类）会以 EPERM 拒绝其中操作，实例在 shell 层就起不来。**agent 自己无法切换沙箱**——这正是沙箱的意义：`/permission` 是用户输入的命令，单命令提权也要用户审批。长期部署更省事的官方做法：启动实例时设 `DSH_PERMISSION_MODE=danger-full-access`（base bundle 的部署级开关，沙箱与审批策略同时放开），所有会话默认无沙箱。或者发起自我重启前，请用户把**当前会话**切到 full-access：`/permission danger-full-access`——设置页只影响**新**会话；有打开中的持久终端（PTY）时会先被 fence 拒绝，须先关闭终端。（`verify` 和 `record` 的输出也会带这条提示。）
+- **安装后的第一次重启必须用 CLI 驱动。** 正在运行的实例还没加载插件（组合变更要重启才生效），watchdog 也还不存在——此时直接退出实例，服务就躺在地上没人拉。add 之后立刻跑 `dsh-ankh-guard supervise --port N --start "CMD"`（它会接管正在运行的实例，之后任何退出都会被拉起），或用 `dsh-ankh-guard restart --port N --start "CMD" --rollback` 驱动首次重启（它在 detached 进程里完成 停→起→canary 全循环），或安装 launchd/systemd 监督器。收编接管会写一条以 `supervise` 调用会话（`$DSH_SESSION_ID`）为收件人的报告记录——首次弹换和计划重启一样自动回报，驱动会话不会无声停泊。没有存活 watchdog 时 `verify`/`record`/`schedule-exit` 都会警告。
 
 ## 已知安装坑
 
@@ -153,7 +147,7 @@ dsh-ankh-guard restart \
 
 ## Model Experience
 
-两条注入上下文，无工具 schema：每个 root 会话一次性的 boot 须知（重启必须走守护 CLI，禁止手写重启脚本），以及重启后的报告与被中断会话的续跑注入。都是插件来源的 snapshot 用户消息；boot 须知经 `agent.inject` 注入（不唤醒）。
+一个随包 skill，加两条 followup 消息，无工具 schema。`dsh-self-restart-guard` skill 在 apply 时注册：完整重启协议挂在 skill catalog 上，agent 在涉及重启实例的任务里按需发现——没有逐会话的推送通知。每次 boot 都会记录注册结果（`skill-registration.json`)，在 `check-env` 的 `skill:` 行可见；无 skill 能力的组合现在会在启动日志告警——迁移或重打包把 skill 弄丢时会在这里现形，而不是无声消失。重启后，重启报告/被中断会话的续跑只到达发起会话和被中断的会话，以插件来源的 followup 用户消息形式注入；其余会话完全无感。
 
 #### KV Cache effect
 
@@ -161,7 +155,7 @@ dsh-ankh-guard restart \
 
 ## Compatibility
 
-- npm 发布线（`@deepseek-ai/dsh@0.1.0-rc.8`）：⚠️ 降级——一切可用；composition-preflight 门禁通过独立的 `preflight-runner` 运行（rc.8 仍未导出 `composeProfile`，runner 改经已发布的 `@deepseek-ai/dsh-app-boot` 原语组装，带漂移绊线测试），只要能解析到 dsh app 布局——`--repo`、`DSH_HARNESS` 或默认检出路径——就完整运行。没有 harness 检出的纯 npm 部署下门禁退化为提示后放行；其余能力（restart/supervise 门禁、watchdog、回滚到已知良好点）在 npm 线上完整。
+- npm 发布线（`@deepseek-ai/dsh@0.1.1-rc.2`）：⚠️ 降级——一切可用；composition-preflight 门禁通过独立的 `preflight-runner` 运行（0.1.1-rc.2 仍未导出 `composeProfile`，runner 改经已发布的 `@deepseek-ai/dsh-app-boot` 原语组装，带漂移绊线测试），只要能解析到 dsh app 布局——`--repo`、`DSH_HARNESS` 或默认检出路径——就完整运行。没有 harness 检出的纯 npm 部署下门禁退化为提示后放行；其余能力在 npm 线上完整；rc.1→rc.2 复核（2026-08-22）：消费面无变化，全量构建测试通过。
 - 源码线(deepseek-harness master,fork 或上游):✅——门禁通过独立的 `preflight-runner` 运行(从在线 checkout 解析已发布的 `@deepseek-ai/dsh-app-boot` 等),不再需要 fork 补丁。
 
 ## Known Limitations and Deferred Work
@@ -175,3 +169,7 @@ dsh-ankh-guard restart \
 - **checkpoint 提交会扫入整个工作树**——有意为之（检查点就是完整回滚点），但也会带上无关的未提交改动。
 - **`restart`/`supervise` 通过 `lsof` 发现监听者**（macOS / 带 lsof 的 Linux）；其他平台需用 `--pid`。
 - **杀进程一律按单 pid + 后代回收，从不按进程组**——实例不是 setsid 的，所以 `restart`、`schedule-exit` 的退出代理和 watchdog 的 `free_port` 都针对监听者 pid，并在强制路径（`restart` 的 SIGKILL 升级、watchdog 的端口接管与退出清理）沿 `pgrep -P` 回收后代，而不是杀进程组。被监管实例应在优雅停机时自行管理子进程；后代回收只是强制路径上的尽力而为兜底。
+
+## 变更记录
+
+见 [CHANGELOG.md](CHANGELOG.md)。
