@@ -31,7 +31,7 @@ import {
 } from './state.ts'
 import { lastGoodBootRevision, stateFile } from './state-files.ts'
 import { discoverLaunchCommand, findPidOnPort, killPidTree } from './processes.ts'
-import { readInstanceLaunch, readSkillRegistration, writeAdoptionRecord, writeInstanceLaunchAsSupervisor, writeRestartOutcome, writeUnexpectedExitRecord } from './restart-context.ts'
+import { readInstanceLaunch, readSkillRegistration, writeAdoptionRecord, writeCompositionRecovery, writeInstanceLaunchAsSupervisor, writeRestartOutcome, writeUnexpectedExitRecord } from './restart-context.ts'
 
 /** Parsed CLI options; empty stateDir/repoDir mean "use defaults". */
 interface CliOptions {
@@ -42,6 +42,7 @@ interface CliOptions {
   port: number | undefined
   command: string | undefined
   message: string | undefined
+  detail: string | undefined
   start: string | undefined
   pid: string | undefined
   timeoutMs: number | undefined
@@ -113,6 +114,25 @@ function sandboxGate(verb: string, options: CliOptions, io: CliIo): boolean {
   if (!envInternals.sandboxedByProbe()) return true
   io.stderr(`${verb} refused: this environment is sandboxed (a probe write outside the workspace was denied), so a detached restart/watchdog process would be reaped when the turn ends. You cannot switch the sandbox yourself — ask the user to run /permission danger-full-access in THIS session (a yes/no "authorization" changes nothing), then verify with \`dsh-ankh-guard check-env\` and retry. Certain the probe is wrong? Re-run with --force\n`)
   return false
+}
+
+/**
+ * Resolve the restart's initiating session. An explicit --initiator that
+ * contradicts the shell's own DSH_SESSION_ID routes the wake-up report to a
+ * session that is not the caller — observed 2026-08-29: an agent invented a
+ * branch-derived slug ('skill-styles-merge'), the report went to a session
+ * that does not exist, and the actual scheduler was never woken. Warn loudly;
+ * do not refuse — scheduling on behalf of another session is legitimate.
+ * @param explicit - the --initiator flag value, when given.
+ * @param io - CLI streams.
+ * @returns the initiator to record (explicit wins, else the env default).
+ */
+function resolveInitiator(explicit: string | undefined, io: CliIo): string | undefined {
+  const fromEnv = process.env.DSH_SESSION_ID
+  if (explicit !== undefined && explicit !== '' && fromEnv !== undefined && explicit !== fromEnv) {
+    io.stderr(`warning: --initiator ${JSON.stringify(explicit)} does not match this session's DSH_SESSION_ID ${JSON.stringify(fromEnv)} — the restart report will be routed to ${JSON.stringify(explicit)} and THIS session will not be woken. Omit --initiator to route it to the current session.\n`)
+  }
+  return explicit !== undefined && explicit !== '' ? explicit : fromEnv
 }
 
 /**
@@ -222,6 +242,7 @@ commands:
   preflight [--profile NAME] [--timeout-ms MS]
   record-unexpected-exit [--state-dir DIR]   # watchdog-facing: record an unplanned-exit recovery
   record-adoption [--initiator ID] [--state-dir DIR]   # watchdog-facing: record the first (adoption) takeover
+  record-composition-recovery [--state-dir DIR]   # watchdog-facing: record a composition-rollback recovery
   restart --port N --start "CMD" [--pid PID] [--timeout-ms MS] [--delay-ms MS] [--stop-timeout-ms MS] [--rollback]
           [--profile NAME] [--preflight-timeout-ms MS] [--state-dir DIR] [--repo DIR] [--max-age MIN]
   schedule-exit --port N --delay-ms MS [--initiator ID] [--log FILE] [--profile NAME]
@@ -251,7 +272,9 @@ flags:
   --home DIR       supervise: the dsh home the supervised instance boots with (profiles,
                    credentials — default: $DSH_HOME; required when that is unset)
   --initiator ID   schedule-exit: session id that requested the exit (default: $DSH_SESSION_ID);
-                   recorded in last-restart.json so the restart report returns to that session
+                   recorded in last-restart.json so the restart report returns to that session.
+                   Do NOT invent a value: a mismatched id routes the wake-up away from you
+                   (the CLI warns when ID contradicts this shell's $DSH_SESSION_ID)
   --profile NAME   preflight/schedule-exit/restart: the dsh profile to dry-run (default:
                    $DSH_PROFILE, else "web")
   --preflight-timeout-ms MS  schedule-exit/restart: bound on the composition preflight (default 120000)
@@ -270,7 +293,7 @@ export function parse(
   argv: readonly string[],
 ): { error: string } | { command: string; positionals: readonly string[]; options: CliOptions } {
   const options: CliOptions = {
-    stateDir: '', repoDir: '', home: '', maxAgeMinutes: 10, port: undefined, command: undefined, message: undefined,
+    stateDir: '', repoDir: '', home: '', maxAgeMinutes: 10, port: undefined, command: undefined, message: undefined, detail: undefined,
     start: undefined, pid: undefined, timeoutMs: undefined, delayMs: undefined, stopTimeoutMs: undefined,
     log: undefined,
     foreground: false, rollback: false, force: false, sync: false, initiator: undefined, profile: undefined, preflightTimeoutMs: undefined,
@@ -309,6 +332,7 @@ export function parse(
         }
         case '--command': options.command = flagValue(arg, true) ?? ''; i++; break
         case '--message': options.message = flagValue(arg, true) ?? ''; i++; break
+        case '--detail': options.detail = flagValue(arg, true); i++; break
         case '--start': options.start = flagValue(arg, true) ?? ''; i++; break
         case '--log': options.log = flagValue(arg, true) ?? ''; i++; break
         case '--pid': options.pid = flagValue(arg, true) ?? ''; i++; break
@@ -898,6 +922,17 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         : '[watchdog] adoption takeover — a report record is still pending, left it untouched\n')
       return 0
     }
+    case 'record-composition-recovery': {
+      // Invoked by the watchdog when it recovered repeated boot failures by
+      // restoring the last healthy profile composition (a freshly installed
+      // plugin that kills the real boot is the common case). The service is
+      // up again minus the newest plugin change — reported, never silent.
+      const written = writeCompositionRecovery(stateDir, Date.now(), options.detail)
+      io.stdout(written
+        ? '[watchdog] composition rollback recovery — left a report record for the next session\n'
+        : '[watchdog] composition rollback recovery — a report record is still pending, left it untouched\n')
+      return 0
+    }
     case 'check-env': {
       // THE one-call readiness answer for an agent planning a restart: (1) is
       // this instance supervised and by whom, (2) what command a restart
@@ -1056,8 +1091,18 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         })
         io.stdout(`stopped ${pid}${exited ? '' : ' (forced)'}\n`)
         const stoppedAt = Date.now()
+        // The new instance must not inherit this caller's supervision
+        // variables: a restart driven from inside a supervised instance's
+        // agent session carries that instance's WD_* (the watchdog spawns
+        // the instance with its own environment), and forwarding them leaks
+        // them into the new instance's shells — a leaked WD_STATE_DIR
+        // retargets any watchdog script those shells spawn. The watchdog's
+        // own launch_instance applies the same scrub.
         const startEnv = { ...process.env }
         delete startEnv.DSH_ANKH_RESTART_DRIVER
+        for (const key of Object.keys(startEnv)) {
+          if (key.startsWith('WD_')) delete startEnv[key]
+        }
         const child = spawn(start, { shell: true, detached: true, stdio: 'ignore', env: startEnv })
         child.unref()
         io.stdout(`started: ${start}\n`)
@@ -1074,7 +1119,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         // The restart verb must not be invisible to the report machinery:
         // record the outcome (the exit agent's semantics) so the next boot's
         // pendingRestartRecord delivers the report to its initiator.
-        const initiator = options.initiator ?? process.env.DSH_SESSION_ID
+        const initiator = resolveInitiator(options.initiator, io)
         if (!listening) {
           io.stderr(`new instance not listening on 127.0.0.1:${port} within ${timeoutMs}ms\n`)
           writeRestartOutcome(stateDir, { exitAt: stoppedAt, pid: pidNumber, error: `new instance not listening on :${port}`, ...(initiator !== undefined ? { initiator } : {}) })
@@ -1199,6 +1244,9 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         // a spawned watchdog would probe the port, the owner may already be
         // gone.
         WD_ADOPTION: findPidOnPort(port) !== null ? '1' : '0',
+        // The profile whose composition inputs the watchdog snapshots at
+        // healthy boots (and restores on out-of-repo boot failures).
+        WD_PROFILE: process.env.DSH_PROFILE ?? '',
         // Foreground (launchd-supervised) mode: the watchdog owns the port by
         // adoption; the detached form waits for the current owner to exit.
         WD_WAIT_OWNER: options.foreground ? '0' : '1',
@@ -1288,7 +1336,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         // to that session instead of racing to whichever root agent resumes
         // first. Everything lands in stateDir directly — the same directory the
         // plugin reads (see the supervise case for why no home is derived).
-        const initiator = options.initiator ?? process.env.DSH_SESSION_ID
+        const initiator = resolveInitiator(options.initiator, io)
         mkdirSync(stateDir, { recursive: true })
         writeFileSync(stateFile(stateDir, 'restartRequested'),
           `${JSON.stringify({

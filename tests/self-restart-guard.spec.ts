@@ -7,7 +7,7 @@
  * reads the clock; git calls run against throwaway repositories.
  */
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { get as httpGet } from 'node:http'
 import { connect, createServer, type AddressInfo, type Server } from 'node:net'
 import { tmpdir, homedir } from 'node:os'
@@ -20,7 +20,7 @@ import * as selfRestartGuard from '../src/index.ts'
 import { currentHead } from '../src/git.ts'
 import { install as installInvariant } from '../src/invariant.ts'
 import {
-  acknowledgeRestartRecord, buildLaunchCommand, continueAndReportText, pendingRestartRecord,
+  acknowledgeRestartRecord, buildLaunchCommand, continueAndReportText, isParkedOnUserInput, pendingRestartRecord,
   readInstanceLaunch, readInterruptedSnapshot, restartContextText, writeInstanceLaunch,
   writeInstanceLaunchAsSupervisor, writeInterruptedSnapshot, writeSkillRegistration,
 } from '../src/restart-context.ts'
@@ -81,6 +81,24 @@ async function freePort(): Promise<number> {
   const port = (server.address() as AddressInfo).port
   await new Promise<void>((resolve) => { server.close(() => { resolve() }) })
   return port
+}
+
+/**
+ * Env for a directly spawned watchdog script: the test's explicit WD_* over a
+ * process.env SCRUBBED of ambient supervision variables. A shell inside a
+ * supervised dsh instance inherits the watchdog's own WD_* (the instance is
+ * spawned with them), and the script honors a leaked WD_STATE_DIR over the
+ * test's WD_HOME — sending the test watchdog into the PROD state dir, where
+ * the live watchdog holds the pidfile: every racer yields on sight (zero
+ * survivors in ~3s) and no temp pidfile ever appears (reclaim times out at
+ * its initial-claim deadline). Reproduced 2026-08-29 by running the two cases
+ * with WD_STATE_DIR pointed at a live-occupied dir.
+ */
+function watchdogEnv(overrides: Record<string, string>): NodeJS.ProcessEnv {
+  return {
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('WD_'))),
+    ...overrides,
+  }
 }
 
 describe('state core', () => {
@@ -442,6 +460,38 @@ describe('CLI', () => {
       await waitForPort(port)
       expect(await fetchBody(port)).toBe('new')
     } finally {
+      await killListener(port)
+      oldServer.kill('SIGKILL')
+    }
+  })
+
+  it('restart starts the new instance without forwarding ambient WD_* variables', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    const port = await freePort()
+    const dump = join(stateDir, 'instance-env.txt')
+    const oldServer = spawnServer(port, 'old')
+    // Simulate the caller being an agent shell inside a supervised instance:
+    // it carries that instance's WD_* environment (the watchdog spawns the
+    // instance with its own), and a bare restart must not forward it.
+    const previousProbe = process.env.WD_PROBE_LEAK
+    process.env.WD_PROBE_LEAK = 'must-not-reach-the-instance'
+    try {
+      await waitForPort(port)
+      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      stubPreflight('true')
+      const startCmd = `env > '${dump}'; "${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
+      const restarted = io()
+      expect(await runCli(
+        ['restart', '--sync', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        restarted.io,
+      )).toBe(0)
+      expect(restarted.out.join('')).toContain('restart + canary PASS')
+      const leaked = readFileSync(dump, 'utf8').split('\n').filter(line => line.startsWith('WD_'))
+      expect(leaked).toEqual([])
+    } finally {
+      if (previousProbe === undefined) delete process.env.WD_PROBE_LEAK
+      else process.env.WD_PROBE_LEAK = previousProbe
       await killListener(port)
       oldServer.kill('SIGKILL')
     }
@@ -1384,6 +1434,111 @@ describe('supervise', () => {
     expect(JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))).toEqual(record)
   })
 
+  it('record-composition-recovery carries the detail and merges over a bare exit record', async () => {
+    const stateDir = tmpDir('guard-cli-')
+    const first = io()
+    expect(await runCli(['record-composition-recovery', '--state-dir', stateDir, '--detail', '卸载挂载行: @demo/x'], first.io)).toBe(0)
+    expect(first.out.join('')).toContain('composition rollback recovery')
+    const record = JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))
+    expect(record.compositionRecovered).toBe(true)
+    expect(record.detail).toBe('卸载挂载行: @demo/x')
+    expect(record.unexpected).toBeUndefined()
+    const second = io()
+    expect(await runCli(['record-composition-recovery', '--state-dir', stateDir], second.io)).toBe(0)
+    expect(second.out.join('')).toContain('still pending')
+    expect(JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))).toEqual(record)
+  })
+
+  it('record-composition-recovery merges over a bare exit outcome, inheriting its initiator', async () => {
+    const stateDir = tmpDir('guard-cli-')
+    // The exit agent's bare outcome (no diagnostics) is pending; the watchdog
+    // then recovers via composition rollback — its record is the truthful one.
+    writeFileSync(join(stateDir, 'last-restart.json'), `${JSON.stringify({ exitAt: NOW, pid: 4242, initiator: 'session-owner' })}\n`)
+    const out = io()
+    expect(await runCli(['record-composition-recovery', '--state-dir', stateDir, '--detail', 'd'], out.io)).toBe(0)
+    const record = JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8'))
+    expect(record.compositionRecovered).toBe(true)
+    expect(record.initiator).toBe('session-owner')
+    // …but a pending record WITH diagnostics (a crash report) is never clobbered.
+    acknowledgeRestartRecord(stateDir, JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8')), NOW)
+    const crash = io()
+    expect(await runCli(['record-unexpected-exit', '--state-dir', stateDir], crash.io)).toBe(0)
+    expect(crash.out.join('')).toContain('left a report record')
+    const blocked = io()
+    expect(await runCli(['record-composition-recovery', '--state-dir', stateDir], blocked.io)).toBe(0)
+    expect(blocked.out.join('')).toContain('still pending')
+    expect(JSON.parse(readFileSync(join(stateDir, 'last-restart.json'), 'utf8')).unexpected).toBe(true)
+  })
+
+  it('the report text describes a composition-rollback recovery', () => {
+    const text = restartContextText({ exitAt: NOW, compositionRecovered: true }, false)
+    expect(text).toContain('回滚到上次健康的 profile 组合')
+    expect(text).toContain('composition-backup-*')
+  })
+
+  it('the watchdog snapshots the healthy composition and restores it over a boot-killing profile change', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    // A fake profile whose composition input decides whether the "instance"
+    // boots: the fixture start command fails (with an error subject OUTSIDE
+    // the repo, like a plugin in the profile's node_modules) when the patch
+    // layer carries the bad row.
+    const profileDir = join(env.home, 'profiles', 'web')
+    mkdirSync(profileDir, { recursive: true })
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), '# good composition\n')
+    writeFileSync(join(profileDir, 'package.json'), '{"name":"profile-web"}\n')
+    const startCmd = `"${process.execPath}" -e "const fs=require('fs');const c=fs.readFileSync('${profileDir}/cordis.patch.yml','utf8');if(c.includes('bad-plugin')){console.error('Error: apply failed at ${profileDir}/node_modules/bad-plugin/index.js');process.exit(1)}require('http').createServer((q,s)=>s.end('ok')).listen(${port},'127.0.0.1')"`
+    try {
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
+        io().io,
+      )).toBe(0)
+      await waitForPort(port)
+      // Healthy boot snapshotted the composition.
+      const snap = join(stateDir, 'last-good-composition', 'cordis.patch.yml')
+      const snapDeadline = Date.now() + 5000
+      while (!existsSync(snap) && Date.now() < snapDeadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 100) })
+      }
+      expect(readFileSync(snap, 'utf8')).toContain('good composition')
+      // A plugin install lands a bad row, then the instance stops (any cause).
+      writeFileSync(join(profileDir, 'cordis.patch.yml'), '# good composition\n# + bad-plugin row\n')
+      await killListener(port)
+      // The watchdog fails to boot the bad composition, rolls the composition
+      // back to the snapshot, and comes up — service recovered, plugin unmounted.
+      const upDeadline = Date.now() + 30_000
+      let recovered = false
+      while (Date.now() < upDeadline) {
+        if ((await portListening(port)) && readFileSync(join(profileDir, 'cordis.patch.yml'), 'utf8').includes('bad-plugin') === false) {
+          recovered = true
+          break
+        }
+        await new Promise((resolve) => { setTimeout(resolve, 500) })
+      }
+      expect(recovered, 'the watchdog restored the healthy composition and the instance came up').toBe(true)
+      expect(await fetchBody(port)).toBe('ok')
+      // The failing inputs were backed up, and the recovery left a report record.
+      const backups = readdirSync(stateDir).filter(name => name.startsWith('composition-backup-'))
+      expect(backups.length).toBe(1)
+      expect(readFileSync(join(stateDir, backups[0]!, 'cordis.patch.yml'), 'utf8')).toContain('bad-plugin')
+      // The record write trails the port by the CLI spawn — wait for it.
+      const recordFile = join(stateDir, 'last-restart.json')
+      const recordDeadline = Date.now() + 5000
+      while (!existsSync(recordFile) && Date.now() < recordDeadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 200) })
+      }
+      const record = JSON.parse(readFileSync(recordFile, 'utf8'))
+      expect(record.compositionRecovered).toBe(true)
+      expect(record.detail).toContain('回滚 profile patch 层变更')
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
+
   it('record-adoption carries the initiator and never overwrites a pending record', async () => {
     const stateDir = tmpDir('guard-cli-')
     const first = io()
@@ -1470,6 +1625,37 @@ describe('supervise', () => {
     }
   })
 
+  it('the supervised instance starts without the watchdog\'s WD_* supervision environment', async () => {
+    // The watchdog spawns the instance with its own environment: every WD_*
+    // (the CLI's explicit WD_PORT/WD_HOME/WD_STATE_DIR/WD_START, plus ambient
+    // leaks from a caller inside another supervised instance) must be scrubbed
+    // at launch, or they land in every shell the instance hosts.
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const port = await freePort()
+    const dump = join(env.home, 'instance-env.txt')
+    const previousProbe = process.env.WD_PROBE_LEAK
+    process.env.WD_PROBE_LEAK = 'must-not-reach-the-instance'
+    try {
+      const startCmd = `env > '${dump}'; "${process.execPath}" -e "require('http').createServer().listen(${port},'127.0.0.1')"`
+      const first = io()
+      expect(await runCli(
+        ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', join(env.home, 'state'), '--repo', repo],
+        first.io,
+      )).toBe(0)
+      // The dump is written before the server starts listening.
+      await waitForPort(port)
+      const leaked = readFileSync(dump, 'utf8').split('\n').filter(line => line.startsWith('WD_'))
+      expect(leaked).toEqual([])
+    } finally {
+      if (previousProbe === undefined) delete process.env.WD_PROBE_LEAK
+      else process.env.WD_PROBE_LEAK = previousProbe
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 30_000)
+
   it('reclaims a pidfile deleted underneath it, and yields to a live replacement owner', async () => {
     // The state dir cleaned under a RUNNING watchdog must not fork
     // supervision: the watchdog reclaims its claim within one poll; and when
@@ -1480,7 +1666,7 @@ describe('supervise', () => {
     const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
     const port = await freePort()
     const wd = spawn('bash', [script, '--supervise'], {
-      env: { ...process.env, WD_HOME: home, WD_PORT: String(port), WD_TEST_FAKE: '1' },
+      env: watchdogEnv({ WD_HOME: home, WD_PORT: String(port), WD_TEST_FAKE: '1' }),
       stdio: 'ignore',
       detached: true,
     })
@@ -1500,14 +1686,18 @@ describe('supervise', () => {
     }
     // Up and claimed.
     expect(await until(() => existsSync(pidfile) && readFileSync(pidfile, 'utf8').trim() === String(wd.pid), 15_000)).toBe(true)
-    // Deleted underneath → reclaimed by the same pid.
+    // Deleted underneath → reclaimed by the same pid. The reclaim runs once
+    // per supervise-loop iteration (~6s in fake-instance mode: spawn + health
+    // poll + two sleeps), so the window must absorb a couple of SLOW
+    // iterations — a machine running a multi-package deploy gate stretches a
+    // single iteration past a tight one.
     unlinkSync(pidfile)
-    expect(await until(() => existsSync(pidfile) && readFileSync(pidfile, 'utf8').trim() === String(wd.pid), 10_000)).toBe(true)
+    expect(await until(() => existsSync(pidfile) && readFileSync(pidfile, 'utf8').trim() === String(wd.pid), 25_000)).toBe(true)
     // A live replacement owner → the watchdog yields (exits) rather than fighting.
     writeFileSync(pidfile, String(process.pid))
     expect(await until(() => {
       try { process.kill(wd.pid ?? 0, 0); return false } catch { return true }
-    }, 10_000)).toBe(true)
+    }, 25_000)).toBe(true)
     // ...and its pidfile claim was NOT stolen back or deleted (it names us).
     expect(readFileSync(pidfile, 'utf8').trim()).toBe(String(process.pid))
   }, 45_000)
@@ -1537,7 +1727,7 @@ describe('supervise', () => {
     // node staggers them by enough process-setup time that the first racer has
     // already written the pidfile, which hides the very race under test.
     const launcher = spawn('bash', ['-c', 'for _ in 1 2 3 4 5 6 7 8; do bash "$0" --supervise >/dev/null 2>&1 & done; wait', script], {
-      env: { ...process.env, WD_HOME: home, WD_PORT: String(port), WD_TEST_FAKE: '1' },
+      env: watchdogEnv({ WD_HOME: home, WD_PORT: String(port), WD_TEST_FAKE: '1' }),
       stdio: 'ignore',
     })
     // unshift for the same reason as `supervisedEnv`: the survivor must die
@@ -1566,6 +1756,71 @@ describe('supervise', () => {
     expect(readFileSync(join(home, 'state', 'watchdog.pid'), 'utf8').trim())
       .toBe(String(survivors()[0]))
   }, 30_000)
+
+  it('give-up parks when the crash page cannot bind — no boot-loop fight, SIGUSR1 re-arms', async () => {
+    // Give-up with the port still occupied is the COMMON shape (the boot
+    // failures were often EADDRINUSE themselves). The crash page's listen must
+    // survive it: pre-fix the page died on an unhandled 'error' event, the
+    // watchdog's `wait` returned, and the boot loop resumed — fighting the
+    // healthy occupant the watchdog had just given up against (observed in an
+    // e2e rig, 2026-08-30: give-up → page crash → more boot attempts, the
+    // occupant killed on every pass).
+    const home = tmpDir('guard-giveup-')
+    mkdirSync(join(home, 'state'), { recursive: true })
+    mkdirSync(join(home, 'home'), { recursive: true })
+    const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
+    const port = await freePort()
+    const wdLog = join(home, 'state', 'watchdog.log')
+    const wd = spawn('bash', [script, '--supervise'], {
+      env: watchdogEnv({ WD_HOME: home, WD_PORT: String(port), WD_TEST_BREAK: '1' }),
+      stdio: ['ignore', openSync(wdLog, 'a'), openSync(wdLog, 'a')],
+      detached: true,
+    })
+    wd.unref()
+    cleanups.unshift(() => {
+      try { process.kill(-(wd.pid ?? 0), 'SIGKILL') } catch { /* not a group leader */ }
+      try { process.kill(wd.pid ?? 0, 'SIGKILL') } catch { /* already gone */ }
+    })
+    const attempts = (): number => (readFileSync(wdLog, 'utf8').match(/starting instance/g) ?? []).length
+    const until = async (fn: () => boolean, ms: number): Promise<boolean> => {
+      const deadline = Date.now() + ms
+      while (Date.now() < deadline) {
+        if (fn()) return true
+        await new Promise((resolve) => { setTimeout(resolve, 200) })
+      }
+      return false
+    }
+    // The port must become occupied only AFTER the watchdog's startup
+    // free_port sweep — and the holder must never answer HTTP 200, or the
+    // loop-bottom health check frees it as a stale listener. A bare TCP
+    // listener (accepts, never responds) is exactly the "half-dead process
+    // still holding the port" shape the crash page faces in the field.
+    let holder: ReturnType<typeof spawn> | undefined
+    try {
+      // WD_TEST_BREAK fails every boot instantly; the backoff sleeps
+      // (failures*5) put give-up at ~35s of wall time.
+      expect(await until(() => readFileSync(wdLog, 'utf8').includes('failure #1'), 20_000)).toBe(true)
+      holder = spawn(process.execPath, ['-e', `require('net').createServer(()=>{}).listen(${port},'127.0.0.1')`], { stdio: 'ignore' })
+      const gaveUp = join(home, 'state', 'watchdog-gave-up')
+      expect(await until(() => existsSync(gaveUp), 50_000)).toBe(true)
+      // Parked: no further boot attempts, the page crash is absent, and the
+      // occupant is NOT touched.
+      const settled = attempts()
+      await new Promise((resolve) => { setTimeout(resolve, 4000) })
+      expect(attempts()).toBe(settled)
+      const log = readFileSync(wdLog, 'utf8')
+      expect(log).not.toContain("Unhandled 'error' event")
+      expect(log).toContain('crash page cannot bind')
+      try { process.kill(holder.pid ?? 0, 0) } catch { throw new Error('port holder was killed') }
+      // SIGUSR1 re-arms the boot loop.
+      process.kill(wd.pid ?? 0, 'SIGUSR1')
+      expect(await until(() => attempts() > settled, 15_000)).toBe(true)
+    } finally {
+      holder?.kill('SIGKILL')
+      await new Promise((resolve) => { setTimeout(resolve, 300) })
+      await killListener(port)
+    }
+  }, 75_000)
 
   it('schedule-exit refuses without a credential (the gate)', async () => {
     const env = supervisedEnv()
@@ -1762,6 +2017,49 @@ describe('supervise', () => {
       expect(existsSync(join(stateDir, 'last-restart.json'))).toBe(true)
       expect(existsSync(join(env.home, 'state', 'last-restart.json'))).toBe(false)
     } finally {
+      env.restore()
+    }
+  }, 15_000)
+
+  it('schedule-exit warns when --initiator contradicts this session\'s DSH_SESSION_ID', async () => {
+    // The wake-up report routes to the recorded initiator: an agent that
+    // invents one (observed 2026-08-29: a branch-derived slug) strands its own
+    // resume. The CLI warns loudly instead of refusing — scheduling on behalf
+    // of another session is legitimate.
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-')
+    const port = await freePort()
+    const previousSession = process.env.DSH_SESSION_ID
+    process.env.DSH_SESSION_ID = 'session-real'
+    try {
+      expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      stubPreflight('true')
+      const out = io()
+      expect(await runCli(
+        ['schedule-exit', '--port', String(port), '--delay-ms', '60000', '--initiator', 'skill-styles-merge',
+          '--state-dir', stateDir, '--repo', repo],
+        out.io,
+      )).toBe(0)
+      const warning = out.err.join('')
+      expect(warning).toContain('does not match')
+      expect(warning).toContain('skill-styles-merge')
+      expect(warning).toContain('session-real')
+      // The marker still records what was asked for (warn, not refuse).
+      const marker = JSON.parse(readFileSync(join(stateDir, 'restart-requested.json'), 'utf8'))
+      expect(marker.initiator).toBe('skill-styles-merge')
+      // A matching (or omitted) --initiator stays silent.
+      const quiet = io()
+      unlinkSync(join(stateDir, 'restart-requested.json'))
+      expect(await runCli(
+        ['schedule-exit', '--port', String(port), '--delay-ms', '60000', '--initiator', 'session-real',
+          '--state-dir', stateDir, '--repo', repo],
+        quiet.io,
+      )).toBe(0)
+      expect(quiet.err.join('')).not.toContain('does not match')
+    } finally {
+      if (previousSession === undefined) delete process.env.DSH_SESSION_ID
+      else process.env.DSH_SESSION_ID = previousSession
       env.restore()
     }
   }, 15_000)
@@ -2273,6 +2571,98 @@ describe('restart context injection', () => {
     // The snapshot is consumed: a later boot does not replay it.
     expect(existsSync(join(stateDir, 'interrupted-sessions.json'))).toBe(false)
     await fiber.dispose()
+  })
+
+  it('a session parked on user input is NOT resumed: the card in the log is the continuation', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-')
+    writeFileSync(join(stateDir, 'interrupted-sessions.json'),
+      JSON.stringify({ exitAt: Date.now(), resume: [], interrupted: ['session-parked', 'session-working'] }))
+    const parkedEvents = [
+      { type: 'turn/start', seq: 1, data: { turn: 1 } },
+      { type: 'tool/call', seq: 2, data: { turn: 1, step: 1, callId: 'c1', name: 'ask_user_question', arguments: '{}' } },
+      { type: 'tool/result', seq: 3, data: { turn: 1, step: 1, callId: 'c1', message: { content: 'interrupted' } } },
+      { type: 'turn/end', seq: 4, data: { turn: 1, reason: { kind: 'interrupted' } } },
+    ]
+    const workingEvents = [
+      { type: 'turn/start', seq: 1, data: { turn: 1 } },
+      { type: 'tool/call', seq: 2, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' } },
+      { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'interrupted' } } },
+    ]
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    const resumed: string[] = []
+    const followups = new Map<string, ReturnType<typeof vi.fn>>()
+    const liveAgents: Array<{ id: string; status: string; followup: ReturnType<typeof vi.fn> }> = []
+    ctx.provide('agents', {
+      roots: () => liveAgents,
+      list: () => liveAgents,
+      resume: async (options: { resumeSessionId: string }) => {
+        resumed.push(options.resumeSessionId)
+        const agent = { id: options.resumeSessionId, status: 'idle', followup: vi.fn() }
+        followups.set(agent.id, agent.followup)
+        liveAgents.push(agent)
+        ctx.emit('agent/created', { agent } as never)
+        return agent
+      },
+    } as never)
+    ctx.provide('sessionPersistence', {
+      inspect: async (id: string) => ({
+        meta: {},
+        events: id === 'session-parked' ? parkedEvents : workingEvents,
+      }),
+    } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 1 })
+    await fiber.await()
+    const deadline = Date.now() + 5000
+    while (!resumed.includes('session-working') && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 20) })
+    }
+    expect(resumed).toEqual(['session-working'])
+    // The working session got its continue; the parked one got nothing — the
+    // question card in its log is still the live continuation surface.
+    expect(followups.get('session-working')).toHaveBeenCalledTimes(1)
+    expect(followups.has('session-parked')).toBe(false)
+    await fiber.dispose()
+  })
+
+  it('isParkedOnUserInput: parked iff the interrupted turn blocked on a question or an approval', () => {
+    const interrupt = (turn: number) => ({ type: 'turn/end', seq: 99, data: { turn, reason: { kind: 'interrupted' } } })
+    const start = (turn: number) => ({ type: 'turn/start', seq: 1, data: { turn } })
+    // Parked on an open ask_user_question at the tail.
+    expect(isParkedOnUserInput([
+      start(1),
+      { type: 'tool/call', seq: 2, data: { turn: 1, name: 'bash' } },
+      { type: 'tool/result', seq: 3, data: { turn: 1 } },
+      { type: 'tool/call', seq: 4, data: { turn: 1, name: 'ask_user_question' } },
+      interrupt(1),
+    ])).toBe(true)
+    // Parked on an undecided approval (asked without decided within the turn).
+    expect(isParkedOnUserInput([
+      start(1),
+      { type: 'approval/asked', seq: 2, data: { turn: 1 } },
+      interrupt(1),
+    ])).toBe(true)
+    // Approval asked AND decided, then real work interrupted: not parked.
+    expect(isParkedOnUserInput([
+      start(1),
+      { type: 'approval/asked', seq: 2, data: { turn: 1 } },
+      { type: 'approval/decided', seq: 3, data: { turn: 1 } },
+      { type: 'tool/call', seq: 4, data: { turn: 1, name: 'bash' } },
+      interrupt(1),
+    ])).toBe(false)
+    // Mid-work interruption (no user-input call at the tail): not parked.
+    expect(isParkedOnUserInput([start(1), { type: 'tool/call', seq: 2, data: { turn: 1, name: 'bash' } }, interrupt(1)])).toBe(false)
+    // A question earlier in the turn, answered, then real work: not parked.
+    expect(isParkedOnUserInput([
+      start(1),
+      { type: 'tool/call', seq: 2, data: { turn: 1, name: 'ask_user_question' } },
+      { type: 'tool/result', seq: 3, data: { turn: 1 } },
+      { type: 'tool/call', seq: 4, data: { turn: 1, name: 'bash' } },
+      interrupt(1),
+    ])).toBe(false)
+    // No interrupted turn at all: not parked.
+    expect(isParkedOnUserInput([start(1), { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'completed' } } }])).toBe(false)
   })
 
   it('merges continue and report into ONE message when the initiator was itself interrupted', async () => {

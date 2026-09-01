@@ -24,7 +24,7 @@ agent 改完代码想重启的时候，这个插件会先问一句：这次改�
 
 但绿色构建证明不了 profile 组合能起来：坏掉的 patch YAML、缺失的构建产物、重复的 loader entry id、typert manifest 归属不匹配、apply 时抛错的插件——这些只在 boot 阶段才爆。于是第二道闸门在凭证检查之后、停任何东西之前运行：`preflight` 在子进程里对完全相同的组合做深度干跑（整个插件树走同一个引擎完整 boot 一遍，然后 dispose），组合起不来就绝不停止运行中的实例。见 [preflight：组合闸门](#preflight-the-composition-gate)。
 
-重启本身交给 watchdog 托管：独立的监督进程，宿主死了自动拉起来，起不来就回滚到最后已知可用版本（健康启动戳——本部署里最近一次真正跑起来过的版本——兜底依次是检查点、绿色凭证的 HEAD）——启动失败源自仓库之外（profile overlay、已装插件）时跳过回滚——连续四次失败停在崩溃页等人工处理。每次回滚都会留下 `guard-backup-*` 恢复锚点（被丢弃的 HEAD 和未提交改动各有分支），恢复不依赖 reflog。`checkpoint` 在批次前把整个工作树提交为回滚点，`reset` 硬重置回该点（同样留锚点），`canary` 在重启后复检。检查点与凭证存在状态文件里，重启后依然存活，所以 canary 可以在新实例起来之后运行。
+重启本身交给 watchdog 托管：独立的监督进程，宿主死了自动拉起来，起不来就回滚到最后已知可用版本（健康启动戳——本部署里最近一次真正跑起来过的版本——兜底依次是检查点、绿色凭证的 HEAD），连续四次失败停在崩溃页等人工处理。启动失败源自仓库之外时（新装的插件是最常见的情形），回滚检出修不好它——所以 watchdog 改为回滚 **profile 组合**：每次健康启动都会快照组合输入（bundles 层与 profile 清单），仓库外故障即恢复该快照（最新插件变更被卸载，故障输入备份在 `composition-backup-*`），并通过重启报告渠道点名被卸载的内容、向用户回报这次自动恢复。每次回滚都会留下 `guard-backup-*` 恢复锚点（被丢弃的 HEAD 和未提交改动各有分支），恢复不依赖 reflog。`checkpoint` 在批次前把整个工作树提交为回滚点，`reset` 硬重置回该点（同样留锚点），`canary` 在重启后复检。检查点与凭证存在状态文件里，重启后依然存活，所以 canary 可以在新实例起来之后运行。
 
 ## 安装与加载
 
@@ -102,13 +102,13 @@ dsh-ankh-guard supervise --port 3080 --start "CMD" --state-dir "$DSH_HOME/state"
 
 `supervise` 还需要被监管实例启动时使用的 dsh home（watchdog 会把它 export 为实例的 `DSH_HOME`）：`--home DIR` 优先，否则取 `$DSH_HOME`；两者都没有时响亮拒绝——从 `--state-dir` 猜出来的 home 会让实例静默读错 profile/凭据目录。
 
-它以 `--wait-owner` 模式 detached 拉起随包发布的 `scripts/dsh-watchdog.sh`：watchdog 在当前实例运行期间待机，实例退出（有意重启或崩溃）后接管端口、重新拉起，有意重启时跑 guard canary（读 `restart-requested.json` 标记），通过后清除标记。连续 2 次起不来→回滚到最后已知可用版本：健康启动戳（`last-good-boot.json`，每次实例成功启动时重写，指向本部署里最近一次真正跑起来的版本）优先，其次是 guard checkpoint，最后是凭证 HEAD；但仅当启动失败的错误主体路径在仓库内——坏掉的 profile overlay 或已装插件靠回滚仓库修不好，这类失败整体跳过回滚。启动命令没有绑到被监督端口时同样豁免：启动窗口超时而实例正监听在别处、或以点名了本 watchdog 并不拥有的端口的 `EADDRINUSE` 失败时，watchdog 会点名实际绑定的端口并跳过回滚——重置检出改不了命令行参数。发生在被监督端口上的 `EADDRINUSE` 保留原本的释放并重试逃生口，现在以五次为上限。任何路径的 reset（watchdog、CLI、service）都会先为被丢弃的 HEAD 和未提交改动创建 `guard-backup-*` 分支锚点，恢复不依赖 reflog。4 次失败→在端口上提供带重试按钮的崩溃页（SIGUSR1 通知 watchdog）。`watchdog-stop` 标记让 watchdog 彻底退出。实例可以在自我重启前自行采用监督——用户永远不需要手动启动 watchdog。
+它以 `--wait-owner` 模式 detached 拉起随包发布的 `scripts/dsh-watchdog.sh`：watchdog 在当前实例运行期间待机，实例退出（有意重启或崩溃）后接管端口、重新拉起，有意重启时跑 guard canary（读 `restart-requested.json` 标记），通过后清除标记。连续 2 次起不来→回滚到最后已知可用版本：健康启动戳（`last-good-boot.json`，每次实例成功启动时重写，指向本部署里最近一次真正跑起来的版本）优先，其次是 guard checkpoint，最后是凭证 HEAD；但仅当启动失败的错误主体路径在仓库内。主体在仓库之外时（坏掉的 profile overlay 或已装插件），回滚检出修不好，watchdog 改为恢复上次健康的 **profile 组合**：健康启动时快照的组合输入（`last-good-composition/`）覆盖回 live 的 bundles 层与清单，最新插件变更被卸载，故障输入保留在 `composition-backup-*`，恢复报告会点名被卸载的内容。启动命令没有绑到被监督端口时同样豁免：启动窗口超时而实例正监听在别处、或以点名了本 watchdog 并不拥有的端口的 `EADDRINUSE` 失败时，watchdog 会点名实际绑定的端口并跳过两种回滚——重置文件改不了命令行参数。发生在被监督端口上的 `EADDRINUSE` 保留原本的释放并重试逃生口，现在以五次为上限。任何路径的 reset（watchdog、CLI、service）都会先为被丢弃的 HEAD 和未提交改动创建 `guard-backup-*` 分支锚点，恢复不依赖 reflog。4 次失败→在端口上提供带重试按钮的崩溃页（SIGUSR1 通知 watchdog）。`watchdog-stop` 标记让 watchdog 彻底退出。实例可以在自我重启前自行采用监督——用户永远不需要手动启动 watchdog。
 
 已有 watchdog 监督时，重启触发用 `schedule-exit`：写入 restart 标记并 spawn 一个 detached 退出代理（node `spawn` 的 setsid），托管 shell 的进程组回收不到它，所以计划中的 kill 会在调度回合结束后真实落地（修复 `(sleep N; kill) &` 静默不触发的坑）。watchdog 重新拉起、跑 canary，新实例经 `last-restart.json` 回报。只有无 watchdog 时才用 `restart`（单次循环）。
 
 **重启报告自动到达模型——并只等它的主人。** 计划重启后（存在未确认的 `last-restart.json` 记录），插件通过 `agent.followup` 把报告排入下一回合，agent 无需任何用户消息即可回报重启结果。重启后的会话恢复是 lazy 的（只有 UI 或 RPC 碰到某个会话，它的 agent 才会被创建），所以完整报告只发给发起重启的会话（`schedule-exit` 把 `$DSH_SESSION_ID` 记为 initiator），等它何时恢复何时送达——其他会话永远不会为了报告被唤醒；记录保持未确认，直到发起会话恢复或下一次重启替换它（新 `exitAt`）。没有 initiator 的记录由首个创建的根 agent 领走。仅根 agent、仅一次（送达即确认）。配置 `reportRestartContext`：`followup`（默认，自主）、`step`（骑在下一次回合的第一步上）、或 `off`。
 
-**被中断的会话自动恢复并继续。** SIGTERM 时插件把当时有在途回合的根会话（连同重启发起会话）快照进 `interrupted-sessions.json`；下一次重启开机时——冷启动会丢弃快照不做动作——通过 `ctx.agents.resume` 把这些会话拉起来，并给被中断的会话排入一条"继续"followup（它们的日志已被崩溃恢复修复以 `reason.kind === 'interrupted'` 关闭），自我重启不再悄悄暂停其他所有会话。配置 `resumeInterrupted`（默认 true）与 `resumeDelayMs`（默认 5000，等应用服务先起来）。
+**被中断的会话自动恢复并继续。** SIGTERM 时插件把当时有在途回合的根会话（连同重启发起会话）快照进 `interrupted-sessions.json`；下一次重启开机时——冷启动会丢弃快照不做动作——通过 `ctx.agents.resume` 把这些会话拉起来，并给被中断的会话排入一条"继续"followup（它们的日志已被崩溃恢复修复以 `reason.kind === 'interrupted'` 关闭），自我重启不再悄悄暂停其他所有会话。一条边界：**泊在用户输入上的回合**（未回答的 `ask_user_question` 或未决审批，读修复后的日志尾部判定）不算被中断的工作——卡片还在日志里、用户随时能答——这类会话既不恢复也不续跑。配置 `resumeInterrupted`（默认 true）与 `resumeDelayMs`（默认 5000，等应用服务先起来）。
 
 ### supervise：一个端口一个拥有者
 

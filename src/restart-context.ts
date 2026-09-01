@@ -24,6 +24,13 @@ export interface RestartRecord {
    * guard) — written on the respawn so the recovery is reported, not silent.
    */
   unexpected?: boolean
+  /**
+   * The watchdog recovered repeated boot failures by restoring the last
+   * healthy profile composition (the newest plugin change was unmounted).
+   */
+  compositionRecovered?: boolean
+  /** What the composition rollback changed (the unmounted rows), for the report. */
+  detail?: string
   reportedAt?: number
 }
 
@@ -79,6 +86,10 @@ export function pendingRestartRecord(stateDir: string): RestartRecord | null {
 export function restartContextText(record: RestartRecord, canaryPending: boolean): string {
   if (record.exitAt === undefined && record.error === undefined) return ''
   const time = record.exitAt !== undefined ? new Date(record.exitAt).toISOString() : '未知时间'
+  if (record.compositionRecovered === true) {
+    const what = record.detail !== undefined ? `回滚内容：${record.detail}。` : ''
+    return `[ankh-guard] 服务于 ${time} 前后连续启动失败，watchdog 已自动回滚到上次健康的 profile 组合并恢复。${what}原组合已备份到 state 的 composition-backup-* 目录。建议用户修复或卸载相关插件后重新安装验证。请向用户简要回报本次自动恢复与上述建议。`
+  }
   if (record.unexpected === true) {
     return `[ankh-guard] 服务最近发生过一次非计划退出（崩溃或被手动停止）：${time}，watchdog 已自动拉起实例。请向用户简要回报这次非计划重启。`
   }
@@ -109,6 +120,9 @@ export function continueInterruptedText(exitAt: number): string {
 export function continueAndReportText(record: RestartRecord, canaryPending: boolean): string {
   if (record.exitAt === undefined && record.error === undefined) return ''
   const time = record.exitAt !== undefined ? new Date(record.exitAt).toISOString() : '未知时间'
+  if (record.compositionRecovered === true) {
+    return `[ankh-guard] 服务于 ${time} 前后连续启动失败，watchdog 已自动回滚到上次健康的 profile 组合并恢复（最近的插件变更已卸载）。你上次正在进行的回合被中断（日志已标记 interrupted）。请检查当前状态并继续未完成的任务，并向用户简要回报本次自动恢复；若任务已不再适用，简要说明原因后停止。`
+  }
   if (record.unexpected === true) {
     return `[ankh-guard] 服务于 ${time} 发生非计划退出（崩溃或被手动停止），watchdog 已自动拉起实例。你上次正在进行的回合被中断（日志已标记 interrupted）。请检查当前状态并继续未完成的任务，并向用户简要回报这次非计划重启；若任务已不再适用，简要说明原因后停止。`
   }
@@ -201,6 +215,37 @@ export interface InstanceLaunch {
   port?: number
   /** Epoch milliseconds when recorded. */
   recordedAt: number
+}
+
+/**
+ * Record a composition rollback recovery: repeated boot failures whose
+ * subject lived outside the checkout (a freshly installed plugin is the
+ * common case) were recovered by restoring the last healthy profile
+ * composition. The service is UP again minus the newest plugin change — the
+ * recovery must be reported, never silent.
+ *
+ * Pending-record policy: a pending record with real diagnostics (error /
+ * unexpected) is kept; a BARE exit outcome (exitAt/pid only) is merged over —
+ * the watchdog knows the boot actually failed and recovered, so its record is
+ * the truthful one, and it inherits the exit record's initiator so the report
+ * still reaches its owner.
+ * @param stateDir - state directory.
+ * @param now - epoch milliseconds of the recovery boot.
+ * @param detail - what changed in the rolled-back composition (e.g. the
+ * unmounted bundle rows), for the report text.
+ * @returns whether the record was written.
+ */
+export function writeCompositionRecovery(stateDir: string, now: number, detail?: string): boolean {
+  const pending = pendingRestartRecord(stateDir)
+  if (pending !== null && (pending.error !== undefined || pending.unexpected === true || pending.compositionRecovered === true)) return false
+  mkdirSync(stateDir, { recursive: true })
+  atomicWrite(restartRecordFile(stateDir), `${JSON.stringify({
+    exitAt: now,
+    compositionRecovered: true,
+    ...(detail !== undefined && detail !== '' ? { detail } : {}),
+    ...(pending?.initiator !== undefined ? { initiator: pending.initiator } : {}),
+  })}\n`)
+  return true
 }
 
 /**
@@ -349,4 +394,54 @@ export function readSkillRegistration(stateDir: string): SkillRegistrationRecord
   } catch {
     return null
   }
+}
+
+/** The tool whose open call means the turn is parked waiting for the human. */
+const USER_INPUT_TOOL = 'ask_user_question'
+
+/** Minimal log-event view this helper reads (the session-persistence event shape). */
+interface ParkedProbeEvent {
+  type: string
+  seq?: number
+  data: Record<string, unknown>
+}
+
+/**
+ * Whether the session's last turn ended PARKED on user input: interrupted
+ * while waiting on an open `ask_user_question` call, or on an approval
+ * (`approval/asked` with no `approval/decided` in the same turn / after the
+ * turn's start). A parked turn has no interrupted WORK — the card persists in
+ * the log and the user answers whenever — so the restart resume must leave
+ * such sessions alone (no resume, no continue injection, no replayed card).
+ * @param events - the session's durable events (crash-repair already applied).
+ * @returns whether the last interrupted turn was parked on user input.
+ */
+export function isParkedOnUserInput(events: readonly ParkedProbeEvent[]): boolean {
+  let parkedTurn: number | undefined
+  let parkedTurnStartSeq = -1
+  for (const event of events) {
+    const reason = event.data['reason'] as { kind?: string } | undefined
+    if (event.type === 'turn/end' && reason?.kind === 'interrupted') {
+      parkedTurn = event.data['turn'] as number
+    }
+  }
+  if (parkedTurn === undefined) return false
+  for (const event of events) {
+    if (event.type === 'turn/start' && event.data['turn'] === parkedTurn) {
+      parkedTurnStartSeq = event.seq ?? -1
+    }
+  }
+  let lastToolName: string | undefined
+  let pendingApproval = false
+  for (const event of events) {
+    // Approval events are not guaranteed to carry a turn — fall back to the
+    // turn's start sequence boundary.
+    const inTurn = event.data['turn'] === parkedTurn
+      || (parkedTurnStartSeq >= 0 && (event.seq ?? -1) >= parkedTurnStartSeq)
+    if (!inTurn) continue
+    if (event.type === 'tool/call') lastToolName = event.data['name'] as string
+    if (event.type === 'approval/asked') pendingApproval = true
+    if (event.type === 'approval/decided') pendingApproval = false
+  }
+  return lastToolName === USER_INPUT_TOOL || pendingApproval
 }

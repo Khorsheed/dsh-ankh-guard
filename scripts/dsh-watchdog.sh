@@ -30,6 +30,9 @@
 #   WD_PORT=N          port to own (default 3080)
 #   WD_REPO=DIR        checkout the guard rollback operates on
 #   WD_START="CMD"     shell command that starts the supervised instance
+#   WD_PROFILE=NAME    the profile the instance boots (default web) — its
+#                      composition inputs are snapshotted at healthy boots and
+#                      restored when boot failures originate outside the repo
 #   WD_GUARD="CMD"     how to invoke the guard CLI (default: dsh-ankh-guard)
 #   WD_WAIT_OWNER=1    don't adopt the port; wait for the current owner to exit
 #   WD_DELAY=N         sleep N seconds before adopting/observing the port
@@ -80,7 +83,18 @@ launch_instance() {
     exit
   fi
   if [ -z "${WD_START:-}" ]; then echo "[watchdog] WD_START unset — nothing to supervise" >&2; exit 1; fi
-  sh -c "$WD_START"
+  # The instance inherits this process's environment: scrub EVERY WD_* so no
+  # supervision variable can leak into the shells the instance hosts. A leaked
+  # WD_STATE_DIR retargets any watchdog script those shells spawn (observed
+  # 2026-08-29: an agent session inside the supervised deployment ran the test
+  # suite straight into the PROD state dir — racers yielded to the live
+  # pidfile owner, and the reclaim case never saw its temp pidfile). The scrub
+  # is prefix-based, not a name list: the CLI adds WD_* variables over time
+  # (WD_GUARD, WD_WAIT_OWNER, WD_ADOPTION, …) and a list silently goes stale.
+  # WD_START is captured first: the unset would otherwise eat the command
+  # itself. The guard CLI's bare-restart spawn applies the same scrub.
+  local start_cmd=$WD_START
+  ( for v in $(env | sed -n 's/^\(WD_[^=]*\)=.*/\1/p'); do unset "$v"; done; sh -c "$start_cmd" )
 }
 
 healthy() {
@@ -169,6 +183,60 @@ stamp_last_good_boot() {
   printf '{"revision":"%s","at":%s}\n' "$sha" "$(date +%s)000" > "$STATE_DIR/last-good-boot.json"
 }
 
+# A healthy boot also proves the current PROFILE COMPOSITION runs: snapshot
+# its inputs (the bundles patch layer + the profile manifest). This is the
+# rollback target for failures a checkout reset cannot fix — a freshly
+# installed plugin whose row breaks the real boot lives in the profile, not
+# the repository.
+snapshot_composition() {
+  local dir="$DSH_ROOT/profiles/${WD_PROFILE:-web}"
+  [ -f "$dir/cordis.patch.yml" ] || return 0
+  mkdir -p "$STATE_DIR/last-good-composition"
+  cp "$dir/cordis.patch.yml" "$STATE_DIR/last-good-composition/"
+  if [ -f "$dir/package.json" ]; then cp "$dir/package.json" "$STATE_DIR/last-good-composition/"; fi
+}
+
+# Restore the snapshotted composition over the live one, backing the current
+# (failing) inputs up first and computing the delta for the recovery report.
+# Returns 1 when there is nothing to restore to (no snapshot, or the snapshot
+# already IS the live composition — retrying a boot with unchanged inputs is
+# pointless).
+restore_composition() {
+  local snap="$STATE_DIR/last-good-composition"
+  local dir="$DSH_ROOT/profiles/${WD_PROFILE:-web}"
+  [ -f "$snap/cordis.patch.yml" ] || return 1
+  local same=1
+  diff -q "$snap/cordis.patch.yml" "$dir/cordis.patch.yml" >/dev/null 2>&1 || same=0
+  if [ -f "$snap/package.json" ] || [ -f "$dir/package.json" ]; then
+    diff -q "$snap/package.json" "$dir/package.json" >/dev/null 2>&1 || same=0
+  fi
+  [ "$same" = "0" ] || return 1
+  # What the rollback unmounts — names for the recovery report.
+  comp_restore_detail=$(node -e '
+    const fs = require("fs")
+    const read = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")) } catch { return {} } }
+    const live = read(process.argv[1]), snap = read(process.argv[2])
+    const added = (a, b) => a.filter((x) => !b.includes(x))
+    const parts = []
+    const rows = added(live.dsh?.profile?.bundles ?? [], snap.dsh?.profile?.bundles ?? [])
+    if (rows.length > 0) parts.push(`卸载挂载行: ${rows.join(", ")}`)
+    const deps = added(Object.keys(live.dependencies ?? {}), Object.keys(snap.dependencies ?? {}))
+    if (deps.length > 0) parts.push(`移除依赖: ${deps.join(", ")}`)
+    process.stdout.write(parts.join(";"))
+  ' "$dir/package.json" "$snap/package.json" 2>/dev/null)
+  if ! diff -q "$snap/cordis.patch.yml" "$dir/cordis.patch.yml" >/dev/null 2>&1; then
+    comp_restore_detail="${comp_restore_detail:+$comp_restore_detail;}回滚 profile patch 层变更"
+  fi
+  local backup="$STATE_DIR/composition-backup-$(date +%s)"
+  mkdir -p "$backup"
+  cp "$dir/cordis.patch.yml" "$backup/" 2>/dev/null || true
+  if [ -f "$dir/package.json" ]; then cp "$dir/package.json" "$backup/"; fi
+  cp "$snap/cordis.patch.yml" "$dir/cordis.patch.yml"
+  if [ -f "$snap/package.json" ]; then cp "$snap/package.json" "$dir/package.json"; fi
+  echo "[watchdog] restored the last healthy profile composition over $dir (failing inputs backed up to $backup)"
+  return 0
+}
+
 # Roll back to a known-good revision — unless that revision already IS HEAD:
 # the reset would be a commit no-op whose only effect is wiping uncommitted
 # work (a real hazard with concurrent sessions on a shared checkout), so skip
@@ -227,7 +295,7 @@ page_script() {
 const http = require('http');
 const port = Number(process.env.WD_PORT || 3080);
 const wd = Number(process.env.WD_PID);
-http.createServer((req, res) => {
+const handler = (req, res) => {
   if (req.url === '/restart') {
     try { process.kill(wd, 'SIGUSR1'); res.end('retrying...'); }
     catch (e) { res.statusCode = 500; res.end('signal failed: ' + e.message); }
@@ -242,7 +310,31 @@ http.createServer((req, res) => {
     + '<div style="text-align:center"><h2>dsh 服务未能启动</h2>'
     + '<p>看门狗多次尝试仍未拉起服务。点击重试，或查看看门狗日志。</p>'
     + '<form action="/restart"><button style="font-size:18px;padding:10px 28px">重试</button></form></div></body>');
-}).listen(port, '127.0.0.1');
+};
+// An occupied port is the COMMON case at give-up (the boot failures were
+// often EADDRINUSE themselves). Dying on the bind error — an unhandled
+// 'error' event — would return the watchdog's `wait` and drop it back into
+// the boot loop, fighting the healthy occupant it just gave up against
+// (observed 2026-08-30 in an e2e rig: four give-up cycles, the occupant
+// killed over and over). Park instead: retry the bind every 5s; SIGUSR1
+// still re-arms the boot loop.
+let noted = false;
+function bind() {
+  const server = http.createServer(handler);
+  server.on('error', (e) => {
+    if (e && e.code === 'EADDRINUSE') {
+      if (!noted) {
+        noted = true;
+        process.stderr.write('[watchdog] crash page cannot bind :' + port + ' (occupied) — retrying every 5s; SIGUSR1 to ' + wd + ' re-arms the boot loop\n');
+      }
+      setTimeout(bind, 5000);
+      return;
+    }
+    throw e;
+  });
+  server.listen(port, '127.0.0.1');
+}
+bind();
 EOF
 }
 
@@ -266,17 +358,36 @@ if [ "$SUPERVISE" = "1" ]; then
   mkdir -p "$(dirname "$PIDFILE")" 2>/dev/null || true
   claimed=0
   attempt=0
+  empty_reads=0
   while [ "$attempt" -lt 5 ]; do
     attempt=$((attempt + 1))
     if (set -C; echo $$ > "$PIDFILE") 2>/dev/null; then claimed=1; break; fi
     owner=$(cat "$PIDFILE" 2>/dev/null)
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-      echo "[watchdog] already supervised by pid $owner; exiting"
-      exit 0
+    if [ -n "$owner" ]; then
+      if kill -0 "$owner" 2>/dev/null; then
+        echo "[watchdog] already supervised by pid $owner; exiting"
+        exit 0
+      fi
+      # A real but dead claim: safe to drop below.
+      empty_reads=0
+    else
+      # An EMPTY pidfile is a rival's claim mid-write: the noclobber create
+      # and the echo are two disk operations, and a preempted winner sits
+      # between them. Deleting the file here re-opens the race and can
+      # cascade until every racer exhausts its attempts (observed under
+      # deploy-gate load: 8 concurrent racers, zero survivors). Give the
+      # writer a beat to land its pid; only treat the file as abandoned
+      # after several consecutive empty reads.
+      empty_reads=$((empty_reads + 1))
+      if [ "$empty_reads" -le 3 ]; then
+        attempt=$((attempt - 1))
+        sleep 0.2
+        continue
+      fi
     fi
-    # Stale (owner gone) or empty pidfile: drop it and race for the claim
-    # again. Losing that race is correct — the next pass sees a live owner and
-    # exits through the branch above.
+    # Stale (owner gone, or abandoned mid-write): drop it and race for the
+    # claim again. Losing that race is correct — the next pass sees a live
+    # owner and exits through the branch above.
     rm -f "$PIDFILE"
   done
   if [ "$claimed" != "1" ]; then
@@ -293,6 +404,9 @@ failures=0
 reset_done=0
 port_races=0
 yielded=0
+comp_restore_done=0
+comp_restored=0
+comp_restore_detail=''
 
 trap 'retry_on_usrs' USR1
 
@@ -424,7 +538,16 @@ while true; do
         echo "[watchdog] no guard credential/checkpoint recorded; cannot roll back"
       elif failure_subject_outside_repo; then
         # The failure lives outside the checkout (profile overlay, installed
-        # plugin, environment) — reverting the repository cannot fix it.
+        # plugin, environment) — reverting the repository cannot fix it. But
+        # the COMPOSITION can be rolled back: if a healthy-boot snapshot of
+        # the profile inputs exists and differs from the live one, restore it
+        # (unmounting the newest plugin change) and retry with a clean count.
+        if [ "$comp_restore_done" -eq 0 ] && restore_composition; then
+          comp_restore_done=1
+          comp_restored=1
+          failures=0
+          continue
+        fi
         echo "[watchdog] boot failure originates outside $REPO — repository rollback cannot fix it; leaving the checkout untouched"
         reset_done=1
       else
@@ -456,6 +579,13 @@ while true; do
   # Instance is up.
   echo "[watchdog] instance up on :$PORT — instance output: $ATTEMPT_LOG"
   stamp_last_good_boot
+  snapshot_composition
+  if [ "$comp_restored" = "1" ]; then
+    # The boot only succeeded because the composition was rolled back — the
+    # recovery (newest plugin change unmounted) must be reported, not silent.
+    guard_cmd record-composition-recovery --state-dir "$STATE_DIR" --detail "$comp_restore_detail"
+    comp_restored=0
+  fi
 
   # Intentional restart: run the guard canary (credential fresh + HEAD match).
   if [ -f "$RESTART_MARKER" ]; then

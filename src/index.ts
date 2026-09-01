@@ -23,7 +23,13 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 // Type-only: pulls the agent package's event merge ('agent/pre-step').
 import type {} from '@deepseek-ai/dsh-agent'
 import type { AgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
-import { resolveSessionPreset, type PresetBearingSession } from '@deepseek-ai/dsh-agent-presets'
+// Namespace handle for runtime feature detection: the 0.1.2 host replaced
+// the `resolveSessionPreset` free function (and the `PresetBearingSession`
+// type) with the `agentPresetProjectionDefinition` unit, and a STATIC named
+// import of a removed export is a SyntaxError at module load — exactly the
+// failure this dual-host probing exists to survive. The derivation below
+// reads both surfaces through one structural cast.
+import * as agentPresetsHost from '@deepseek-ai/dsh-agent-presets'
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -33,6 +39,7 @@ import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
 import { stateFile } from './state-files.ts'
 import {
   acknowledgeRestartRecord, buildLaunchCommand, continueAndReportText, continueInterruptedText, interruptedSnapshotFile,
+  isParkedOnUserInput,
   writeInstanceLaunch, writeSkillRegistration,
   pendingRestartRecord, readInterruptedSnapshot, restartContextText, writeInterruptedSnapshot,
   type RestartRecord,
@@ -41,6 +48,52 @@ import {
   clearCredential, loadState, recordCredential, setCheckpoint, verifyCredential,
   type GuardState, type VerifyResult,
 } from './state.ts'
+
+/**
+ * The slice of a persisted session the preset derivation reads. Structural
+ * rather than the rc host's `PresetBearingSession`: the 0.1.2 host deleted
+ * that type together with `resolveSessionPreset`.
+ */
+interface PersistedPresetSource {
+  header: { agentPreset?: string | null }
+  events: readonly { type: string; data?: unknown }[]
+}
+
+/**
+ * The two preset-derivation surfaces a host may carry: the rc line exports
+ * `resolveSessionPreset`; the 0.1.2 line replaced it (and the
+ * `PresetBearingSession` type) with the `agentPresetProjectionDefinition`
+ * unit. Probed per call, never from a version string.
+ */
+export interface PresetDerivationSurface {
+  agentPresetProjectionDefinition?: {
+    init(header: { agentPreset?: string | null }): string | null
+    apply(state: string | null, event: { type: string; data?: unknown }): string | null
+  }
+  resolveSessionPreset?: (session: PersistedPresetSource) => string | undefined
+}
+
+/**
+ * Which preset a session actually runs, newest selection winning. The rc host
+ * exports `resolveSessionPreset` for exactly this fold; the 0.1.2 host
+ * replaced it with `agentPresetProjectionDefinition` (init from the header,
+ * fold `agent-preset/selected` events) — same semantics, so the derivation
+ * feature-detects either surface and never touches the version string. A host
+ * with neither yields undefined: the resume falls back to the deployment's
+ * default preset, the same outcome a preset-less session had before.
+ * @param host - the agent-presets module namespace, structurally probed.
+ * @param session - the session's header and event log.
+ * @returns the preset id, or `undefined` when the session names none.
+ */
+export function deriveSessionPreset(host: PresetDerivationSurface, session: PersistedPresetSource): string | undefined {
+  if (host.agentPresetProjectionDefinition !== undefined) {
+    const projection = host.agentPresetProjectionDefinition
+    let state = projection.init(session.header)
+    for (const event of session.events) state = projection.apply(state, event)
+    return state ?? undefined
+  }
+  return host.resolveSessionPreset?.(session)
+}
 
 /** Plugin configuration. */
 export interface SelfRestartGuardConfig {
@@ -173,7 +226,13 @@ export const inject = ['agents']
 
 /** The slice of the skill registry this plugin consumes (optional service). */
 interface SkillRegistrySlice {
-  register: (skill: { name: string; description: string; content: string; source: string }) => () => void
+  register: (skill: {
+    name: string
+    description: string
+    content: string
+    source: string
+    provider?: string
+  }) => () => void
 }
 
 /**
@@ -208,7 +267,13 @@ function registerRestartSkill(ctx: Context, stateDir: string): void {
       writeSkillRegistration(stateDir, { registered: false, reason: 'shipped SKILL.md malformed', at: Date.now() })
       return
     }
-    ctx.effect(() => skills.register({ name, description, content, source: 'runtime' }))
+    ctx.effect(() => skills.register({
+      name,
+      description,
+      content,
+      source: 'runtime',
+      provider: 'ankh-guard',
+    }))
     writeSkillRegistration(stateDir, { registered: true, at: Date.now() })
   } catch (error) {
     ctx.logger.warn(`ankh-guard: shipped SKILL.md unreadable (${String(error)}) — the restart-protocol skill is not registered`)
@@ -286,6 +351,34 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     let disposed = false
     ctx.effect(() => () => { disposed = true })
 
+    // A turn parked on user input (an open ask_user_question call, or an
+    // undecided approval) is not interrupted WORK — the card persists in the
+    // log and the user answers whenever. Auto-continuing it replays the
+    // question and burns a turn for nothing (observed on prod 3080: sessions
+    // parked on question cards were woken on every restart of an upgrade
+    // day). The probe reads the session's repaired log tail; memoized per
+    // boot; a probe failure fails open to the pre-existing behavior.
+    const parkedMemo = new Map<string, Promise<boolean>>()
+    const checkParked = (id: string): Promise<boolean> => {
+      let probe = parkedMemo.get(id)
+      if (probe === undefined) {
+        probe = (async () => {
+          try {
+            const persistence = ctx.get('sessionPersistence') as
+              | { inspect(sessionId: string): Promise<{ events: readonly { type: string; seq?: number; data: Record<string, unknown> }[] }> }
+              | undefined
+            if (persistence === undefined) return false
+            const { events } = await persistence.inspect(id)
+            return isParkedOnUserInput(events)
+          } catch {
+            return false
+          }
+        })()
+        parkedMemo.set(id, probe)
+      }
+      return probe
+    }
+
     const claim = (agent: FollowupAgent, record: RestartRecord): void => {
       const canaryPending = existsSync(stateFile(stateDir, 'restartRequested'))
       const text = restartContextText(record, canaryPending)
@@ -299,33 +392,55 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
 
     // The single delivery path for every resume trigger (this plugin's pass,
     // the UI, the schedule system): an interrupted session gets exactly one
-    // "continue" injection; the restart's initiator gets the report — merged
-    // into one message when it is both. The map makes repeat calls no-ops.
+    // "continue" injection — unless its interrupted turn was parked on user
+    // input, in which case the card in the log is the continuation and no
+    // injection fires; the restart's initiator gets the report — merged into
+    // one message when it is both. The map makes repeat calls no-ops.
     const deliver = (agent: FollowupAgent & { id: unknown }): void => {
       const id = agent.id as string
       const exitAt = pendingContinue.get(id)
       const record = followupReport ? pendingRestartRecord(stateDir) : null
-      if (exitAt !== undefined && record !== null
-        && (record.initiator === undefined || id === record.initiator)) {
-        // The initiator was itself interrupted by its own restart: one
-        // combined turn continues the work AND reports the outcome — two
-        // separate injections would run two near-duplicate turns.
-        const canaryPending = existsSync(stateFile(stateDir, 'restartRequested'))
-        const text = continueAndReportText(record, canaryPending)
-        if (text !== '') {
-          agent.followup(pluginMessage(text))
-          pendingContinue.delete(id)
-          acknowledgeRestartRecord(stateDir, record, Date.now())
-          return
-        }
-        // A record with nothing to report yet (no exitAt/error) must not
-        // swallow the continue — fall through to the continue-only path.
-      }
+      const owesReport = record !== null && (record.initiator === undefined || id === record.initiator)
       if (exitAt !== undefined) {
-        agent.followup(pluginMessage(continueInterruptedText(exitAt)))
-        // Delete only after a successful injection: a throwing followup keeps
-        // the session eligible at its next creation (same rule as claim()).
-        pendingContinue.delete(id)
+        void (async () => {
+          const parked = await checkParked(id)
+          if (disposed || pendingContinue.get(id) !== exitAt) return
+          // Delete before injecting: two resume triggers racing the memoized
+          // probe must not double-inject; a throwing followup re-arms the
+          // session for its next creation (same rule as claim()).
+          pendingContinue.delete(id)
+          if (parked) {
+            // Parked on user input: the card IS the continuation. An owed
+            // report still lands (report-only text, not the merged one).
+            if (owesReport && record !== null) claim(agent, record)
+            return
+          }
+          if (owesReport && record !== null) {
+            // The initiator was itself interrupted by its own restart: one
+            // combined turn continues the work AND reports the outcome — two
+            // separate injections would run two near-duplicate turns.
+            const canaryPending = existsSync(stateFile(stateDir, 'restartRequested'))
+            const text = continueAndReportText(record, canaryPending)
+            if (text !== '') {
+              try {
+                agent.followup(pluginMessage(text))
+                acknowledgeRestartRecord(stateDir, record, Date.now())
+                return
+              } catch {
+                pendingContinue.set(id, exitAt)
+                return
+              }
+            }
+            // A record with nothing to report yet (no exitAt/error) must not
+            // swallow the continue — fall through to the continue-only path.
+          }
+          try {
+            agent.followup(pluginMessage(continueInterruptedText(exitAt)))
+          } catch {
+            pendingContinue.set(id, exitAt)
+          }
+        })()
+        return
       }
       if (record === null) return
       // The report waits for its owner; other sessions are never woken.
@@ -387,11 +502,11 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
         | { resolve(presetId?: string): Promise<{ id: string }>; mount(agentCtx: Context, presetId?: string): Promise<unknown> }
         | undefined
       const persistence = ctx.get('sessionPersistence') as
-        | { inspect(sessionId: string): Promise<{ meta: PresetBearingSession['header']; events: PresetBearingSession['events'] }> }
+        | { inspect(sessionId: string): Promise<{ meta: PersistedPresetSource['header']; events: PersistedPresetSource['events'] }> }
         | undefined
       if (presets !== undefined && persistence !== undefined) {
         const inspected = await persistence.inspect(id)
-        const presetId = resolveSessionPreset({ header: inspected.meta, events: inspected.events })
+        const presetId = deriveSessionPreset(agentPresetsHost as unknown as PresetDerivationSurface, { header: inspected.meta, events: inspected.events })
         setup = async (agentCtx) => { await presets.mount(agentCtx, (await presets.resolve(presetId)).id) }
       }
       return { resumeSessionId: id, agentOptions, ...(setup === undefined ? {} : { setup }) } as ResumeAgentOptions
@@ -427,6 +542,13 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       if (Date.now() - snapshot.exitAt <= resumeMaxSnapshotAgeMs) {
         for (const id of [...new Set([...snapshot.resume, ...snapshot.interrupted])]) {
           if (disposed) return
+          // Parked on user input: the card in the log is the continuation —
+          // do not recreate the agent at all (its creation would fire the
+          // delivery path; deliver() also filters, belt and suspenders).
+          if (await checkParked(id)) {
+            pendingContinue.delete(id)
+            continue
+          }
           const live = ctx.agents.list().find(agent => (agent.id as string) === id)
           if (live !== undefined) {
             // Already live: its `agent/created` may have predated this plugin's

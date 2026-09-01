@@ -33,7 +33,7 @@
  * @module @khorsheed/dsh-ankh-guard/preflight-runner
  */
 
-import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -44,6 +44,18 @@ const PROFILE_ROOT_FILENAME = 'cordis.yml'
 const HOME_PATCH_FILENAME = 'cordis.patch.yml'
 const TELEMETRY_ROW_ID = 'session-telemetry-otel'
 const DSH_HARNESS_ENV = 'DSH_HARNESS'
+
+/**
+ * The empty root entry list every profile tree patches over — the exact
+ * bytes the launcher's prepareProfile rewrites on every boot (the vendored
+ * Loader's tree write-back can bake composed rows into this file, so both
+ * the launcher and this dry-run always start from the empty root).
+ */
+const PROFILE_ROOT_CONFIG = `# dsh profile root — an empty entry list. The tree is composed as patches:
+# each bundle in package.json's dsh.profile.bundles, then cordis.patch.yml, then any
+# --patch overlays. Edit cordis.patch.yml, not this file.
+[]
+`
 
 /** The guarded (or tracking) harness checkout the live instance boots from. */
 export function resolveHarnessRoot(env: Record<string, string | undefined> = process.env): string {
@@ -69,6 +81,19 @@ const HARNESS_PACKAGE_DIRS: Record<string, string> = {
  */
 function canImportTypeScript(): boolean {
   return process.execArgv.some(arg => arg.includes('tsx'))
+}
+
+/**
+ * The module-fallback heal, whose calling convention is the sharpest
+ * composition-layering difference between the supported host lines:
+ * - rc line (through 0.1.1-rc.*): positional, sync, and runs BEFORE the
+ *   profile load (the launcher's prepareProfile heals, then loads);
+ * - 0.1.2 line: an async options object that also links bundle-carried
+ *   packages into the profile, so it runs AFTER the profile load.
+ */
+type HealProfilesModuleFallback = {
+  (installAnchor: string, home?: string): void
+  (options: { installAnchor: string; profile?: unknown; home?: string }): Promise<void>
 }
 
 /**
@@ -125,9 +150,12 @@ export interface PreflightComposition {
 /**
  * Compose one profile's full patch stack through the launcher's layering —
  * bundle layers in `dsh.profile.bundles` order, the profile user layer, the
- * home-level user layer, `--patch` overlays, the agent-presets roots overlay,
- * then the telemetry switch. Exported so the drift tripwire can compare this
- * assembly against the launcher's own dump without booting anything.
+ * home-level user layer, `--patch` overlays, the agent-presets roots overlay
+ * (rc host line only; the 0.1.2 line's preset package self-ships its root),
+ * then the telemetry switch. Two host API generations are mirrored and
+ * feature-detected per run — see the `hostLine` branch below. Exported so
+ * the drift tripwire can compare this assembly against the launcher's own
+ * dump without booting anything.
  * @param profile - the profile name (same resolution as `--profile`).
  * @param patchFiles - `--patch` overlay paths, in argv order.
  * @param root - harness checkout root.
@@ -151,7 +179,7 @@ export async function composePreflightPatches(
     throw new PreflightInfraError(`harness packages unavailable under ${root}: ${String(error)}`, { cause: error })
   }
   const composeEntries = appBoot.composeEntries as (layers: readonly unknown[][], warn?: (msg: string) => void) => Array<{ id?: unknown; config?: Record<string, unknown> }>
-  const healProfilesModuleFallback = appBoot.healProfilesModuleFallback as (anchor: string) => void
+  const healProfilesModuleFallback = appBoot.healProfilesModuleFallback as HealProfilesModuleFallback
   const loadOptionalPatches = appBoot.loadOptionalPatches as (bin: string, file: string) => unknown[] | undefined
   const loadOverlayPatches = appBoot.loadOverlayPatches as (bin: string, file: string) => unknown[]
   const loadProfile = appBoot.loadProfile as (bin: string, name: string, anchor: string, home: string, opts: { userLayer?: boolean }) => {
@@ -168,8 +196,27 @@ export async function composePreflightPatches(
   // the next real boot would have failed).
   const anchor = join(root, 'apps', 'cli', 'package.json')
   const resolvedHome = resolveDshHome(home)
-  healProfilesModuleFallback(anchor)
+  // Which app-boot API generation this host speaks. The 0.1.2 line re-layered
+  // the profile composition: the heal moved behind the async options API and
+  // below the profile load (see HealProfilesModuleFallback), and the launcher
+  // dropped its agent-presets shipped-root overlay because the preset package
+  // now self-ships its root. DEFAULT_PROFILE_PATCH_RELOAD is a value export
+  // only the new line carries, so it is the feature marker; a version parse
+  // would break on exactly the unreleased builds this runner must dry-run.
+  // Both lines stay supported: prod hosts run the rc line until 0.1.2 lands
+  // on npm.
+  const hostLine: 'rc' | '0.1.2' = 'DEFAULT_PROFILE_PATCH_RELOAD' in appBoot ? '0.1.2' : 'rc'
+  if (hostLine === 'rc') healProfilesModuleFallback(anchor, resolvedHome)
   const composed = loadProfile(NAME, profile, anchor, resolvedHome, { userLayer: true })
+  // Mirror prepareProfile: rewrite the empty root config the tree patches
+  // over. The Loader needs the real file to anchor the include, and on a
+  // fresh home (the launcher never booted it) the file does not exist yet —
+  // the dry-run would otherwise fail on exactly the tree a first boot
+  // composes fine.
+  writeFileSync(join(composed.dir, PROFILE_ROOT_FILENAME), PROFILE_ROOT_CONFIG)
+  if (hostLine === '0.1.2') {
+    await healProfilesModuleFallback({ installAnchor: anchor, profile: composed, home: resolvedHome })
+  }
   const homePatches = loadOptionalPatches(NAME, join(resolvedHome, HOME_PATCH_FILENAME)) ?? []
   const overlays = patchFiles.flatMap(file => loadOverlayPatches(NAME, resolve(file)))
   const bundlePatches = composed.layers.flatMap(layer => layer.patches)
@@ -179,12 +226,17 @@ export async function composePreflightPatches(
     if (typeof row.id === 'string') rows.set(row.id, row)
   }
   const composedOverlays = [...overlays]
-  if (rows.has('agent-presets')) {
+  // The launcher's shipped preset root exists only on the rc line — the
+  // 0.1.2 line removed apps/cli/config/agent-presets and lets the preset
+  // package self-ship its root, so the overlay follows the directory, not
+  // the host line.
+  const shippedPresetRoot = join(root, 'apps/cli/config/agent-presets/')
+  if (rows.has('agent-presets') && existsSync(shippedPresetRoot)) {
     composedOverlays.push({
       id: 'agent-presets',
       config: {
         ...(rows.get('agent-presets')?.config ?? {}) as Record<string, unknown>,
-        roots: [{ path: join(root, 'apps/cli/config/agent-presets/'), trust: 'system' }],
+        roots: [{ path: shippedPresetRoot, trust: 'system' }],
       },
     })
   }
@@ -227,6 +279,40 @@ export async function composePreflightPatches(
 interface ClientArtifactRegistry {
   graph(): { entries: Array<{ id: string }> }
   clientPath(id: string): string | undefined
+}
+
+/** The launcher's readiness service shape (0.1.2's `AppReady` in dsh-cmdline). */
+interface AppReady {
+  onReady(listener: () => void): () => void
+}
+
+/**
+ * The launcher's readiness signal, mirrored: 0.1.2's runProfile provides an
+ * `appReady` service through provideCmdline and commits it once boot and host
+ * setup settle. The rc line's provideCmdline ignores the field, so one
+ * implementation serves both host lines.
+ */
+function createAppReadyStub(): { service: AppReady; commit(): void } {
+  let committed = false
+  const listeners = new Set<() => void>()
+  return {
+    service: {
+      onReady(listener) {
+        if (committed) {
+          listener()
+          return () => {}
+        }
+        listeners.add(listener)
+        return () => { listeners.delete(listener) }
+      },
+    },
+    commit() {
+      if (committed) return
+      committed = true
+      for (const listener of [...listeners]) listener()
+      listeners.clear()
+    },
+  }
 }
 
 /** Stat every registered client bundle; report one line per missing/unreadable artifact. */
@@ -280,7 +366,7 @@ export async function runPreflight(
   const boot = appBoot.boot as (bin: string, config: string, patches?: unknown[], prepare?: (ctx: { provide?: (key: string, value: unknown) => void }) => void | Promise<void>) => Promise<{ fiber: { dispose(): Promise<unknown> } }>
   const loadLayeredEnv = appBoot.loadLayeredEnv as (bin: string) => unknown
   const launchEnvironmentKey = launchEnvironment.DSH_LAUNCH_ENVIRONMENT_KEY as string
-  const provideCmdline = cmdline.provideCmdline as (ctx: unknown, options: { args: readonly string[]; exit: () => void }) => void
+  const provideCmdline = cmdline.provideCmdline as (ctx: unknown, options: { args: readonly string[]; exit: () => void; ready?: AppReady }) => void
 
   let environment: unknown
   try {
@@ -307,12 +393,17 @@ export async function runPreflight(
     }
 
     const rootConfig = join(composed.profileDir, PROFILE_ROOT_FILENAME)
+    const appReady = createAppReadyStub()
     // Cloned for the same insert-aliasing reason the launcher documents: boot
     // application mutates rows by reference.
     const ctx = await boot(NAME, rootConfig, structuredClone(patches), (hostCtx) => {
       hostCtx.provide?.(launchEnvironmentKey, environment)
-      provideCmdline(hostCtx, { args: [], exit: () => {} })
+      provideCmdline(hostCtx, { args: [], exit: () => {}, ready: appReady.service })
     })
+    // The launcher commits readiness once boot and host setup settle; a
+    // dry-run's host setup is the no-op cmdline above, so boot settling is
+    // that point.
+    appReady.commit()
     const missing = missingClientArtifacts(ctx)
     // A repeated dispose returns the settled single-shot result when boot
     // already tore the tree down, so this is safe on every path.

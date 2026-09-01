@@ -46,6 +46,10 @@ export const STATE_FILES = {
   instanceLaunch: 'instance-launch.json',
   /** Whether the restart-protocol skill registered at apply (and why not). */
   skillRegistration: 'skill-registration.json',
+  /** Directory: the healthy-boot snapshot of the profile composition inputs. */
+  lastGoodComposition: 'last-good-composition',
+  /** Directory prefix: a failing composition backed up before rollback restores over it. */
+  compositionBackup: 'composition-backup-',
 } as const
 
 /** A STATE_FILES key. */
