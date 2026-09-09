@@ -11,6 +11,7 @@
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { appendTestLifecycleEvent } from './test-seam.ts'
 
 /** Every state-directory file name, keyed by role. */
 export const STATE_FILES = {
@@ -44,6 +45,20 @@ export const STATE_FILES = {
   scheduleExitLog: 'schedule-exit.log',
   /** How the current instance was launched (recorded by the plugin at apply). */
   instanceLaunch: 'instance-launch.json',
+  /** The atomically selected full launch configuration (stable or in cutover). */
+  launchSpec: 'launch-spec.json',
+  /** Redacted durable receipt for the latest launch-configuration cutover. */
+  launchCutover: 'launch-cutover.json',
+  /** Legacy combined operator-control marker, retained for rolling upgrades. */
+  cutoverControl: 'launch-cutover-control.json',
+  /** Operator → watchdog: abort according to the pre-approved recovery policy. */
+  cutoverAbort: 'launch-cutover-abort.json',
+  /** Monotonic stronger operator action: explicitly restore the previous spec. */
+  cutoverRestorePrevious: 'launch-cutover-restore-previous.json',
+  /** Original browser-tab registry: per-tab capability hashes only; retained through terminal recovery. */
+  browserHandoffRequest: 'browser-handoff-request.json',
+  /** Browser → watchdog acknowledgement for one proven final process. */
+  browserHandoffAck: 'browser-handoff-ack.json',
   /** Whether the restart-protocol skill registered at apply (and why not). */
   skillRegistration: 'skill-registration.json',
   /** Directory: the healthy-boot snapshot of the profile composition inputs. */
@@ -75,4 +90,40 @@ export function lastGoodBootRevision(stateDir: string): string | undefined {
   } catch {
     return undefined
   }
+}
+
+/**
+ * Whether the pid named by this raw pid/lock-file content is alive. Empty
+ * content reads as NO holder: Number('') is 0 and kill(0, 0) probes our own
+ * process group (always succeeds), which once read as "alive" and refused
+ * every restart forever — the bug that had to be fixed in two copies of this
+ * logic before it was consolidated here.
+ */
+export function pidAlive(raw: string): boolean {
+  const pid = Number(raw)
+  if (raw === '' || !Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** The live pid named by a pid/lock file (as the raw string), or null when absent/stale. */
+export function livePidIn(file: string): string | null {
+  try {
+    const raw = readFileSync(file, 'utf8').trim()
+    return pidAlive(raw) ? raw : null
+  } catch {
+    return null
+  }
+}
+
+/** The live supervising watchdog's pid, or null when none is (pidfile + kill 0). */
+export function liveWatchdogPid(stateDir: string): number | null {
+  const raw = livePidIn(stateFile(stateDir, 'watchdogPid'))
+  const pid = raw === null ? null : Number(raw)
+  appendTestLifecycleEvent('watchdog-liveness-probe', { pid: pid ?? 0, live: pid !== null }, 'parent-observer')
+  return pid
 }

@@ -3,10 +3,9 @@
  *
  * The guard records one "green build" credential — bound to the git HEAD it
  * was recorded on and to a freshness window — and answers `verify()` against
- * the CURRENT head and wall clock. A self-restart may only proceed while the
- * credential is valid; the binding to HEAD means any tree change after
- * recording invalidates it, so a stale or post-hoc credential can never
- * authorize a restart of unverified code. Framework-free: the cordis plugin,
+ * the CURRENT head and wall clock. A later fully gated boot may promote that
+ * credential into a deployment proof whose exact runtime fingerprint can be
+ * reused by the same-launch restart path. Framework-free: the cordis plugin,
  * the CLI, and the invariant companion all share this module.
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -24,6 +23,30 @@ export interface GuardCredential {
   command: string
 }
 
+/**
+ * Durable proof that one exact deployment passed restart readiness + canary.
+ * Digests contain no command, profile content, or credential values.
+ */
+export interface ProvenDeployment {
+  version: 1
+  provenAt: number
+  credential: {
+    revision: string
+    recordedAt: number
+    scope: string
+    commandSha256: string
+  }
+  fingerprint: {
+    version: 1
+    credentialRevision: string
+    harnessRevision: string
+    launchSpecSha256: string
+    profileSha256: string
+    hostRuntimeSha256: string
+  }
+  fingerprintSha256: string
+}
+
 /** A pre-batch snapshot commit the guard can reset back to. */
 export interface GuardCheckpoint {
   /** Commit SHA of the checkpoint. */
@@ -36,7 +59,7 @@ export interface GuardCheckpoint {
 
 /** Append-only audit trail of state mutations (capped; verify is read-only). */
 export interface GuardAuditEntry {
-  action: 'record' | 'clear' | 'checkpoint'
+  action: 'record' | 'clear' | 'checkpoint' | 'prove-deployment'
   ts: number
   detail: string
 }
@@ -44,6 +67,7 @@ export interface GuardAuditEntry {
 /** The whole persisted state file. */
 export interface GuardState {
   credential?: GuardCredential
+  provenDeployment?: ProvenDeployment
   checkpoint?: GuardCheckpoint
   audit: readonly GuardAuditEntry[]
 }
@@ -79,10 +103,34 @@ function isCheckpoint(value: unknown): value is GuardCheckpoint {
   return typeof c.revision === 'string' && typeof c.recordedAt === 'number' && typeof c.message === 'string'
 }
 
+function isSha256(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+}
+
+function isProvenDeployment(value: unknown): value is ProvenDeployment {
+  if (typeof value !== 'object' || value === null) return false
+  const proof = value as Partial<ProvenDeployment>
+  const credential = proof.credential as Partial<ProvenDeployment['credential']> | undefined
+  const fingerprint = proof.fingerprint as Partial<ProvenDeployment['fingerprint']> | undefined
+  return proof.version === 1 && typeof proof.provenAt === 'number'
+    && credential !== undefined
+    && typeof credential.revision === 'string' && credential.revision !== ''
+    && typeof credential.recordedAt === 'number'
+    && typeof credential.scope === 'string'
+    && isSha256(credential.commandSha256)
+    && fingerprint?.version === 1
+    && typeof fingerprint.credentialRevision === 'string' && fingerprint.credentialRevision !== ''
+    && typeof fingerprint.harnessRevision === 'string' && fingerprint.harnessRevision !== ''
+    && isSha256(fingerprint.launchSpecSha256)
+    && isSha256(fingerprint.profileSha256)
+    && isSha256(fingerprint.hostRuntimeSha256)
+    && isSha256(proof.fingerprintSha256)
+}
+
 function isAuditEntry(value: unknown): value is GuardAuditEntry {
   if (typeof value !== 'object' || value === null) return false
   const e = value as GuardAuditEntry
-  return (e.action === 'record' || e.action === 'clear' || e.action === 'checkpoint')
+  return (e.action === 'record' || e.action === 'clear' || e.action === 'checkpoint' || e.action === 'prove-deployment')
     && typeof e.ts === 'number' && typeof e.detail === 'string'
 }
 
@@ -100,6 +148,7 @@ export function loadState(stateDir: string): GuardState {
     const audit = Array.isArray(parsed.audit) ? parsed.audit.filter(isAuditEntry) : []
     const state: GuardState = { audit }
     if (isCredential(parsed.credential)) state.credential = parsed.credential
+    if (isProvenDeployment(parsed.provenDeployment)) state.provenDeployment = parsed.provenDeployment
     if (isCheckpoint(parsed.checkpoint)) state.checkpoint = parsed.checkpoint
     return state
   } catch (error) {
@@ -142,7 +191,10 @@ export function recordCredential(stateDir: string, input: RecordInput, now: numb
   const credential: GuardCredential = { ...input, recordedAt: now }
   const state = loadState(stateDir)
   const next = withAudit(state, { action: 'record', ts: now, detail: `${input.scope} @ ${input.revision}` })
-  const updated: GuardState = { ...next, credential }
+  // A new proof attempt invalidates the old deployed-runtime proof even when
+  // it happens to target the same HEAD: ignored build outputs may be changing.
+  const { provenDeployment: _oldProof, ...withoutOldProof } = next
+  const updated: GuardState = { ...withoutOldProof, credential }
   saveState(stateDir, updated)
   return updated
 }
@@ -158,6 +210,18 @@ export function clearCredential(stateDir: string, now: number): GuardState {
   const audited = withAudit(state, { action: 'clear', ts: now, detail: 'credential cleared' })
   const updated: GuardState = { audit: audited.audit }
   if (audited.checkpoint !== undefined) updated.checkpoint = audited.checkpoint
+  saveState(stateDir, updated)
+  return updated
+}
+
+/** Persist a deployment proof after the watchdog has completed its canary. */
+export function setProvenDeployment(stateDir: string, proof: ProvenDeployment, now: number): GuardState {
+  const state = loadState(stateDir)
+  const next = withAudit(state, {
+    action: 'prove-deployment', ts: now,
+    detail: `${proof.credential.revision} ${proof.fingerprintSha256.slice(0, 16)}`,
+  })
+  const updated: GuardState = { ...next, provenDeployment: proof }
   saveState(stateDir, updated)
   return updated
 }
@@ -185,6 +249,7 @@ export function setCheckpoint(stateDir: string, input: { revision: string; messa
  * @param currentRevision - the git HEAD of the checkout, or null when unavailable.
  * @param now - epoch milliseconds (injected for deterministic tests).
  * @param maxAgeMinutes - freshness window.
+ * @param workingTreeClean - whether staged, unstaged, and untracked inputs are absent.
  * @returns ok plus a human reason either way.
  */
 export function verifyCredential(
@@ -192,11 +257,18 @@ export function verifyCredential(
   currentRevision: string | null,
   now: number,
   maxAgeMinutes: number,
+  workingTreeClean = true,
 ): VerifyResult {
   const credential = state.credential
   if (credential === undefined) return { ok: false, reason: 'no green-build credential recorded' }
   if (currentRevision === null) {
     return { ok: false, reason: 'current git HEAD unavailable (not inside a git repository?)' }
+  }
+  if (!workingTreeClean) {
+    return {
+      ok: false,
+      reason: 'working tree is dirty (staged, unstaged, or untracked changes exist) — commit or remove them, then rebuild and re-record',
+    }
   }
   if (credential.revision !== currentRevision) {
     return {

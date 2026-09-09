@@ -31,6 +31,12 @@ export interface RestartRecord {
   compositionRecovered?: boolean
   /** What the composition rollback changed (the unmounted rows), for the report. */
   detail?: string
+  /** Durable launch-configuration cutover outcome and receipt location. */
+  cutover?: {
+    id: string
+    outcome: 'target-ready' | 'restored' | 'awaiting-user' | 'prepare-failed'
+    receipt: string
+  }
   reportedAt?: number
 }
 
@@ -86,6 +92,18 @@ export function pendingRestartRecord(stateDir: string): RestartRecord | null {
 export function restartContextText(record: RestartRecord, canaryPending: boolean): string {
   if (record.exitAt === undefined && record.error === undefined) return ''
   const time = record.exitAt !== undefined ? new Date(record.exitAt).toISOString() : '未知时间'
+  if (record.cutover !== undefined) {
+    if (record.cutover.outcome === 'target-ready') {
+      return `[ankh-guard] 服务于 ${time} 完成启动配置切换；新 supervisor 与 child 已接管，应用就绪证明（受保护宿主需要时包含认证交接）和金丝雀均通过。耐久回执：${record.cutover.receipt}。请读取回执中的 PID、配置摘要、认证、重试与恢复字段，并向用户生成最终报告。`
+    }
+    if (record.cutover.outcome === 'restored') {
+      return `[ankh-guard] 服务于 ${time} 尝试切换启动配置失败，但已按重启前批准的策略恢复上一份完整启动配置并重新就绪。耐久回执：${record.cutover.receipt}。请读取回执并向用户报告失败、重试和恢复结果。`
+    }
+    if (record.cutover.outcome === 'awaiting-user') {
+      return `[ankh-guard] 服务于 ${time} 切换启动配置失败；批准的策略是停留等待用户，watchdog 未擅自重置仓库。耐久回执：${record.cutover.receipt}。请读取回执并向用户报告当前等待点。`
+    }
+    return `[ankh-guard] 启动配置切换在停止旧实例前失败，上一份启动配置仍有效。耐久回执：${record.cutover.receipt}。请读取回执并向用户报告准备阶段失败。`
+  }
   if (record.compositionRecovered === true) {
     const what = record.detail !== undefined ? `回滚内容：${record.detail}。` : ''
     return `[ankh-guard] 服务于 ${time} 前后连续启动失败，watchdog 已自动回滚到上次健康的 profile 组合并恢复。${what}原组合已备份到 state 的 composition-backup-* 目录。建议用户修复或卸载相关插件后重新安装验证。请向用户简要回报本次自动恢复与上述建议。`
@@ -120,6 +138,16 @@ export function continueInterruptedText(exitAt: number): string {
 export function continueAndReportText(record: RestartRecord, canaryPending: boolean): string {
   if (record.exitAt === undefined && record.error === undefined) return ''
   const time = record.exitAt !== undefined ? new Date(record.exitAt).toISOString() : '未知时间'
+  if (record.cutover !== undefined) {
+    const outcome = record.cutover.outcome === 'target-ready'
+      ? '新启动配置的应用就绪证明（受保护宿主需要时包含认证交接）与金丝雀均已通过'
+      : record.cutover.outcome === 'restored'
+        ? '目标启动失败，上一份完整启动配置已恢复并重新就绪'
+        : record.cutover.outcome === 'awaiting-user'
+          ? '目标启动失败，watchdog 正按批准策略等待用户'
+          : '切换在停止旧实例前失败，上一份启动配置仍有效'
+    return `[ankh-guard] 服务于 ${time} 发生启动配置切换：${outcome}。你上次正在进行的回合被中断（日志已标记 interrupted）。耐久回执：${record.cutover.receipt}。请检查当前状态并继续未完成的任务，读取回执后向用户报告 supervisor/child PID、配置摘要、认证、重试与恢复结果。`
+  }
   if (record.compositionRecovered === true) {
     return `[ankh-guard] 服务于 ${time} 前后连续启动失败，watchdog 已自动回滚到上次健康的 profile 组合并恢复（最近的插件变更已卸载）。你上次正在进行的回合被中断（日志已标记 interrupted）。请检查当前状态并继续未完成的任务，并向用户简要回报本次自动恢复；若任务已不再适用，简要说明原因后停止。`
   }

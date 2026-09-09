@@ -6,18 +6,23 @@
  * malformed-state check. Deterministic time is injected everywhere the core
  * reads the clock; git calls run against throwaway repositories.
  */
-import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn as nodeSpawn, type SpawnOptions } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { get as httpGet } from 'node:http'
 import { connect, createServer, type AddressInfo, type Server } from 'node:net'
 import { tmpdir, homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import * as selfRestartGuard from '../src/index.ts'
 import { currentHead } from '../src/git.ts'
+import {
+  findOwnedListener, findPidOnPort, processIdentity,
+  processIdentityMatches, signalProcessIdentity,
+} from '../src/processes.ts'
 import { install as installInvariant } from '../src/invariant.ts'
 import {
   acknowledgeRestartRecord, buildLaunchCommand, continueAndReportText, isParkedOnUserInput, pendingRestartRecord,
@@ -25,17 +30,108 @@ import {
   writeInstanceLaunchAsSupervisor, writeInterruptedSnapshot, writeSkillRegistration,
 } from '../src/restart-context.ts'
 import { performExit } from '../src/exit-agent.ts'
+import {
+  cutoverBlocksWake, prepareLaunchCutover, readCutoverControl, readCutoverReceipt, readLaunchState,
+  recordCutoverEvent, selectedLaunchSpec, summarizeLaunchState, writeStableLaunchSpec,
+  type LaunchSpec,
+} from '../src/launch-spec.ts'
 import { envInternals, preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
 import {
   clearCredential, emptyState, loadState, recordCredential, setCheckpoint,
   verifyCredential, type GuardState,
 } from '../src/state.ts'
 import { lastGoodBootRevision, STATE_FILES } from '../src/state-files.ts'
+import {
+  appendTestLifecycleEventForProcess,
+  TEST_PROCESS_PORT_ENV, TEST_PROCESS_ROLE_ENV, TEST_PROCESS_TEMP_ROOT_ENV,
+} from '../src/test-seam.ts'
+import { TestProcessLifecycle } from './helpers/process-lifecycle.ts'
 
 const cleanups: Array<() => void> = []
-afterEach(() => {
-  for (const cleanup of cleanups.splice(0)) cleanup()
+const gracefulStops: Array<() => void> = []
+let lifecycle: TestProcessLifecycle
+const testRegisterBin = fileURLToPath(new URL('../lib/test-seam-cli.js', import.meta.url))
+const testSeamModule = fileURLToPath(new URL('../lib/test-seam.js', import.meta.url))
+
+function stableShard(title: string, count: number): number {
+  const balancedLongCases: Record<string, number> = {
+    'reconfigure restores the complete previous spec after target readiness failures': 0,
+    'rejects a target that exits after authenticated 200 without handing its URL to the browser, then restores previous': 2,
+  }
+  const balanced = balancedLongCases[title]
+  if (balanced !== undefined && balanced < count) return balanced
+  let hash = 0x811c9dc5
+  for (const byte of Buffer.from(title)) {
+    hash ^= byte
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash % count
+}
+
+const superviseIt = ((title: string, ...args: unknown[]) => {
+  const count = Number(process.env.ANKH_GUARD_TEST_SHARD_COUNT ?? '1')
+  const index = Number(process.env.ANKH_GUARD_TEST_SHARD_INDEX ?? '0')
+  const selected = Number.isInteger(count) && count > 0 && Number.isInteger(index) && index >= 0 && index < count
+    && stableShard(title, count) === index
+  return Reflect.apply(selected ? it : it.skip, undefined, [title, ...args])
+}) as typeof it
+
+beforeEach(() => {
+  lifecycle = new TestProcessLifecycle(testRegisterBin)
 })
+
+afterEach(async (context) => {
+  if (context.task.result?.state === 'fail') lifecycle.retainEvidence()
+  for (const stop of gracefulStops.splice(0)) stop()
+  let lifecycleError: unknown
+  try {
+    await lifecycle.teardown()
+  } catch (error) {
+    lifecycleError = error
+  }
+  for (const cleanup of cleanups.splice(0)) cleanup()
+  if (lifecycleError !== undefined) throw lifecycleError
+})
+
+/** Every child spawned by this file is immediately identity-registered. */
+function spawn(command: string, args: readonly string[], options: SpawnOptions = {}): ReturnType<typeof nodeSpawn> {
+  const role = options.env?.[TEST_PROCESS_ROLE_ENV]
+    ?? `fixture-${command.split('/').pop() ?? 'process'}-${args[0]?.split('/').pop() ?? 'child'}`
+  const portText = options.env?.[TEST_PROCESS_PORT_ENV]
+  const port = portText === undefined ? undefined : Number(portText)
+  const tempRoot = options.env?.[TEST_PROCESS_TEMP_ROOT_ENV]
+  const child = nodeSpawn(command, [...args], {
+    ...options,
+    env: lifecycle.childEnv(role, options.env ?? process.env, {
+      ...(Number.isInteger(port) && (port ?? 0) > 0 ? { port } : {}),
+      ...(tempRoot === undefined || tempRoot === '' ? {} : { tempRoot }),
+    }),
+  })
+  lifecycle.track(child, role, {
+    ...(Number.isInteger(port) && (port ?? 0) > 0 ? { port } : {}),
+    ...(tempRoot === undefined || tempRoot === '' ? {} : { tempRoot }),
+  })
+  return child
+}
+
+function spawnPortRuntime(command: string, args: readonly string[], port: number, options: SpawnOptions = {}): ReturnType<typeof nodeSpawn> {
+  return spawn(command, args, {
+    ...options,
+    env: lifecycle.childEnv('fixture-port-runtime', options.env ?? process.env, { port }),
+  })
+}
+
+/** Freeze one captured identity for a fixture without ever leaving a reused PID stopped. */
+function freezeFixtureIdentity(identity: NonNullable<ReturnType<typeof processIdentity>>): 'frozen' | 'gone' | 'mismatch' {
+  try {
+    process.kill(identity.pid, 'SIGSTOP')
+  } catch {
+    return 'gone'
+  }
+  if (processIdentityMatches(identity)) return 'frozen'
+  try { process.kill(identity.pid, 'SIGCONT') } catch { /* already gone */ }
+  return 'mismatch'
+}
 
 function tmpDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
@@ -67,6 +163,13 @@ function commitChange(repoDir: string): void {
 
 const NOW = 1_000_000
 
+function fakeOwnership(childPid: number, listenerPid = childPid) {
+  return {
+    childPid, childStartToken: `child-start-${childPid}`,
+    listenerPid, listenerStartToken: `listener-start-${listenerPid}`,
+  }
+}
+
 /**
  * A currently-free loopback port: bind 0, read the assignment, close. The
  * rebind race after close is far smaller than the alternative — a random
@@ -74,13 +177,7 @@ const NOW = 1_000_000
  * red teaches its owners to ignore it.
  */
 async function freePort(): Promise<number> {
-  const server = await new Promise<Server>((resolve) => {
-    const s = createServer(() => {})
-    s.listen(0, '127.0.0.1', () => { resolve(s) })
-  })
-  const port = (server.address() as AddressInfo).port
-  await new Promise<void>((resolve) => { server.close(() => { resolve() }) })
-  return port
+  return await lifecycle.acquirePort()
 }
 
 /**
@@ -97,9 +194,49 @@ async function freePort(): Promise<number> {
 function watchdogEnv(overrides: Record<string, string>): NodeJS.ProcessEnv {
   return {
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('WD_'))),
+    WD_READY_STABILITY_SECONDS: '1',
+    ...(overrides.WD_PORT === undefined ? {} : { [TEST_PROCESS_PORT_ENV]: overrides.WD_PORT }),
     ...overrides,
   }
 }
+
+describe('process ownership discovery', () => {
+  it('uses the absolute lsof fallback when PATH omits /usr/sbin and traces the listener to the supervisor child root', async () => {
+    const port = await freePort()
+    const serverProgram = `require('http').createServer((q,s)=>s.end('owned')).listen(${port},'127.0.0.1')`
+    const wrapperProgram = `const {spawn}=require('child_process');spawn(process.execPath,['-e',${JSON.stringify(serverProgram)}],{stdio:'ignore'});setInterval(()=>{},1000)`
+    const supervisorProgram = `const {spawn}=require('child_process');spawn(process.execPath,['-e',${JSON.stringify(wrapperProgram)}],{stdio:'ignore'});setInterval(()=>{},1000)`
+    const supervisor = spawn(process.execPath, ['-e', supervisorProgram], { stdio: 'ignore' })
+    await waitForPort(port)
+    const previousPath = process.env.PATH
+    process.env.PATH = '/usr/bin:/bin'
+    try {
+      expect(findPidOnPort(port)).not.toBeNull()
+      const owned = findOwnedListener(port, supervisor.pid!)
+      expect(owned).not.toBeNull()
+      expect(owned?.child.pid).not.toBe(supervisor.pid)
+      expect(owned?.child.pid).not.toBe(owned?.listener.pid)
+      expect(owned?.listener.pid).toBe(Number(findPidOnPort(port)))
+      expect(processIdentityMatches(owned!.child)).toBe(true)
+      expect(processIdentityMatches(owned!.listener)).toBe(true)
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH
+      else process.env.PATH = previousPath
+      lifecycle.signal(supervisor, 'SIGKILL')
+      await killListener(port)
+    }
+  }, 15_000)
+
+  it('freezes and revalidates before signalling an identity mismatch', async () => {
+    const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const identity = processIdentity(child.pid!)
+    expect(identity).not.toBeNull()
+    expect(signalProcessIdentity({ ...identity!, startToken: `${identity!.startToken}-recycled` }, 'SIGTERM')).toBe('mismatch')
+    expect(processIdentityMatches(identity!)).toBe(true)
+    expect(signalProcessIdentity(identity!, 'SIGTERM')).toBe('signalled')
+  })
+})
 
 describe('state core', () => {
   it('records a credential and verifies it while fresh on the same revision', () => {
@@ -169,6 +306,8 @@ describe('state core', () => {
     expect(registrations.map(skill => skill.name)).toEqual(['dsh-self-restart-guard'])
     expect(registrations[0]?.description).toContain('restart')
     expect(registrations[0]?.content).toContain('check-env')
+    expect(registrations[0]?.content).toContain('timeoutMs: 180000')
+    expect(registrations[0]?.content).toContain('Caller timeout is not a guard verdict')
     // The shipped skill must not carry machine-specific paths from the
     // development environment it was written on.
     expect(registrations[0]?.content).not.toContain('code/dsh-plugins')
@@ -235,6 +374,250 @@ describe('state core', () => {
   })
 })
 
+describe('durable launch cutover state', () => {
+  const spec = (command: string, root: string): LaunchSpec => ({
+    version: 1,
+    command,
+    port: 3080,
+    home: join(root, 'home'),
+    credentialRepo: join(root, 'credential-repo'),
+    harnessRoot: join(root, 'harness-root'),
+    profile: 'web',
+  })
+
+  it('atomically selects target, records a credential-free receipt, then compacts to stable target', () => {
+    const stateDir = tmpDir('guard-cutover-')
+    const previous = spec('node previous-host.js --opaque previous-value', stateDir)
+    const target = spec('node target-host.js --opaque target-value', stateDir)
+    writeStableLaunchSpec(stateDir, previous)
+
+    prepareLaunchCutover(stateDir, {
+      id: 'cutover-1', previous, target,
+      recoveryPolicy: 'restore-previous', browserHandoff: 'required',
+      previousSupervisorPid: 101, previousSupervisorStartToken: 'supervisor-start-101', previousOwnership: fakeOwnership(102, 103),
+      initiator: 'session-owner', now: NOW,
+    })
+    const active = readLaunchState(stateDir)
+    expect(active?.mode).toBe('cutover')
+    expect(active === null ? null : selectedLaunchSpec(active)).toEqual(target)
+    expect(cutoverBlocksWake(stateDir)).toBe(true)
+
+    recordCutoverEvent(stateDir, 'cutover-1', 'driver-started', ['201', 'driver-start-201'], NOW + 1)
+    recordCutoverEvent(stateDir, 'cutover-1', 'supervisor-ready', ['202', 'supervisor-start-202'], NOW + 2)
+    recordCutoverEvent(stateDir, 'cutover-1', 'child-started', ['target', '1', '203', 'target-start-203'], NOW + 3)
+    recordCutoverEvent(stateDir, 'cutover-1', 'transport', ['401'], NOW + 4)
+    recordCutoverEvent(stateDir, 'cutover-1', 'launch-url', [], NOW + 5)
+    recordCutoverEvent(stateDir, 'cutover-1', 'auth-exchange', ['303'], NOW + 6)
+    recordCutoverEvent(stateDir, 'cutover-1', 'authenticated', ['200'], NOW + 7)
+    recordCutoverEvent(stateDir, 'cutover-1', 'ownership-stable', ['target', '203', 'target-start-203', '204', 'listener-start-204', '3000', '0'], NOW + 8)
+    recordCutoverEvent(stateDir, 'cutover-1', 'canary', ['pass'], NOW + 9)
+    recordCutoverEvent(stateDir, 'cutover-1', 'browser-handoff', ['acknowledged', 'original-tab', 'launch-url', '127.0.0.1:3080'], NOW + 10)
+    writeFileSync(join(stateDir, STATE_FILES.lastRestart), JSON.stringify({ exitAt: 1, unexpected: true, reportedAt: 2 }))
+    recordCutoverEvent(stateDir, 'cutover-1', 'ready', ['target'], NOW + 11)
+
+    const stable = readLaunchState(stateDir)
+    expect(stable).toEqual({ version: 1, mode: 'stable', active: target })
+    expect(cutoverBlocksWake(stateDir)).toBe(false)
+    const receipt = readCutoverReceipt(stateDir)
+    expect(receipt).toMatchObject({
+      phase: 'ready',
+      supervisor: {
+        previousPid: 101,
+        previousStartToken: 'supervisor-start-101',
+        targetDriverPid: 201,
+        targetDriverStartToken: 'driver-start-201',
+        targetPid: 202,
+        targetStartToken: 'supervisor-start-202',
+      },
+      child: { previousPid: 102, targetPid: 203 },
+      ownership: {
+        previous: fakeOwnership(102, 103),
+        target: { childPid: 203, childStartToken: 'target-start-203', listenerPid: 204, listenerStartToken: 'listener-start-204' },
+      },
+      readiness: { role: 'target', childPid: 203, listenerPid: 204, stableWindowMs: 3000, retryCount: 0 },
+      authentication: {
+        transportStatus: 401, launchUrlObserved: true, exchangeStatus: 303,
+        authenticatedStatus: 200, browserHandoff: 'acknowledged',
+      },
+      browserHandoff: {
+        required: true, status: 'acknowledged', channel: 'original-tab',
+        authentication: 'launch-url', authority: '127.0.0.1:3080', acknowledgedAt: NOW + 10,
+      },
+      canary: { outcome: 'pass' },
+      recovery: { policy: 'restore-previous', result: 'not-needed' },
+    })
+    const durableReceipt = readFileSync(join(stateDir, STATE_FILES.launchCutover), 'utf8')
+    expect(durableReceipt).not.toContain(previous.command)
+    expect(durableReceipt).not.toContain(target.command)
+    expect(statSync(join(stateDir, STATE_FILES.launchSpec)).mode & 0o777).toBe(0o600)
+    const restartRecord = JSON.parse(readFileSync(join(stateDir, STATE_FILES.lastRestart), 'utf8'))
+    expect(restartRecord.cutover).toEqual({ id: 'cutover-1', outcome: 'target-ready', receipt: join(stateDir, STATE_FILES.launchCutover) })
+    expect(restartRecord).toMatchObject({ initiator: 'session-owner', pid: 102 })
+    expect(restartRecord.reportedAt).toBeUndefined()
+    expect(restartRecord.unexpected).toBeUndefined()
+  })
+
+  it('restores the complete previous launch specification as one selected unit', () => {
+    const stateDir = tmpDir('guard-cutover-')
+    const previous = spec('node previous-host.js', join(stateDir, 'previous-root'))
+    const target = { ...spec('node target-host.js', join(stateDir, 'target-root')), profile: 'next-web' }
+    prepareLaunchCutover(stateDir, {
+      id: 'cutover-restore', previous, target,
+      recoveryPolicy: 'restore-previous', browserHandoff: 'off',
+      previousSupervisorPid: 301, previousSupervisorStartToken: 'supervisor-start-301', previousOwnership: fakeOwnership(300), now: NOW,
+    })
+    recordCutoverEvent(stateDir, 'cutover-restore', 'child-started', ['target', '1', '302', 'target-start-302'], NOW + 1)
+    recordCutoverEvent(stateDir, 'cutover-restore', 'ownership-stable', ['target', '302', 'target-start-302', '305', 'listener-start-305', '3000', '0'], NOW + 2)
+    recordCutoverEvent(stateDir, 'cutover-restore', 'canary', ['target', 'fail', 'target credential rejected'], NOW + 3)
+    recordCutoverEvent(stateDir, 'cutover-restore', 'attempt-failed', ['target', '1', 'readiness failed'], NOW + 4)
+    recordCutoverEvent(stateDir, 'cutover-restore', 'restoring', ['approved full-spec recovery'], NOW + 5)
+    expect(readLaunchState(stateDir)).toMatchObject({ mode: 'cutover', selected: 'previous' })
+    recordCutoverEvent(stateDir, 'cutover-restore', 'child-started', ['previous', '1', '303', 'previous-start-303'], NOW + 6)
+    recordCutoverEvent(stateDir, 'cutover-restore', 'ownership-stable', ['previous', '303', 'previous-start-303', '304', 'listener-start-304', '3000', '0'], NOW + 7)
+    recordCutoverEvent(stateDir, 'cutover-restore', 'canary', ['previous', 'skipped', 'target credential is unrelated'], NOW + 8)
+    recordCutoverEvent(stateDir, 'cutover-restore', 'ready', ['previous'], NOW + 9)
+
+    expect(readLaunchState(stateDir)).toEqual({ version: 1, mode: 'stable', active: previous })
+    expect(readCutoverReceipt(stateDir)).toMatchObject({
+      phase: 'restored', child: { restoredPid: 303 },
+      recovery: {
+        policy: 'restore-previous', result: 'restored',
+        validation: { canary: { outcome: 'skipped' }, readiness: { role: 'previous' } },
+      },
+      targetValidation: { canary: { outcome: 'fail', detail: 'target credential rejected' } },
+    })
+    expect(readCutoverReceipt(stateDir)?.canary).toBeUndefined()
+    expect(JSON.parse(readFileSync(join(stateDir, STATE_FILES.lastRestart), 'utf8')).cutover.outcome).toBe('restored')
+  })
+
+  it('refuses terminal ready until ownership is stable, browser handoff is complete, and canary passes', () => {
+    const stateDir = tmpDir('guard-cutover-proof-')
+    const previous = spec('node previous-host.js', stateDir)
+    const target = spec('node target-host.js', stateDir)
+    prepareLaunchCutover(stateDir, {
+      id: 'cutover-proof', previous, target,
+      recoveryPolicy: 'restore-previous', browserHandoff: 'required',
+      previousSupervisorPid: 801, previousSupervisorStartToken: 'supervisor-start-801', previousOwnership: fakeOwnership(802, 803), now: NOW,
+    })
+    recordCutoverEvent(stateDir, 'cutover-proof', 'child-started', ['target', '1', '804', 'target-start-804'], NOW + 1)
+    recordCutoverEvent(stateDir, 'cutover-proof', 'launch-url', [], NOW + 2)
+    expect(() => recordCutoverEvent(stateDir, 'cutover-proof', 'ready', ['target'], NOW + 3)).toThrow(/ownership was not stable/)
+    expect(() => recordCutoverEvent(
+      stateDir, 'cutover-proof', 'ownership-stable',
+      ['target', '804', 'target-start-804', '805', 'listener-start-805', '3000', '1'], NOW + 4,
+    )).toThrow(/retry count must be zero/)
+    recordCutoverEvent(
+      stateDir, 'cutover-proof', 'ownership-stable',
+      ['target', '804', 'target-start-804', '805', 'listener-start-805', '3000', '0'], NOW + 5,
+    )
+    expect(() => recordCutoverEvent(
+      stateDir, 'cutover-proof', 'browser-handoff',
+      ['acknowledged', 'original-tab', 'existing-cookie', '127.0.0.1:3080'], NOW + 6,
+    )).toThrow(/canary has not passed/)
+    expect(() => recordCutoverEvent(stateDir, 'cutover-proof', 'ready', ['target'], NOW + 6)).toThrow(/canary has not passed/)
+    recordCutoverEvent(stateDir, 'cutover-proof', 'canary', ['pass'], NOW + 7)
+    expect(() => recordCutoverEvent(stateDir, 'cutover-proof', 'ready', ['target'], NOW + 8)).toThrow(/no browser acknowledgement/)
+    recordCutoverEvent(stateDir, 'cutover-proof', 'browser-handoff', ['acknowledged', 'original-tab', 'existing-cookie', '127.0.0.1:3080'], NOW + 9)
+    expect(recordCutoverEvent(stateDir, 'cutover-proof', 'ready', ['target'], NOW + 10).phase).toBe('ready')
+  })
+
+  it('does not upgrade a legacy opener-success receipt into a page acknowledgement', () => {
+    const stateDir = tmpDir('guard-cutover-legacy-browser-')
+    const previous = spec('node previous-host.js', stateDir)
+    const target = spec('node target-host.js', stateDir)
+    prepareLaunchCutover(stateDir, {
+      id: 'cutover-legacy-browser', previous, target,
+      recoveryPolicy: 'restore-previous', browserHandoff: 'required',
+      previousSupervisorPid: 901, previousSupervisorStartToken: 'supervisor-start-901',
+      previousOwnership: fakeOwnership(902, 903), now: NOW,
+    })
+    const file = join(stateDir, STATE_FILES.launchCutover)
+    const legacy = JSON.parse(readFileSync(file, 'utf8'))
+    legacy.phase = 'ready'
+    legacy.authentication.browserHandoff = 'accepted'
+    delete legacy.browserHandoff
+    writeFileSync(file, JSON.stringify(legacy))
+
+    expect(readCutoverReceipt(stateDir)).toMatchObject({
+      phase: 'ready',
+      authentication: { browserHandoff: 'fallback-opened' },
+      browserHandoff: { required: true, status: 'fallback-opened' },
+    })
+  })
+
+  it('gates target and previous launch events on the filesystem transition phase', () => {
+    const stateDir = tmpDir('guard-cutover-transition-')
+    const previous = spec('node previous-host.js', stateDir)
+    const target = spec('node target-host.js', stateDir)
+    const transition = {
+      version: 1 as const,
+      planPath: join(stateDir, 'launch-transitions/cutover-transition/plan.json'),
+      planSha256: 'a'.repeat(64),
+      operationCount: 1,
+    }
+    prepareLaunchCutover(stateDir, {
+      id: 'cutover-transition', previous, target, transition,
+      recoveryPolicy: 'restore-previous', browserHandoff: 'off',
+      previousSupervisorPid: 1001, previousSupervisorStartToken: 'supervisor-start-1001',
+      previousOwnership: fakeOwnership(1002, 1003), now: NOW,
+    })
+
+    expect(() => recordCutoverEvent(
+      stateDir, 'cutover-transition', 'child-started', ['target', '1', '1004', 'target-start-1004'], NOW + 1,
+    )).toThrow(/transition has not been applied/)
+    expect(() => recordCutoverEvent(
+      stateDir, 'cutover-transition', 'transition', ['applied', 'b'.repeat(64)], NOW + 2,
+    )).toThrow(/digest does not match/)
+    recordCutoverEvent(stateDir, 'cutover-transition', 'transition', ['applied', transition.planSha256], NOW + 3)
+    recordCutoverEvent(
+      stateDir, 'cutover-transition', 'child-started', ['target', '1', '1004', 'target-start-1004'], NOW + 4,
+    )
+    recordCutoverEvent(
+      stateDir, 'cutover-transition', 'attempt-failed', ['target', '1', 'target failed'], NOW + 5,
+    )
+    expect(() => recordCutoverEvent(
+      stateDir, 'cutover-transition', 'restoring', ['approved recovery'], NOW + 6,
+    )).toThrow(/has not been rolled back/)
+
+    recordCutoverEvent(stateDir, 'cutover-transition', 'transition', ['rolled-back', transition.planSha256], NOW + 7)
+    expect(() => recordCutoverEvent(
+      stateDir, 'cutover-transition', 'transition', ['applied', transition.planSha256], NOW + 8,
+    )).toThrow(/cannot be applied/)
+    recordCutoverEvent(stateDir, 'cutover-transition', 'restoring', ['approved recovery'], NOW + 9)
+    recordCutoverEvent(
+      stateDir, 'cutover-transition', 'child-started', ['previous', '1', '1005', 'previous-start-1005'], NOW + 10,
+    )
+
+    expect(readCutoverReceipt(stateDir)).toMatchObject({ transition: {
+      planSha256: transition.planSha256,
+      operationCount: 1,
+      phase: 'rolled-back',
+    } })
+    const rendered = JSON.stringify(summarizeLaunchState(readLaunchState(stateDir)))
+    expect(rendered).not.toContain(transition.planPath)
+    expect(rendered).toContain(transition.planSha256)
+  })
+
+  it('summarizes launch state without exposing either command', () => {
+    const stateDir = tmpDir('guard-cutover-')
+    const previous = spec('do-not-print-previous-command', stateDir)
+    const target = spec('do-not-print-target-command', stateDir)
+    prepareLaunchCutover(stateDir, {
+      id: 'cutover-summary', previous, target,
+      recoveryPolicy: 'wait-for-user', browserHandoff: 'required',
+      previousSupervisorPid: 401, previousSupervisorStartToken: 'supervisor-start-401', previousOwnership: fakeOwnership(402), now: NOW,
+    })
+    const rendered = JSON.stringify(summarizeLaunchState(readLaunchState(stateDir)))
+    expect(rendered).not.toContain(previous.command)
+    expect(rendered).not.toContain(target.command)
+    expect(rendered).toContain('commandSha256')
+    // Receipt-first preparation can crash before the launch-state commit. An
+    // orphan nonterminal receipt must not gate a still-stable deployment.
+    writeStableLaunchSpec(stateDir, previous)
+    expect(cutoverBlocksWake(stateDir)).toBe(false)
+  })
+})
+
 describe('cordis service (real git repo)', () => {
   it('record → verify → mutate → verify-denied → checkpoint → reset round trip', async () => {
     const repo = makeRepo()
@@ -283,6 +666,12 @@ function cliIo(): { out: string[]; err: string[]; io: CliIo } {
   return { out, err, io: { stdout: l => out.push(l), stderr: l => err.push(l) } }
 }
 
+/** Mark this test process as the live watchdog owner for gate-only CLI tests. */
+function markLiveWatchdog(stateDir: string): void {
+  mkdirSync(stateDir, { recursive: true })
+  writeFileSync(join(stateDir, STATE_FILES.watchdogPid), String(process.pid))
+}
+
 /** Set or unset $DSH_PREFLIGHT_COMMAND, restored after the test. `undefined` restores real app-bin resolution. */
 function stubPreflight(command: string | undefined): void {
   const previous = process.env.DSH_PREFLIGHT_COMMAND
@@ -308,6 +697,24 @@ function stubPreflightRunner(resolveRunner: (harnessRoot: string) => string | un
   cleanups.push(() => { preflightInternals.resolveRunner = original })
 }
 
+/** Explicit built-surface binding for reconfigure tests that do not exercise the real runner. */
+function boundPreflightArgs(candidateProbeCommand = 'true', observedHarnessFile?: string): string[] {
+  const root = tmpDir('guard-bound-preflight-')
+  const installAnchor = join(root, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+  const runner = join(root, 'preflight-runner.js')
+  mkdirSync(join(root, 'node_modules', '@deepseek-ai', 'dsh'), { recursive: true })
+  writeFileSync(installAnchor, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.0.0-test' }))
+  writeFileSync(runner, observedHarnessFile === undefined
+    ? 'process.exit(0)\n'
+    : `require('node:fs').writeFileSync(${JSON.stringify(observedHarnessFile)}, process.env.DSH_HARNESS ?? '')\n`)
+  return [
+    '--preflight-surface', 'built',
+    '--preflight-runner', runner,
+    '--preflight-install-anchor', installAnchor,
+    '--candidate-probe-command', candidateProbeCommand,
+  ]
+}
+
 /** Fake the sandbox probe, restored after the test. */
 function stubSandboxProbe(sandboxed: boolean): void {
   const original = envInternals.sandboxedByProbe
@@ -318,6 +725,376 @@ function stubSandboxProbe(sandboxed: boolean): void {
 describe('CLI', () => {
   const io = cliIo
 
+  it('initializes launch state once and prints only redacted launch summaries', async () => {
+    const repo = makeRepo()
+    const home = tmpDir('guard-launch-home-')
+    const stateDir = join(home, 'state')
+    const firstCommand = 'do-not-print-first-launch-command'
+    const replacementCommand = 'do-not-print-replacement-launch-command'
+    expect(await runCli([
+      'configure-launch', '--port', '3080', '--start', firstCommand,
+      '--home', home, '--profile', 'web', '--state-dir', stateDir, '--repo', repo,
+      '--harness-root', join(home, 'host-current'),
+      ...boundPreflightArgs(),
+    ], io().io)).toBe(0)
+    expect(await runCli([
+      'configure-launch', '--if-absent', '--port', '3080', '--start', replacementCommand,
+      '--home', home, '--profile', 'web', '--state-dir', stateDir, '--repo', repo,
+      '--harness-root', join(home, 'host-replacement'),
+      ...boundPreflightArgs(),
+    ], io().io)).toBe(0)
+    expect(selectedLaunchSpec(readLaunchState(stateDir)!).command).toBe(firstCommand)
+    expect(selectedLaunchSpec(readLaunchState(stateDir)!).preflight).toMatchObject({
+      surface: 'built',
+      candidateProbeProvenance: 'caller-supplied',
+      targetCommandSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      runnerSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })
+
+    const status = io()
+    expect(await runCli(['launch-status', '--state-dir', stateDir], status.io)).toBe(0)
+    const text = status.out.join('')
+    expect(text).not.toContain(firstCommand)
+    expect(text).not.toContain(replacementCommand)
+    expect(text).toContain('commandSha256')
+    expect(text).toContain('targetCommandSha256')
+    expect(text).toContain('runnerSha256')
+  })
+
+  it('refuses to invent a complete previous spec from the legacy instance-launch record', async () => {
+    const stateDir = tmpDir('guard-legacy-launch-')
+    const home = tmpDir('guard-legacy-home-')
+    const targetRepo = makeRepo()
+    writeInstanceLaunchAsSupervisor(stateDir, {
+      command: 'legacy-current-command', source: 'supervisor', supervised: true, port: 3080, recordedAt: NOW,
+    })
+    const result = io()
+    expect(await runCli([
+      'reconfigure', '--start', 'target-command', '--on-failure', 'restore-previous',
+      '--port', '3080', '--home', home, '--repo', targetRepo,
+      '--harness-root', join(home, 'target-harness'), '--profile', 'web', '--state-dir', stateDir,
+    ], result.io)).toBe(2)
+    expect(result.err.join('')).toContain('legacy instance-launch record does not identify credential repo, host root, home, and profile independently')
+    expect(result.err.join('')).toContain('configure-launch')
+    expect(readLaunchState(stateDir)).toBeNull()
+  })
+
+  it('uses target credential repo for the gate and target harness root for reconfigure preflight', async () => {
+    const stateDir = tmpDir('guard-split-roots-')
+    const previousRepo = makeRepo()
+    const targetRepo = makeRepo()
+    const previousHarness = tmpDir('guard-previous-harness-')
+    const targetHarness = tmpDir('guard-target-harness-')
+    const home = tmpDir('guard-split-home-')
+    writeStableLaunchSpec(stateDir, {
+      version: 1,
+      command: 'previous-command',
+      port: 3080,
+      home,
+      credentialRepo: previousRepo,
+      harnessRoot: previousHarness,
+      profile: 'web',
+    })
+    recordCredential(stateDir, {
+      scope: 'target build+test', revision: currentHead(targetRepo)!, command: 'pnpm test',
+    }, Date.now())
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(join(stateDir, STATE_FILES.watchdogPid), String(process.pid))
+    // Stop after the two independent gates and before any cutover mutation.
+    writeFileSync(join(stateDir, STATE_FILES.restartLock), String(process.pid))
+    stubSandboxProbe(false)
+    stubPreflight(undefined)
+    const observedHarnessFile = join(stateDir, 'observed-harness')
+
+    const result = io()
+    expect(await runCli([
+      'reconfigure', '--start', 'target-command', '--on-failure', 'restore-previous',
+      '--repo', targetRepo, '--harness-root', targetHarness,
+      '--state-dir', stateDir,
+      ...boundPreflightArgs('true', observedHarnessFile),
+    ], result.io)).toBe(1)
+    expect(result.out.join('')).toContain('composition preflight PASS')
+    expect(result.err.join('')).toContain('restart is in flight')
+    expect(readFileSync(observedHarnessFile, 'utf8')).toBe(targetHarness)
+    expect(selectedLaunchSpec(readLaunchState(stateDir)!)).toMatchObject({
+      credentialRepo: previousRepo,
+      harnessRoot: previousHarness,
+    })
+  })
+
+  it('binds a candidate command probe to the target command and refuses before cutover when target argv is invalid', async () => {
+    const stateDir = tmpDir('guard-candidate-probe-')
+    const repo = makeRepo()
+    const home = tmpDir('guard-candidate-home-')
+    writeStableLaunchSpec(stateDir, {
+      version: 1, command: 'previous-command', port: 3080, home,
+      credentialRepo: repo, harnessRoot: home, profile: 'web',
+    })
+    recordCredential(stateDir, {
+      scope: 'target build+test', revision: currentHead(repo)!, command: 'pnpm test',
+    }, Date.now())
+    markLiveWatchdog(stateDir)
+    stubSandboxProbe(false)
+
+    const result = io()
+    expect(await runCli([
+      'reconfigure', '--start', 'dsh web --profile web-target',
+      '--on-failure', 'restore-previous', '--state-dir', stateDir, '--repo', repo,
+      ...boundPreflightArgs(`"${process.execPath}" -e "console.error('unknown option --profile http://127.0.0.1:3080/?token=one-time-secret'); process.exit(2)"`),
+    ], result.io)).toBe(1)
+    expect(result.err.join('')).toContain('candidate command probe failed')
+    expect(result.err.join('')).toContain('unknown option --profile')
+    expect(result.err.join('')).toContain('token=<redacted>')
+    expect(result.err.join('')).not.toContain('one-time-secret')
+    expect(readLaunchState(stateDir)).toMatchObject({ mode: 'stable', active: { command: 'previous-command' } })
+    expect(readCutoverReceipt(stateDir)).toBeNull()
+  })
+
+  it('refuses a dangling snapshot link before running the candidate or stopping previous', async () => {
+    const stateDir = tmpDir('guard-snapshot-dangling-state-')
+    const repo = makeRepo()
+    const home = tmpDir('guard-snapshot-dangling-home-')
+    const candidateMarker = join(stateDir, 'candidate-ran')
+    writeStableLaunchSpec(stateDir, {
+      version: 1, command: 'previous-command', port: 3080, home,
+      credentialRepo: repo, harnessRoot: home, profile: 'web',
+    })
+    recordCredential(stateDir, {
+      scope: 'target build+test', revision: currentHead(repo)!, command: 'pnpm test',
+    }, Date.now())
+    markLiveWatchdog(stateDir)
+    symlinkSync('missing-target', join(home, 'dangling'))
+    stubSandboxProbe(false)
+
+    const result = io()
+    expect(await runCli([
+      'reconfigure', '--start', 'target-command',
+      '--on-failure', 'restore-previous', '--state-dir', stateDir, '--repo', repo,
+      ...boundPreflightArgs(`touch ${JSON.stringify(candidateMarker)}`),
+    ], result.io)).toBe(1)
+    expect(result.err.join('')).toContain('could not prepare an isolated home')
+    expect(result.err.join('')).toContain('could not safely copy')
+    expect(existsSync(candidateMarker)).toBe(false)
+    expect(readLaunchState(stateDir)).toMatchObject({ mode: 'stable', active: { command: 'previous-command' } })
+    expect(readCutoverReceipt(stateDir)).toBeNull()
+    expect(Number(readFileSync(join(stateDir, STATE_FILES.watchdogPid), 'utf8'))).toBe(process.pid)
+  })
+
+  it('schedule-exit rejects flags or an instance record that diverge from the durable active launch spec', async () => {
+    const stateDir = tmpDir('guard-schedule-spec-')
+    const repo = makeRepo()
+    const otherRepo = makeRepo()
+    const home = tmpDir('guard-schedule-home-')
+    const active = {
+      version: 1 as const,
+      command: 'durable-host-command',
+      port: 3080,
+      home,
+      credentialRepo: repo,
+      harnessRoot: join(home, 'host'),
+      profile: 'web',
+    }
+    writeStableLaunchSpec(stateDir, active)
+    writeInstanceLaunchAsSupervisor(stateDir, {
+      command: active.command, source: 'supervisor', supervised: true, port: active.port, recordedAt: NOW,
+    })
+    markLiveWatchdog(stateDir)
+    expect(await runCli([
+      'record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo,
+    ], io().io)).toBe(0)
+
+    const flagConflict = io()
+    expect(await runCli([
+      'schedule-exit', '--port', '3080', '--delay-ms', '5000', '--state-dir', stateDir, '--repo', otherRepo,
+    ], flagConflict.io)).toBe(1)
+    expect(flagConflict.err.join('')).toContain('conflict with the durable active launch specification')
+    expect(flagConflict.err.join('')).toContain('Use reconfigure')
+    expect(existsSync(join(stateDir, STATE_FILES.restartRequested))).toBe(false)
+
+    writeInstanceLaunchAsSupervisor(stateDir, {
+      command: 'stale-rejected-target', source: 'supervisor', supervised: true, port: active.port, recordedAt: NOW,
+    })
+    const recordConflict = io()
+    expect(await runCli([
+      'schedule-exit', '--delay-ms', '5000', '--state-dir', stateDir,
+    ], recordConflict.io)).toBe(1)
+    expect(recordConflict.err.join('')).toContain('does not prove that its supervisor owns')
+    expect(existsSync(join(stateDir, STATE_FILES.restartRequested))).toBe(false)
+  })
+
+  it('refuses a second stop or reconfigure while a launch cutover is active', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-cutover-')
+    const base = {
+      version: 1 as const,
+      port: 3080,
+      home: join(stateDir, 'home'),
+      credentialRepo: repo,
+      harnessRoot: join(stateDir, 'harness'),
+      profile: 'web',
+    }
+    prepareLaunchCutover(stateDir, {
+      id: 'exclusive-cutover',
+      previous: { ...base, command: 'previous' },
+      target: { ...base, command: 'target' },
+      recoveryPolicy: 'wait-for-user', browserHandoff: 'off',
+      previousSupervisorPid: 501, previousSupervisorStartToken: 'supervisor-start-501', previousOwnership: fakeOwnership(502), now: NOW,
+    })
+    const reconfigure = io()
+    expect(await runCli([
+      'reconfigure', '--start', 'another-target', '--on-failure', 'wait-for-user',
+      '--state-dir', stateDir, '--repo', repo,
+    ], reconfigure.io)).toBe(1)
+    expect(reconfigure.err.join('')).toContain('exclusive-cutover')
+    const scheduled = io()
+    expect(await runCli([
+      'schedule-exit', '--port', '3080', '--delay-ms', '1',
+      '--state-dir', stateDir, '--repo', repo,
+    ], scheduled.io)).toBe(1)
+    expect(scheduled.err.join('')).toContain('launch cutover exclusive-cutover')
+  })
+
+  it('persists formal abort and restore-previous requests, with explicit restore taking precedence', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-control-')
+    const base = {
+      version: 1 as const,
+      port: 3080,
+      home: join(stateDir, 'home'),
+      credentialRepo: repo,
+      harnessRoot: join(stateDir, 'harness'),
+      profile: 'web',
+    }
+    const ready = join(stateDir, 'watchdog-ready')
+    const fakeProgram = `
+      const fs = require('node:fs')
+      const { pathToFileURL } = require('node:url')
+      import(pathToFileURL(${JSON.stringify(testSeamModule)}).href).then(seam => {
+        process.on('SIGUSR2', () => seam.appendTestLifecycleEvent('signal-received', { signal: 'SIGUSR2' }))
+        seam.appendTestLifecycleEvent('handler-installed')
+        setImmediate(() => {
+          seam.appendTestLifecycleEvent('keepalive-first-tick')
+          fs.writeFileSync(${JSON.stringify(ready)}, 'ready')
+          seam.appendTestLifecycleEvent('ready')
+        })
+        setInterval(() => {}, 1000)
+      })
+    `
+    const watchdog = spawn(process.execPath, ['-e', fakeProgram], {
+      stdio: 'ignore',
+      env: lifecycle.childEnv('fake-control-watchdog', process.env, { tempRoot: stateDir }),
+    })
+    const readyDeadline = performance.now() + 10_000
+    while (!existsSync(ready) && performance.now() < readyDeadline) {
+      if (watchdog.pid !== undefined) {
+        let state = 'gone'
+        try { state = execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(watchdog.pid)], { encoding: 'utf8' }).trim() || 'gone' } catch { /* gone */ }
+        appendTestLifecycleEventForProcess(watchdog.pid, 'fake-control-watchdog', 'process-state-observed', { state }, 'ps-sampler')
+        if (state === 'gone') break
+      }
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    if (!existsSync(ready)) throw new Error(`fake watchdog never became ready:\n${lifecycle.diagnostics()}`)
+    writeFileSync(join(stateDir, STATE_FILES.watchdogPid), String(watchdog.pid))
+    appendTestLifecycleEventForProcess(watchdog.pid!, 'fake-control-watchdog', 'pidfile-published', undefined, 'parent-observer')
+    prepareLaunchCutover(stateDir, {
+      id: 'controlled-cutover',
+      previous: { ...base, command: 'previous' },
+      target: { ...base, command: 'target' },
+      recoveryPolicy: 'wait-for-user', browserHandoff: 'off',
+      previousSupervisorPid: 901, previousSupervisorStartToken: 'supervisor-start-901', previousOwnership: fakeOwnership(902), now: NOW,
+    })
+    expect(await runCli(['abort-cutover', '--state-dir', stateDir], io().io)).toBe(0)
+    expect(readCutoverControl(stateDir)).toMatchObject({ cutoverId: 'controlled-cutover', action: 'abort' })
+    expect(await runCli(['restore-previous', '--state-dir', stateDir], io().io)).toBe(0)
+    expect(readCutoverControl(stateDir)).toMatchObject({ cutoverId: 'controlled-cutover', action: 'restore-previous' })
+    // A later weaker abort cannot downgrade the explicit restoration request.
+    expect(await runCli(['abort-cutover', '--state-dir', stateDir], io().io)).toBe(0)
+    expect(readCutoverControl(stateDir)?.action).toBe('restore-previous')
+
+    // Cross-process writers cannot reproduce the old read-then-overwrite
+    // ordering bug: the separate restore marker remains dominant regardless
+    // of which CLI process renames its file last.
+    rmSync(join(stateDir, STATE_FILES.cutoverAbort), { force: true })
+    rmSync(join(stateDir, STATE_FILES.cutoverRestorePrevious), { force: true })
+    const cli = fileURLToPath(new URL('../lib/cli.js', import.meta.url))
+    const cliSha256 = createHash('sha256').update(readFileSync(cli)).digest('hex')
+    const actions = Array.from({ length: 12 }, (_, index) => index % 2 === 0 ? 'abort-cutover' : 'restore-previous')
+    const writers = actions.map((action, index) => spawn(process.execPath, [cli, action, '--state-dir', stateDir], {
+      stdio: 'ignore',
+      env: lifecycle.childEnv(`control-writer-${index}`, process.env, { tempRoot: stateDir }),
+    }))
+    const codes = await Promise.all(writers.map(writer => new Promise<number | null>(resolveExit => {
+      writer.on('exit', resolveExit)
+    })))
+    const finalCliSha256 = createHash('sha256').update(readFileSync(cli)).digest('hex')
+    expect(codes, `built CLI ${cli} sha256=${cliSha256}\n${lifecycle.diagnostics()}`).toEqual(actions.map(() => 0))
+    expect(finalCliSha256).toBe(cliSha256)
+    expect(readCutoverControl(stateDir)?.action).toBe('restore-previous')
+    const childEvents = lifecycle.events().filter(event => event.pid === watchdog.pid)
+    const eventIndex = (name: string): number => childEvents.findIndex(event => event.event === name)
+    expect(eventIndex('handler-installed')).toBeGreaterThanOrEqual(0)
+    expect(eventIndex('keepalive-first-tick')).toBeGreaterThan(eventIndex('handler-installed'))
+    expect(eventIndex('ready')).toBeGreaterThan(eventIndex('keepalive-first-tick'))
+    expect(eventIndex('signal-received')).toBeGreaterThan(eventIndex('ready'))
+  }, 30_000)
+
+  it('refuses to resume a legacy active cutover that lacks authoritative child/listener ownership', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-legacy-cutover-')
+    const base = {
+      version: 1 as const,
+      port: 3080,
+      home: join(stateDir, 'home'),
+      credentialRepo: repo,
+      harnessRoot: join(stateDir, 'harness'),
+      profile: 'web',
+    }
+    prepareLaunchCutover(stateDir, {
+      id: 'legacy-cutover',
+      previous: { ...base, command: 'previous' },
+      target: { ...base, command: 'target' },
+      recoveryPolicy: 'wait-for-user', browserHandoff: 'off',
+      previousSupervisorPid: 911, previousSupervisorStartToken: 'supervisor-start-911', previousOwnership: fakeOwnership(912), now: NOW,
+    })
+    const receiptFile = join(stateDir, STATE_FILES.launchCutover)
+    const legacy = JSON.parse(readFileSync(receiptFile, 'utf8'))
+    delete legacy.ownership
+    writeFileSync(receiptFile, JSON.stringify(legacy))
+
+    const output = io()
+    expect(await runCli(['supervise', '--foreground', '--state-dir', stateDir], output.io)).toBe(1)
+    expect(output.err.join('')).toContain('predates authoritative child/listener ownership evidence')
+  })
+
+  it('refuses a PID-only legacy cutover that lacks previous supervisor start identity', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-cli-legacy-supervisor-')
+    const base = {
+      version: 1 as const,
+      port: 3080,
+      home: join(stateDir, 'home'),
+      credentialRepo: repo,
+      harnessRoot: join(stateDir, 'harness'),
+      profile: 'web',
+    }
+    prepareLaunchCutover(stateDir, {
+      id: 'legacy-supervisor-cutover',
+      previous: { ...base, command: 'previous' },
+      target: { ...base, command: 'target' },
+      recoveryPolicy: 'wait-for-user', browserHandoff: 'off',
+      previousSupervisorPid: 921, previousSupervisorStartToken: 'supervisor-start-921', previousOwnership: fakeOwnership(922), now: NOW,
+    })
+    const receiptFile = join(stateDir, STATE_FILES.launchCutover)
+    const legacy = JSON.parse(readFileSync(receiptFile, 'utf8'))
+    delete legacy.supervisor.previousStartToken
+    writeFileSync(receiptFile, JSON.stringify(legacy))
+
+    const output = io()
+    expect(await runCli(['supervise', '--foreground', '--state-dir', stateDir], output.io)).toBe(1)
+    expect(output.err.join('')).toContain('predates supervisor start identity evidence')
+  })
+
   it('verify and record warn while no watchdog supervises the instance', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
@@ -325,11 +1102,48 @@ describe('CLI', () => {
     // The agent's first contacts in any restart flow: the bootstrap gap must
     // surface HERE, before anyone considers a bare exit.
     const rec = io()
-    expect(await runCli(['record', 'build', ...flags], rec.io)).toBe(0)
+    expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', ...flags], rec.io)).toBe(0)
     expect(rec.err.join('')).toContain('no live watchdog')
     const ver = io()
     expect(await runCli(['verify', ...flags], ver.io)).toBe(0)
     expect(ver.err.join('')).toContain('no live watchdog')
+  })
+
+  it('refuses self-attestation and records only an exact successful argv on a clean unchanged tree', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-evidence-')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+
+    const selfAttested = io()
+    expect(await runCli(['record', 'build', '--command', 'true', ...flags], selfAttested.io)).toBe(2)
+    expect(selfAttested.err.join('')).toContain('refuses self-attestation')
+
+    const observed = io()
+    expect(await runCli([
+      'record', 'build+test', ...flags, '--run', '--', process.execPath, '-e',
+      "if (process.argv[1] !== 'argument with spaces') process.exit(7)", 'argument with spaces',
+    ], observed.io)).toBe(0)
+    expect(loadState(stateDir).credential?.command).toContain(JSON.stringify('argument with spaces'))
+
+    const failed = io()
+    expect(await runCli([
+      'record', 'build+test', ...flags, '--run', '--', process.execPath, '-e', 'process.exit(9)',
+    ], failed.io)).toBe(1)
+    expect(failed.err.join('')).toContain('command exited 9')
+    expect(loadState(stateDir).credential).toBeUndefined()
+  })
+
+  it('rejects a credential when any uncommitted input appears after recording', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-dirty-credential-')
+    const flags = ['--state-dir', stateDir, '--repo', repo]
+    expect(await runCli([
+      'record', 'build', '--trust-command', '--command', 'test fixture', ...flags,
+    ], io().io)).toBe(0)
+    writeFileSync(join(repo, 'untracked.txt'), 'not tested\n')
+    const denied = io()
+    expect(await runCli(['verify', ...flags], denied.io)).toBe(1)
+    expect(denied.out.join('')).toContain('working tree is dirty')
   })
 
   it('records and verifies, then denies after a new commit', async () => {
@@ -338,7 +1152,7 @@ describe('CLI', () => {
     const flags = ['--state-dir', stateDir, '--repo', repo]
 
     const rec = io()
-    expect(await runCli(['record', 'build+test', '--command', 'pnpm run build', ...flags], rec.io)).toBe(0)
+    expect(await runCli(['record', 'build+test', '--trust-command', '--command', 'pnpm run build', ...flags], rec.io)).toBe(0)
     expect(rec.out.join('')).toContain('build+test')
 
     const ok = io()
@@ -374,19 +1188,45 @@ describe('CLI', () => {
     expect(reset.out.join('')).toContain('reset to')
   })
 
-  it('checkpoint warns (but still commits) when bare-tsc artifacts under src/ are swept in', async () => {
+  it('checkpoint refuses a dirty tree until the complete snapshot is explicitly approved', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
     const flags = ['--state-dir', stateDir, '--repo', repo]
     mkdirSync(join(repo, 'packages', 'x', 'y', 'src'), { recursive: true })
     writeFileSync(join(repo, 'packages', 'x', 'y', 'src', 'index.js'), '// stray emit\n')
     writeFileSync(join(repo, 'packages', 'x', 'y', 'src', 'index.ts'), 'export {}\n')
+    const before = execFileSync('git', ['status', '--porcelain=v1'], { cwd: repo, encoding: 'utf8' })
+    const refused = io()
+    expect(await runCli(['checkpoint', '--message', 'batch', ...flags], refused.io)).toBe(1)
+    expect(refused.err.join('')).toContain('--include-dirty')
+    expect(execFileSync('git', ['status', '--porcelain=v1'], { cwd: repo, encoding: 'utf8' })).toBe(before)
+
     const cp = io()
-    expect(await runCli(['checkpoint', '--message', 'batch', ...flags], cp.io)).toBe(0)
+    expect(await runCli(['checkpoint', '--message', 'batch', '--include-dirty', ...flags], cp.io)).toBe(0)
     expect(cp.out.join('')).toContain('1 build-artifact-looking')
     expect(cp.out.join('')).toContain('packages/x/y/src/index.js')
-    // The commit still happened, artifact included — a checkpoint never refuses work.
+    // Explicit approval commits the complete snapshot and still flags likely artifacts.
     expect(execFileSync('git', ['ls-files'], { cwd: repo, encoding: 'utf8' })).toContain('packages/x/y/src/index.js')
+  })
+
+  it('a failed approved checkpoint leaves HEAD and the caller staging area untouched', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-checkpoint-hook-')
+    writeFileSync(join(repo, 'staged.txt'), 'staged\n')
+    run(repo, ['add', 'staged.txt'])
+    writeFileSync(join(repo, 'a.txt'), 'unstaged\n')
+    const head = currentHead(repo)
+    const status = execFileSync('git', ['status', '--porcelain=v1'], { cwd: repo, encoding: 'utf8' })
+    const hook = join(repo, '.git', 'hooks', 'pre-commit')
+    writeFileSync(hook, '#!/bin/sh\nexit 1\n')
+    chmodSync(hook, 0o755)
+
+    const out = io()
+    expect(await runCli([
+      'checkpoint', '--message', 'hook refusal', '--include-dirty', '--repo', repo, '--state-dir', stateDir,
+    ], out.io)).toBe(1)
+    expect(currentHead(repo)).toBe(head)
+    expect(execFileSync('git', ['status', '--porcelain=v1'], { cwd: repo, encoding: 'utf8' })).toBe(status)
   })
 
   it('canary passes only when verify passes and the port is listening', async () => {
@@ -400,7 +1240,7 @@ describe('CLI', () => {
     expect(fail.out.join('')).toContain('canary FAIL')
 
     // Credential recorded and a live listener → PASS.
-    await runCli(['record', 'build', ...flags], io().io)
+    await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', ...flags], io().io)
     const server = await new Promise<Server>((resolve) => {
       const s = createServer(() => {})
       s.listen(0, '127.0.0.1', () => { resolve(s) })
@@ -425,7 +1265,7 @@ describe('CLI', () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
-    const server = spawnServer(port, 'old')
+    spawnServer(port, 'old')
     try {
       await waitForPort(port)
       const io2 = io()
@@ -437,7 +1277,6 @@ describe('CLI', () => {
       expect(await portListening(port)).toBe(true)
     } finally {
       await killListener(port)
-      server.kill('SIGKILL')
     }
   })
 
@@ -445,10 +1284,10 @@ describe('CLI', () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
-    const oldServer = spawnServer(port, 'old')
+    spawnServer(port, 'old')
     try {
       await waitForPort(port)
-      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
       stubPreflight('true')
       const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
       const restarted = io()
@@ -461,7 +1300,6 @@ describe('CLI', () => {
       expect(await fetchBody(port)).toBe('new')
     } finally {
       await killListener(port)
-      oldServer.kill('SIGKILL')
     }
   })
 
@@ -470,7 +1308,7 @@ describe('CLI', () => {
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
     const dump = join(stateDir, 'instance-env.txt')
-    const oldServer = spawnServer(port, 'old')
+    spawnServer(port, 'old')
     // Simulate the caller being an agent shell inside a supervised instance:
     // it carries that instance's WD_* environment (the watchdog spawns the
     // instance with its own), and a bare restart must not forward it.
@@ -478,7 +1316,7 @@ describe('CLI', () => {
     process.env.WD_PROBE_LEAK = 'must-not-reach-the-instance'
     try {
       await waitForPort(port)
-      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
       stubPreflight('true')
       const startCmd = `env > '${dump}'; "${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
       const restarted = io()
@@ -493,7 +1331,6 @@ describe('CLI', () => {
       if (previousProbe === undefined) delete process.env.WD_PROBE_LEAK
       else process.env.WD_PROBE_LEAK = previousProbe
       await killListener(port)
-      oldServer.kill('SIGKILL')
     }
   })
 
@@ -501,10 +1338,10 @@ describe('CLI', () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
-    const server = spawnServer(port, 'old')
+    spawnServer(port, 'old')
     try {
       await waitForPort(port)
-      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
       stubPreflight('true')
       const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
       const started = Date.now()
@@ -519,7 +1356,6 @@ describe('CLI', () => {
       expect(await fetchBody(port)).toBe('new')
     } finally {
       await killListener(port)
-      server.kill('SIGKILL')
     }
   })
 
@@ -528,12 +1364,12 @@ describe('CLI', () => {
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
     // A listener that swallows SIGTERM: only the SIGKILL escalation can stop it.
-    const stubborn = spawn(process.execPath, ['-e',
+    spawn(process.execPath, ['-e',
       `process.on('SIGTERM', () => {}); require('http').createServer((q, s) => s.end('stubborn')).listen(${port}, '127.0.0.1')`],
     { stdio: 'ignore' })
     try {
       await waitForPort(port)
-      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
       stubPreflight('true')
       // The replacement retries binding: the stubborn listener's socket is
       // released asynchronously after its SIGKILL, so a single immediate bind
@@ -571,7 +1407,6 @@ tryListen();
       expect(body).toBe('new')
     } finally {
       await killListener(port)
-      stubborn.kill('SIGKILL')
     }
   })
 
@@ -579,14 +1414,14 @@ tryListen();
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
-    const server = spawnServer(port, 'old')
+    spawnServer(port, 'old')
     try {
       await waitForPort(port)
       const cp = io()
       expect(await runCli(['checkpoint', '--message', 'pre', '--state-dir', stateDir, '--repo', repo], cp.io)).toBe(0)
       const sha = cp.out.join('').trim().split(' ').pop()
       commitChange(repo)
-      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
       stubPreflight('true')
       const broken = `"${process.execPath}" -e "process.exit(3)"`
       const failed = io()
@@ -600,22 +1435,21 @@ tryListen();
       expect(currentHead(repo)).toBe(sha)
     } finally {
       await killListener(port)
-      server.kill('SIGKILL')
     }
   })
 
-  it('restart --rollback skips the reset when the target already is HEAD', async () => {
+  it('restart refuses a dirty checkout before stopping the healthy instance', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
-    const server = spawnServer(port, 'old')
+    spawnServer(port, 'old')
     try {
       await waitForPort(port)
-      // Checkpoint and credential both bind the CURRENT HEAD: there is
-      // nothing to roll back, and the dirty tree must survive.
+      // Checkpoint and credential both bind the CURRENT HEAD, but an input
+      // appeared after evidence. It must not reach stop/start/rollback at all.
       const cp = io()
       expect(await runCli(['checkpoint', '--message', 'pre', '--state-dir', stateDir, '--repo', repo], cp.io)).toBe(0)
-      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
       stubPreflight('true')
       writeFileSync(join(repo, 'a.txt'), 'dirty')
       const broken = `"${process.execPath}" -e "process.exit(3)"`
@@ -625,11 +1459,11 @@ tryListen();
           '--state-dir', stateDir, '--repo', repo],
         failed.io,
       )).toBe(1)
-      expect(failed.out.join('')).toContain('skipping reset')
+      expect(failed.err.join('')).toContain('working tree is dirty')
       expect(readFileSync(join(repo, 'a.txt'), 'utf8')).toBe('dirty')
+      expect(await portListening(port)).toBe(true)
     } finally {
       await killListener(port)
-      server.kill('SIGKILL')
     }
   })
 })
@@ -663,8 +1497,8 @@ describe('composition preflight gate', () => {
     expect(resolvePreflightBin(foreignCli(tmpDir('guard-layout-')))).toBeUndefined()
   })
 
-  it('resolveHarnessRoot prefers the repo target, then DSH_HARNESS, then the conventional default', () => {
-    expect(resolveHarnessRoot('/repo')).toBe('/repo')
+  it('resolveHarnessRoot prefers the explicit host root, then DSH_HARNESS, then the conventional default', () => {
+    expect(resolveHarnessRoot('/explicit-host')).toBe('/explicit-host')
     expect(resolveHarnessRoot(undefined, { DSH_HARNESS: '/env-harness' })).toBe('/env-harness')
     expect(resolveHarnessRoot('', { DSH_HARNESS: '  ' })).toBe(join(homedir(), 'code/deepseek-harness'))
   })
@@ -716,10 +1550,12 @@ describe('composition preflight gate', () => {
     // gate must degrade and proceed, not refuse restarts on a phantom verdict.
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    const port = await freePort()
+    await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
+    markLiveWatchdog(stateDir)
     stubPreflight(`"${process.execPath}" -e "console.error(\\"error: unknown command 'preflight'\\"); process.exit(1)"`)
     const out = io()
-    await runCli(['schedule-exit', '--port', '3099', '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo], out.io)
+    await runCli(['schedule-exit', '--port', String(port), '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo], out.io)
     expect(out.err.join('')).not.toContain('composition preflight failed')
     expect(out.out.join('')).toContain('unavailable')
   })
@@ -755,12 +1591,14 @@ describe('composition preflight gate', () => {
   it('schedule-exit refuses when the composition preflight fails, quoting the diagnostics', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    const port = await freePort()
+    await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
+    markLiveWatchdog(stateDir)
     const lines = Array.from({ length: 50 }, (_, i) => `console.error('layer ${i} failed')`).join(';')
     stubPreflight(`"${process.execPath}" -e "${lines}; process.exit(1)"`)
     const out = io()
     expect(await runCli(
-      ['schedule-exit', '--port', '3099', '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
+      ['schedule-exit', '--port', String(port), '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
       out.io,
     )).toBe(1)
     expect(out.err.join('')).toContain('schedule-exit refused: composition preflight failed')
@@ -772,11 +1610,13 @@ describe('composition preflight gate', () => {
   it('schedule-exit refuses with the infrastructure wording when preflight exits 3', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    const port = await freePort()
+    await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
+    markLiveWatchdog(stateDir)
     stubPreflight(`"${process.execPath}" -e "process.exit(3)"`)
     const out = io()
     expect(await runCli(
-      ['schedule-exit', '--port', '3099', '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
+      ['schedule-exit', '--port', String(port), '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
       out.io,
     )).toBe(1)
     expect(out.err.join('')).toContain('schedule-exit refused: the composition preflight itself failed')
@@ -787,34 +1627,45 @@ describe('composition preflight gate', () => {
   it('schedule-exit refuses when the preflight times out', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    const port = await freePort()
+    await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
+    markLiveWatchdog(stateDir)
     // exec replaces the shell, so the timeout's SIGKILL kills the sleeper itself.
     stubPreflight('exec sleep 10')
     const out = io()
-    expect(await runCli(
-      ['schedule-exit', '--port', '3099', '--delay-ms', '100', '--preflight-timeout-ms', '300',
+    const pending = runCli(
+      ['schedule-exit', '--port', String(port), '--delay-ms', '100', '--preflight-timeout-ms', '300',
         '--state-dir', stateDir, '--repo', repo],
       out.io,
-    )).toBe(1)
+    )
+    // A caller whose own tool deadline expires while the gate is running must
+    // still see which stage was active and the larger internal budget. The
+    // completion verdict remains absent until the child actually settles.
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
+    expect(out.out.join('')).toContain('composition preflight START (profile "web", timeout 300 ms)')
+    expect(out.out.join('')).not.toContain('composition preflight PASS')
+    expect(await pending).toBe(1)
     expect(out.err.join('')).toContain('preflight timed out after 300 ms')
   }, 15_000)
 
   it('schedule-exit warns and proceeds when no sibling dsh app exists (standalone layout)', async () => {
     const repo = makeRepo()
     const home = tmpDir('guard-home-')
+    const port = await freePort()
     const previousHome = process.env.DSH_HOME
     process.env.DSH_HOME = home
     cleanups.push(() => {
       if (previousHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previousHome
     })
-    await runCli(['record', 'build', '--state-dir', join(home, 'state'), '--repo', repo], io().io)
+    await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', join(home, 'state'), '--repo', repo], io().io)
+    markLiveWatchdog(join(home, 'state'))
     stubPreflight(undefined)
     stubPreflightBin(() => undefined)
     stubPreflightRunner(() => undefined)
     const out = io()
     expect(await runCli(
-      ['schedule-exit', '--port', '3099', '--delay-ms', '60000', '--state-dir', join(home, 'state'), '--repo', repo],
+      ['schedule-exit', '--port', String(port), '--delay-ms', '60000', '--state-dir', join(home, 'state'), '--repo', repo],
       out.io,
     )).toBe(0)
     expect(out.out.join('')).toContain('preflight unavailable outside the dsh app layout — proceeding without it')
@@ -825,10 +1676,10 @@ describe('composition preflight gate', () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
-    const server = spawnServer(port, 'old')
+    spawnServer(port, 'old')
     try {
       await waitForPort(port)
-      await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+      await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
       stubPreflight('false')
       const out = io()
       expect(await runCli(
@@ -839,18 +1690,19 @@ describe('composition preflight gate', () => {
       expect(await portListening(port)).toBe(true)
     } finally {
       await killListener(port)
-      server.kill('SIGKILL')
     }
   })
 
   it('caps captured preflight output instead of growing without bound', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-cli-')
-    await runCli(['record', 'build', '--state-dir', stateDir, '--repo', repo], io().io)
+    const port = await freePort()
+    await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)
+    markLiveWatchdog(stateDir)
     stubPreflight(`"${process.execPath}" -e "process.stderr.write('x'.repeat(300000)); process.exit(1)"`)
     const out = io()
     expect(await runCli(
-      ['schedule-exit', '--port', '3099', '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
+      ['schedule-exit', '--port', String(port), '--delay-ms', '100', '--state-dir', stateDir, '--repo', repo],
       out.io,
     )).toBe(1)
     // The refusal holds, and the diagnostics are far below the raw 300 KB.
@@ -868,7 +1720,7 @@ describe('composition preflight gate', () => {
 /** Spawn a detached throwaway http server answering the given body on a port. */
 function spawnServer(port: number, body: string): ReturnType<typeof spawn> {
   const script = `require('http').createServer((q,s)=>s.end(${JSON.stringify(body)})).listen(${port},'127.0.0.1')`
-  const child = spawn(process.execPath, ['-e', script], { detached: true, stdio: 'ignore' })
+  const child = spawnPortRuntime(process.execPath, ['-e', script], port, { detached: true, stdio: 'ignore' })
   child.unref()
   return child
 }
@@ -897,6 +1749,31 @@ async function waitForPort(port: number, timeoutMs = 10_000): Promise<void> {
   throw new Error(`port ${port} never listened`)
 }
 
+/** Poll a lifecycle predicate with a named, load-resilient deadline. */
+async function waitForCondition(
+  description: string,
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 20_000,
+  intervalMs = 100,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown
+  while (Date.now() < deadline) {
+    try {
+      if (await predicate()) return
+      lastError = undefined
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise(resolve => setTimeout(resolve, intervalMs))
+  }
+  throw new Error(
+    `timed out after ${timeoutMs} ms waiting for ${description}`
+    + `${lastError === undefined ? '' : `; last observation error: ${String(lastError)}`}`
+    + `\n${lifecycle.diagnostics()}`,
+  )
+}
+
 /** GET the body from a local http server. */
 async function fetchBody(port: number): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -909,57 +1786,55 @@ async function fetchBody(port: number): Promise<string> {
   })
 }
 
-/** Kill whatever listens on a port (lsof), best-effort. */
+/** GET only the status from a local HTTP server. */
+async function fetchStatus(port: number): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const req = httpGet({ port, host: '127.0.0.1' }, (res) => {
+      res.resume()
+      res.on('end', () => { resolve(res.statusCode ?? 0) })
+    })
+    req.on('error', reject)
+  })
+}
+
+/** Stop only runtime identities explicitly bound to this run's port ledger. */
 async function killListener(port: number): Promise<void> {
-  try {
-    const out = execFileSync('lsof', [`-tiTCP:${port}`, '-sTCP:LISTEN', '-P'], { encoding: 'utf8' }).trim()
-    for (const pid of out.split('\n')) {
-      if (pid !== '') {
-        try { process.kill(Number(pid), 'SIGKILL') } catch { /* already gone */ }
-      }
-    }
-  } catch {
-    // nothing listening — fine
+  const stopped = await lifecycle.stopPortProcesses(port)
+  if (stopped === 0 && findPidOnPort(port) !== null) {
+    throw new Error(`port ${port} has a listener but no registered runtime identity; refusing port-based cleanup\n${lifecycle.diagnostics()}`)
   }
 }
 
 describe('supervise', () => {
+  // Separate Vitest processes isolate process.env/mocks while the machine-wide
+  // port lease coordinates their real watchdogs. An ordinary direct run has
+  // count=1 and still executes every case.
+  const it = superviseIt
   const io = cliIo
 
   /** Throwaway DSH_HOME isolation + watchdog cleanup for the spawned supervisor. */
   function supervisedEnv(): { home: string; restore: () => void; stop: () => void } {
     const home = tmpDir('guard-home-')
-    const previous = process.env.DSH_HOME
+    const previousHome = process.env.DSH_HOME
+    const previousHarness = process.env.DSH_HARNESS
     process.env.DSH_HOME = home
+    process.env.DSH_HARNESS = join(home, 'harness-root')
+    mkdirSync(process.env.DSH_HARNESS, { recursive: true })
     const stop = (): void => {
       try {
         mkdirSync(join(home, 'state'), { recursive: true })
         writeFileSync(join(home, 'state', 'watchdog-stop'), '')
-        const pidfile = join(home, 'state', 'watchdog.pid')
-        if (existsSync(pidfile)) {
-          const pid = Number(readFileSync(pidfile, 'utf8').trim())
-          if (Number.isInteger(pid)) {
-            // The watchdog is setsid'd, so its process group == its pid; kill
-            // the group so respawned children cannot leak past the test.
-            try { process.kill(-pid, 'SIGKILL') } catch { /* not a group leader */ }
-            try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
-          }
-        }
       } catch { /* best-effort */ }
     }
     const restore = (): void => {
-      if (previous === undefined) delete process.env.DSH_HOME
-      else process.env.DSH_HOME = previous
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+      if (previousHarness === undefined) delete process.env.DSH_HARNESS
+      else process.env.DSH_HARNESS = previousHarness
     }
-    // A watchdog is setsid'd and detached: nothing reaps it when a test fails
-    // before its own `stop()`, so it outlives the run and keeps respawning a
-    // fake instance forever. Registering here makes teardown unconditional;
-    // `stop` stays on the return value for tests that stop it mid-test (it is
-    // idempotent — killing an already-dead pid is caught).
-    // unshift, not push: `tmpDir` already registered the rmSync of `home`, and
-    // a watchdog that is still alive when its WD_HOME is removed recreates
-    // `state/` under the deleted directory.
-    cleanups.unshift(stop)
+    // Publish the protocol marker before identity-gated TERM→wait→KILL. The
+    // ordinary cleanup list runs later, after no child can recreate the home.
+    gracefulStops.push(stop)
     cleanups.push(restore)
     return { home, restore, stop }
   }
@@ -982,7 +1857,7 @@ describe('supervise', () => {
       )).toBe(0)
       expect(out.out.join('')).toContain('watchdog spawned')
       // The watchdog waits for the current owner to exit, then takes over.
-      host.kill('SIGTERM')
+      lifecycle.signalExact(host, 'SIGTERM')
       const deadline = Date.now() + 20_000
       let portDown = false
       while (Date.now() < deadline) {
@@ -991,26 +1866,24 @@ describe('supervise', () => {
         await new Promise((resolve) => { setTimeout(resolve, 300) })
       }
       expect(await fetchBody(port)).toBe('new')
+      expect(readFileSync(join(env.home, 'state', STATE_FILES.watchdogLog), 'utf8'))
+        .toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} \[watchdog] /)
       // A live owner existed at supervise time: this takeover is an ADOPTION
       // restart, and the watchdog files a report record addressed to the
       // supervising session (empty initiator here — no DSH_SESSION_ID in this
       // test's env). The no-false-positive guard covers the first-EVER boot
       // (no owner), asserted by the next test.
       const record = join(env.home, 'state', 'last-restart.json')
-      const recordDeadline = Date.now() + 5000
-      while (!existsSync(record) && Date.now() < recordDeadline) {
-        await new Promise((resolve) => { setTimeout(resolve, 200) })
-      }
+      await waitForCondition('the adoption report record', () => existsSync(record))
       const outcome = JSON.parse(readFileSync(record, 'utf8'))
       expect(outcome.unexpected).toBeUndefined()
       expect(typeof outcome.exitAt).toBe('number')
     } finally {
       env.stop()
-      host.kill('SIGKILL')
       await killListener(port)
       env.restore()
     }
-  }, 30_000)
+  }, 60_000)
 
   it('a first-EVER boot (no previous owner) files no report record', async () => {
     const env = supervisedEnv()
@@ -1076,7 +1949,7 @@ describe('supervise', () => {
         source: 'instance',
         recordedAt: Date.now(),
       }))
-      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', ...flags], io().io)).toBe(0)
       stubPreflight('true')
       const host = spawn(process.execPath, ['-e',
         `require('http').createServer((q,s)=>s.end('old')).listen(${port},'127.0.0.1')`],
@@ -1088,7 +1961,6 @@ describe('supervise', () => {
       expect(await runCli(['restart', '--sync', '--port', String(port), ...flags], out.io)).toBe(0)
       expect(out.out.join('')).toContain('restart + canary PASS')
       expect(await fetchBody(port)).toBe('new')
-      host.kill('SIGKILL')
       await killListener(port)
     } finally {
       env.restore()
@@ -1102,7 +1974,7 @@ describe('supervise', () => {
     const flags = ['--state-dir', stateDir, '--repo', repo]
     try {
       writeInstanceLaunchAsSupervisor(stateDir, { command: `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('ok')).listen(1,'127.0.0.1')"`, source: 'supervisor', supervised: true, recordedAt: Date.now() })
-      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', ...flags], io().io)).toBe(0)
       stubPreflight('true')
       // Watchdog DEAD despite the supervised record: refusing here would send
       // the agent to schedule-exit → the instance dies with nobody to respawn
@@ -1123,7 +1995,7 @@ describe('supervise', () => {
       expect(out.err.join()).toContain('schedule-exit')
       expect(out.err.join()).not.toContain('pass --start explicitly')
       rmSync(join(stateDir, 'watchdog.pid'), { force: true })
-      try { process.kill(sleeper.pid ?? 0, 'SIGKILL') } catch { /* already gone */ }
+      lifecycle.signalExact(sleeper, 'SIGKILL')
       // The instance side never overwrites the supervisor's record.
       expect(writeInstanceLaunch(stateDir, { command: 'echo inner', source: 'instance', recordedAt: Date.now() })).toBe(false)
     } finally {
@@ -1179,9 +2051,9 @@ describe('supervise', () => {
     const port = await freePort()
     try {
       // Unsupervised: warning present, and the start command discovered live.
-      const host = spawn(process.execPath, ['-e',
+      const host = spawnPortRuntime(process.execPath, ['-e',
         `require('http').createServer((q,s)=>s.end('x')).listen(${port},'127.0.0.1')`],
-      { detached: true, stdio: 'ignore', env: { ...process.env, DSH_PROBE_MARKER: 'discovered-1' } })
+      port, { detached: true, stdio: 'ignore', env: { ...process.env, DSH_PROBE_MARKER: 'discovered-1' } })
       host.unref()
       await waitForPort(port)
       const out = io()
@@ -1191,7 +2063,6 @@ describe('supervise', () => {
       expect(text).toContain('leaves the service DOWN')
       expect(text).toContain('live discovery')
       expect(text).toContain(String(port))
-      host.kill('SIGKILL')
       await killListener(port)
       // Supervised: pidfile with a live pid → the chain names the watchdog.
       // (A SLEEPER's pid, never the test worker's own — env.stop() SIGKILLs
@@ -1203,7 +2074,7 @@ describe('supervise', () => {
       const out2 = io()
       expect(await runCli(['check-env', '--state-dir', stateDir, '--repo', repo], out2.io)).toBe(0)
       expect(out2.out.join('')).toContain(`supervised by ankh watchdog (pid ${sleeper.pid})`)
-      try { process.kill(sleeper.pid ?? 0, 'SIGKILL') } catch { /* already gone */ }
+      lifecycle.signalExact(sleeper, 'SIGKILL')
     } finally {
       env.restore()
     }
@@ -1218,7 +2089,7 @@ describe('supervise', () => {
     const serverFile = join(env.home, 'server.js')
     writeFileSync(serverFile, `require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')`)
     try {
-      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', ...flags], io().io)).toBe(0)
       stubPreflight('true')
       // The "instance": a node process running serverFile — discovery must
       // reconstruct `node <serverFile>` and re-run it after the stop.
@@ -1229,7 +2100,6 @@ describe('supervise', () => {
       expect(await runCli(['restart', '--sync', '--port', String(port), ...flags], out.io)).toBe(0)
       expect(out.out.join('')).toContain('restart + canary PASS')
       expect(await fetchBody(port)).toBe('new')
-      host.kill('SIGKILL')
       await killListener(port)
     } finally {
       env.restore()
@@ -1248,7 +2118,7 @@ describe('supervise', () => {
     host.unref()
     try {
       await waitForPort(port)
-      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', ...flags], io().io)).toBe(0)
       stubPreflight('true')
       const startCmd = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('new')).listen(${port},'127.0.0.1')"`
       // No --sync: the caller returns as soon as the driver is detached.
@@ -1283,7 +2153,6 @@ describe('supervise', () => {
       expect(existsSync(lockFile)).toBe(false)
       expect(readFileSync(join(stateDir, 'restart.log'), 'utf8')).toContain('restart + canary PASS')
     } finally {
-      host.kill('SIGKILL')
       await killListener(port)
       env.restore()
     }
@@ -1295,7 +2164,7 @@ describe('supervise', () => {
     const stateDir = join(env.home, 'state')
     const flags = ['--state-dir', stateDir, '--repo', repo]
     try {
-      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', ...flags], io().io)).toBe(0)
       stubPreflight('true')
       const port = await freePort()
       // A LIVE holder (this test process): the second restart must refuse,
@@ -1337,7 +2206,8 @@ describe('supervise', () => {
     const stateDir = join(env.home, 'state')
     mkdirSync(stateDir, { recursive: true })
     try {
-      expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      markLiveWatchdog(stateDir)
       stubPreflight('true')
       writeFileSync(join(stateDir, 'restart-requested.json'), JSON.stringify({ requestedAt: Date.now() }))
       const out = io()
@@ -1373,6 +2243,7 @@ describe('supervise', () => {
       expect(locked.err.join()).toContain('restart is in flight')
       rmSync(join(stateDir, 'restart.lock'), { force: true })
     } finally {
+      rmSync(join(stateDir, STATE_FILES.watchdogPid), { force: true })
       env.restore()
     }
   }, 15_000)
@@ -1397,7 +2268,7 @@ describe('supervise', () => {
         ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', join(env.home, 'state'), '--repo', repo],
         io().io,
       )).toBe(0)
-      host.kill('SIGTERM')
+      lifecycle.signalExact(host, 'SIGTERM')
       const deadline = Date.now() + 20_000
       let portDown = false
       while (Date.now() < deadline) {
@@ -1407,18 +2278,14 @@ describe('supervise', () => {
       }
       expect(await fetchBody(port)).toBe('new')
       const crashRecord = join(env.home, 'state', 'last-restart.json')
-      const recordDeadline = Date.now() + 5000
-      while (!existsSync(crashRecord) && Date.now() < recordDeadline) {
-        await new Promise((resolve) => { setTimeout(resolve, 200) })
-      }
+      await waitForCondition('the unplanned-exit report record', () => existsSync(crashRecord))
       expect(JSON.parse(readFileSync(crashRecord, 'utf8')).unexpected).toBe(true)
     } finally {
       env.stop()
-      host.kill('SIGKILL')
       await killListener(port)
       env.restore()
     }
-  }, 30_000)
+  }, 60_000)
 
   it('record-unexpected-exit writes once and never overwrites a pending record', async () => {
     const stateDir = tmpDir('guard-cli-')
@@ -1498,17 +2365,15 @@ describe('supervise', () => {
       await waitForPort(port)
       // Healthy boot snapshotted the composition.
       const snap = join(stateDir, 'last-good-composition', 'cordis.patch.yml')
-      const snapDeadline = Date.now() + 5000
-      while (!existsSync(snap) && Date.now() < snapDeadline) {
-        await new Promise((resolve) => { setTimeout(resolve, 100) })
-      }
+      await waitForCondition('the healthy composition snapshot', () => existsSync(snap))
       expect(readFileSync(snap, 'utf8')).toContain('good composition')
       // A plugin install lands a bad row, then the instance stops (any cause).
       writeFileSync(join(profileDir, 'cordis.patch.yml'), '# good composition\n# + bad-plugin row\n')
+      const rejectedCompositionSha256 = createHash('sha256').update(readFileSync(join(profileDir, 'cordis.patch.yml'))).digest('hex')
       await killListener(port)
       // The watchdog fails to boot the bad composition, rolls the composition
       // back to the snapshot, and comes up — service recovered, plugin unmounted.
-      const upDeadline = Date.now() + 30_000
+      const upDeadline = Date.now() + 45_000
       let recovered = false
       while (Date.now() < upDeadline) {
         if ((await portListening(port)) && readFileSync(join(profileDir, 'cordis.patch.yml'), 'utf8').includes('bad-plugin') === false) {
@@ -1517,7 +2382,20 @@ describe('supervise', () => {
         }
         await new Promise((resolve) => { setTimeout(resolve, 500) })
       }
-      expect(recovered, 'the watchdog restored the healthy composition and the instance came up').toBe(true)
+      const listenerPid = findPidOnPort(port)
+      const diagnostic = {
+        message: 'the watchdog restored the healthy composition and the instance came up',
+        deadlineAt: upDeadline,
+        deadlineMs: 45_000,
+        rejectedCompositionSha256,
+        currentCompositionSha256: createHash('sha256').update(readFileSync(join(profileDir, 'cordis.patch.yml'))).digest('hex'),
+        repoHead: currentHead(repo),
+        listener: listenerPid === null ? null : processIdentity(Number(listenerPid)),
+        receipt: readCutoverReceipt(stateDir),
+        watchdogLogTail: readFileSync(join(stateDir, STATE_FILES.watchdogLog), 'utf8').slice(-12_000),
+        lifecycle: JSON.parse(lifecycle.diagnostics()),
+      }
+      expect(recovered, JSON.stringify(diagnostic, null, 2)).toBe(true)
       expect(await fetchBody(port)).toBe('ok')
       // The failing inputs were backed up, and the recovery left a report record.
       const backups = readdirSync(stateDir).filter(name => name.startsWith('composition-backup-'))
@@ -1525,10 +2403,7 @@ describe('supervise', () => {
       expect(readFileSync(join(stateDir, backups[0]!, 'cordis.patch.yml'), 'utf8')).toContain('bad-plugin')
       // The record write trails the port by the CLI spawn — wait for it.
       const recordFile = join(stateDir, 'last-restart.json')
-      const recordDeadline = Date.now() + 5000
-      while (!existsSync(recordFile) && Date.now() < recordDeadline) {
-        await new Promise((resolve) => { setTimeout(resolve, 200) })
-      }
+      await waitForCondition('the composition-recovery report record', () => existsSync(recordFile))
       const record = JSON.parse(readFileSync(recordFile, 'utf8'))
       expect(record.compositionRecovered).toBe(true)
       expect(record.detail).toContain('回滚 profile patch 层变更')
@@ -1537,7 +2412,7 @@ describe('supervise', () => {
       await killListener(port)
       env.restore()
     }
-  }, 45_000)
+  }, 90_000)
 
   it('record-adoption carries the initiator and never overwrites a pending record', async () => {
     const stateDir = tmpDir('guard-cli-')
@@ -1575,7 +2450,7 @@ describe('supervise', () => {
         io().io,
       )).toBe(0)
       // The detached watchdog waits for the owner to exit, then takes over.
-      host.kill('SIGTERM')
+      lifecycle.signalExact(host, 'SIGTERM')
       const record = join(env.home, 'state', 'last-restart.json')
       const deadline = Date.now() + 20_000
       while (!existsSync(record) && Date.now() < deadline) {
@@ -1589,7 +2464,6 @@ describe('supervise', () => {
       if (previousSession === undefined) delete process.env.DSH_SESSION_ID
       else process.env.DSH_SESSION_ID = previousSession
       env.stop()
-      host.kill('SIGKILL')
       await killListener(port)
       env.restore()
     }
@@ -1656,6 +2530,932 @@ describe('supervise', () => {
     }
   }, 30_000)
 
+  it('reconfigure transfers supervision before stopping the old host and settles the target receipt', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const oldStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('old-host')).listen(${port},'127.0.0.1')"`
+    const targetStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('target-host')).listen(${port},'127.0.0.1')"`
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', oldStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      expect(await fetchBody(port)).toBe('old-host')
+      await waitForCondition(
+        'initial previous watchdog to finish its healthy boot',
+        () => lastGoodBootRevision(stateDir) === currentHead(repo),
+        30_000,
+      )
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)).toBe(0)
+      stubPreflight('true')
+      stubSandboxProbe(false)
+
+      const result = io()
+      const previousPath = process.env.PATH
+      process.env.PATH = (previousPath ?? '').split(':').filter(entry => entry !== '/usr/sbin').join(':')
+      try {
+        expect(await runCli([
+          'reconfigure', '--start', targetStart,
+          '--on-failure', 'restore-previous', '--browser-handoff', 'off',
+          '--delay-ms', '3000', '--state-dir', stateDir, '--repo', repo,
+          ...boundPreflightArgs(),
+        ], result.io)).toBe(0)
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH
+        else process.env.PATH = previousPath
+      }
+      expect(result.out.join('')).toContain('replacement watchdog stops the old child')
+      const claimed = readCutoverReceipt(stateDir)
+      expect(claimed?.supervisor.targetPid).not.toBe(claimed?.supervisor.previousPid)
+      expect(claimed?.supervisor.previousStartToken).toMatch(/^(darwin|linux|posix):/)
+      expect(claimed?.supervisor.targetDriverStartToken).toMatch(/^(darwin|linux|posix):/)
+      expect(claimed?.supervisor.targetStartToken).toMatch(/^(darwin|linux|posix):/)
+      expect(claimed?.ownership.previous.childPid).not.toBe(claimed?.supervisor.previousPid)
+      expect(claimed?.ownership.previous.childPid).not.toBe(claimed?.ownership.previous.listenerPid)
+      expect(claimed?.ownership.previous.childStartToken).not.toBe('')
+      expect(claimed?.ownership.previous.listenerStartToken).not.toBe('')
+      // The new watchdog owns the pidfile, but its grace window keeps the old
+      // host continuously available until the committed successor stops it.
+      expect(await fetchBody(port)).toBe('old-host')
+
+      try {
+        await waitForCondition(
+          'successful reconfigure target to settle its ready receipt',
+          () => readCutoverReceipt(stateDir)?.phase === 'ready',
+          60_000,
+          200,
+        )
+      } catch (error) {
+        const receipt = readCutoverReceipt(stateDir)
+        const logFile = join(stateDir, STATE_FILES.watchdogLog)
+        const log = existsSync(logFile) ? readFileSync(logFile, 'utf8') : '<watchdog log absent>'
+        throw new Error(`${String(error)}\n${JSON.stringify(receipt, null, 2)}\n${log.slice(-12000)}`)
+      }
+      const settledReceipt = readCutoverReceipt(stateDir)
+      const cutoverLog = readFileSync(join(stateDir, STATE_FILES.watchdogLog), 'utf8')
+      expect(settledReceipt?.phase, `${JSON.stringify(settledReceipt, null, 2)}\n${cutoverLog.slice(-12000)}`).toBe('ready')
+      expect(await fetchBody(port)).toBe('target-host')
+      expect(settledReceipt, `cutover did not settle; marker=${existsSync(join(stateDir, STATE_FILES.restartRequested))}\n${cutoverLog.slice(-8000)}`).toMatchObject({
+        phase: 'ready',
+        preflight: {
+          surface: 'built', candidateProbe: 'pass', composition: 'pass',
+          candidateProbeProvenance: 'caller-supplied',
+          targetCommandSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+          runnerSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+        authentication: { transportStatus: 200, browserHandoff: 'off' },
+        readiness: { role: 'target', stableWindowMs: 3000, retryCount: 0 },
+        canary: { outcome: 'pass' },
+        recovery: { result: 'not-needed' },
+      })
+      expect(settledReceipt?.ownership.target?.childPid).toBe(settledReceipt?.child.targetPid)
+      expect(settledReceipt?.ownership.target?.listenerPid).toBeGreaterThan(0)
+      expect(processIdentityMatches({
+        pid: settledReceipt!.ownership.previous.childPid,
+        startToken: settledReceipt!.ownership.previous.childStartToken,
+      })).toBe(false)
+      expect(processIdentityMatches({
+        pid: settledReceipt!.ownership.previous.listenerPid,
+        startToken: settledReceipt!.ownership.previous.listenerStartToken,
+      })).toBe(false)
+      expect(readLaunchState(stateDir)).toMatchObject({ mode: 'stable', active: { command: targetStart } })
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 120_000)
+
+  it('settles a protected previous-watchdog → candidate-watchdog cutover only after page acknowledgement', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const oldStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('old-protected-cutover-host')).listen(${port},'127.0.0.1')"`
+    const targetFixture = join(env.home, 'protected-ack-target.cjs')
+    writeFileSync(targetFixture, `
+const fs = require('fs')
+const http = require('http')
+const path = require('path')
+const port = Number(process.argv[2])
+const stateDir = process.argv[3]
+const grant = 'final-' + process.pid + '-' + Date.now()
+let armed = false
+let acknowledged = false
+const writeAtomic = (file, value) => {
+  const tmp = file + '.' + process.pid + '.tmp'
+  fs.writeFileSync(tmp, JSON.stringify(value) + '\\n', { mode: 0o600 })
+  fs.renameSync(tmp, file)
+}
+http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1:' + port)
+  if (url.searchParams.get('grant') === grant) {
+    res.writeHead(303, { location: '/', 'set-cookie': 'guard-session=ready; Path=/; HttpOnly' })
+    res.end()
+  } else if ((req.headers.cookie || '').includes('guard-session=ready')) {
+    res.end('protected-target')
+  } else {
+    res.statusCode = 401
+    res.end('authentication required')
+  }
+}).listen(port, '127.0.0.1', () => {
+  console.log('http://127.0.0.1:' + port + '/?grant=' + grant)
+})
+const timer = setInterval(() => {
+  try {
+    const receipt = JSON.parse(fs.readFileSync(path.join(stateDir, 'launch-cutover.json'), 'utf8'))
+    if (!armed) {
+      writeAtomic(path.join(stateDir, 'browser-handoff-request.json'), {
+        version: 2,
+        cutoverId: receipt.id,
+        registrations: [{
+          authority: '127.0.0.1:' + port,
+          capabilitySha256: 'a'.repeat(64),
+          armedAt: Date.now(),
+        }],
+      })
+      armed = true
+    }
+    const ownership = receipt.ownership && receipt.ownership.target
+    if (!acknowledged && receipt.canary && receipt.canary.outcome === 'pass'
+      && receipt.readiness && receipt.readiness.role === 'target'
+      && ownership && ownership.listenerPid === process.pid) {
+      writeAtomic(path.join(stateDir, 'browser-handoff-ack.json'), {
+        version: 1,
+        cutoverId: receipt.id,
+        role: 'target',
+        authority: '127.0.0.1:' + port,
+        listenerPid: ownership.listenerPid,
+        listenerStartToken: ownership.listenerStartToken,
+        channel: 'original-tab',
+        authentication: 'launch-url',
+        acknowledgedAt: Date.now(),
+      })
+      acknowledged = true
+      clearInterval(timer)
+    }
+  } catch {}
+}, 20)
+`)
+    const targetStart = `"${process.execPath}" ${JSON.stringify(targetFixture)} ${port} ${JSON.stringify(stateDir)}`
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', oldStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      expect(await runCli([
+        'record', 'build', '--trust-command', '--command', 'test fixture',
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      stubPreflight('true')
+      stubSandboxProbe(false)
+      expect(await runCli([
+        'reconfigure', '--start', targetStart,
+        '--on-failure', 'restore-previous', '--browser-handoff', 'required',
+        '--delay-ms', '200', '--state-dir', stateDir, '--repo', repo,
+        ...boundPreflightArgs(),
+      ], io().io)).toBe(0)
+
+      const deadline = Date.now() + 30_000
+      while (readCutoverReceipt(stateDir)?.phase !== 'ready' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      const receipt = readCutoverReceipt(stateDir)
+      const log = readFileSync(join(stateDir, STATE_FILES.watchdogLog), 'utf8')
+      expect(receipt?.phase, `${JSON.stringify(receipt, null, 2)}\n${log.slice(-12000)}`).toBe('ready')
+      expect(receipt).toMatchObject({
+        readiness: { role: 'target', retryCount: 0 },
+        browserHandoff: {
+          required: true,
+          status: 'acknowledged',
+          channel: 'original-tab',
+          authentication: 'launch-url',
+          authority: `127.0.0.1:${port}`,
+        },
+        authentication: { transportStatus: 401, browserHandoff: 'acknowledged' },
+        canary: { outcome: 'pass' },
+        recovery: { result: 'not-needed' },
+      })
+      const eventKinds = receipt?.events.map(event => event.kind) ?? []
+      expect(eventKinds.indexOf('canary')).toBeLessThan(eventKinds.indexOf('browser-handoff'))
+      expect(eventKinds.indexOf('browser-handoff')).toBeLessThan(eventKinds.indexOf('ready'))
+      expect(receipt?.events.some(event => event.kind === 'browser-fallback-opened')).toBe(false)
+      expect(log).toContain('original browser tab acknowledged handoff')
+      expect(log).not.toContain('?grant=')
+      expect(readFileSync(join(stateDir, STATE_FILES.launchCutover), 'utf8')).not.toContain('?grant=')
+      expect(await fetchStatus(port)).toBe(401)
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
+
+  it('bounds a hung previous watchdog, consumes restore while waiting, and retires only its frozen identity', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const previousStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('previous-after-hung-supervisor')).listen(${port},'127.0.0.1')"`
+    const targetStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('target-must-not-start')).listen(${port},'127.0.0.1')"`
+    let previousSupervisor: ReturnType<typeof processIdentity> = null
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', previousStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      const previousPid = Number(readFileSync(join(stateDir, STATE_FILES.watchdogPid), 'utf8'))
+      previousSupervisor = processIdentity(previousPid)
+      expect(previousSupervisor).not.toBeNull()
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)).toBe(0)
+      stubPreflight('true')
+      stubSandboxProbe(false)
+
+      // Establish the wedged-previous precondition before the successor can
+      // retire it. The previous host is a separate child and keeps serving;
+      // the successor must still claim supervision, consume restore while it
+      // waits, and retire exactly this frozen identity after the bound yield.
+      expect(freezeFixtureIdentity(previousSupervisor!)).toBe('frozen')
+      expect(await fetchBody(port)).toBe('previous-after-hung-supervisor')
+      expect(await runCli([
+        'reconfigure', '--start', targetStart,
+        '--on-failure', 'wait-for-user', '--browser-handoff', 'off',
+        '--delay-ms', '200', '--supervisor-yield-timeout-ms', '3000',
+        '--state-dir', stateDir, '--repo', repo,
+        ...boundPreflightArgs(),
+      ], io().io)).toBe(0)
+
+      const logFile = join(stateDir, STATE_FILES.watchdogLog)
+      // Claiming supervision and reaching the bounded-yield loop traverses
+      // multiple real shell/process observations. A five-second precondition
+      // budget raced that progress under the full gate even though the
+      // production 3 s yield bound itself had not started yet.
+      await waitForCondition(
+        'replacement watchdog to enter the bounded previous-supervisor yield',
+        () => existsSync(logFile) && readFileSync(logFile, 'utf8').includes('waiting up to 3000ms'),
+        30_000,
+        50,
+      )
+      expect(readFileSync(logFile, 'utf8')).toContain('waiting up to 3000ms')
+      expect(await fetchBody(port)).toBe('previous-after-hung-supervisor')
+      expect(await runCli(['restore-previous', '--state-dir', stateDir], io().io)).toBe(0)
+
+      await waitForCondition(
+        'hung-previous cutover to restore the previous launch',
+        () => readCutoverReceipt(stateDir)?.phase === 'restored',
+        60_000,
+      )
+      const receipt = readCutoverReceipt(stateDir)
+      expect(receipt?.phase, `${JSON.stringify(receipt, null, 2)}\n${readFileSync(logFile, 'utf8').slice(-12000)}`).toBe('restored')
+      expect(receipt).toMatchObject({
+        supervisor: { previousPid, previousRetirement: 'forced' },
+        failureCount: { target: 0, previous: 0 },
+        readiness: { role: 'previous', retryCount: 0 },
+        recovery: { result: 'restored' },
+      })
+      expect(receipt?.attempts.some(attempt => attempt.role === 'target')).toBe(false)
+      expect(receipt?.events.some(event => event.kind === 'control-requested' && event.detail === 'restore-previous')).toBe(true)
+      expect(processIdentityMatches(previousSupervisor!)).toBe(false)
+      expect(await fetchBody(port)).toBe('previous-after-hung-supervisor')
+    } finally {
+      if (previousSupervisor !== null && processIdentityMatches(previousSupervisor)) {
+        signalProcessIdentity(previousSupervisor, 'SIGKILL')
+      }
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 90_000)
+
+  it('reconfigure restores the complete previous spec after target readiness failures', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const previousStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('previous-restored')).listen(${port},'127.0.0.1')"`
+    const brokenTarget = `"${process.execPath}" -e "process.stderr.write('target boot failed\\n'); process.exit(1)"`
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', previousStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)).toBe(0)
+      stubPreflight('true')
+      stubSandboxProbe(false)
+      expect(await runCli([
+        'reconfigure', '--start', brokenTarget,
+        '--on-failure', 'restore-previous', '--browser-handoff', 'off',
+        '--delay-ms', '500', '--state-dir', stateDir, '--repo', repo,
+        ...boundPreflightArgs(),
+      ], io().io)).toBe(0)
+
+      await waitForCondition(
+        'failed reconfigure target to restore the complete previous launch spec',
+        () => readCutoverReceipt(stateDir)?.phase === 'restored',
+        60_000,
+        200,
+      )
+      expect(await fetchBody(port)).toBe('previous-restored')
+      const receipt = readCutoverReceipt(stateDir)
+      expect(receipt).toMatchObject({
+        phase: 'restored',
+        recovery: { policy: 'restore-previous', result: 'restored' },
+      })
+      expect(receipt?.attempts.filter(attempt => attempt.role === 'target').length).toBe(2)
+      expect(receipt?.attempts.some(attempt => attempt.role === 'previous' && attempt.outcome === 'ready')).toBe(true)
+      expect(readLaunchState(stateDir)).toMatchObject({ mode: 'stable', active: { command: previousStart } })
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 90_000)
+
+  it('applies a live-home transition only after takeover and rolls it back before restoring previous', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const legacyState = join(env.home, 'storages/session_projcache.json')
+    const targetState = join(env.home, 'storages/session_projcache')
+    mkdirSync(join(env.home, 'storages'), { recursive: true })
+    writeFileSync(legacyState, 'previous-version-3')
+    const previousStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('previous-with-v3')).listen(${port},'127.0.0.1')"`
+    const failingTarget = join(env.home, 'target-writes-v5.cjs')
+    writeFileSync(failingTarget, `
+const fs = require('fs')
+const path = ${JSON.stringify(join(targetState, 'sessions/rebuilt.json'))}
+fs.mkdirSync(require('path').dirname(path), { recursive: true })
+fs.writeFileSync(path, 'rejected-target-version-5')
+process.stderr.write('target boot failed after writing v5\\n')
+process.exit(1)
+`)
+    const transitionFile = join(env.home, 'transition-plan.json')
+    writeFileSync(transitionFile, `${JSON.stringify({
+      schemaVersion: 1,
+      home: env.home,
+      operations: [
+        { kind: 'quarantine', path: 'storages/session_projcache.json', expect: 'present' },
+        { kind: 'quarantine', path: 'storages/session_projcache', expect: 'absent' },
+      ],
+    }, null, 2)}\n`)
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', previousStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      expect(await fetchBody(port)).toBe('previous-with-v3')
+      expect(readFileSync(legacyState, 'utf8')).toBe('previous-version-3')
+      expect(await runCli([
+        'record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      stubPreflight('test ! -e "$DSH_HOME/storages/session_projcache.json"')
+      stubSandboxProbe(false)
+
+      const result = io()
+      expect(await runCli([
+        'reconfigure', '--start', `"${process.execPath}" ${JSON.stringify(failingTarget)}`,
+        '--transition-file', transitionFile,
+        '--on-failure', 'restore-previous', '--browser-handoff', 'off',
+        '--delay-ms', '500', '--state-dir', stateDir, '--repo', repo,
+        ...boundPreflightArgs(),
+      ], result.io)).toBe(0)
+      expect(result.out.join('')).toContain('filesystem transition preflight PASS on an isolated copy')
+
+      await waitForCondition(
+        'transition rollback to restore the previous launch',
+        () => readCutoverReceipt(stateDir)?.phase === 'restored',
+        60_000,
+        200,
+      )
+      const receipt = readCutoverReceipt(stateDir)
+      const log = readFileSync(join(stateDir, STATE_FILES.watchdogLog), 'utf8')
+      expect(receipt?.phase, `${JSON.stringify(receipt, null, 2)}\n${log.slice(-12000)}`).toBe('restored')
+      expect(receipt).toMatchObject({
+        transition: { phase: 'rolled-back', operationCount: 2 },
+        recovery: { policy: 'restore-previous', result: 'restored' },
+      })
+      expect(receipt?.events.filter(event => event.kind === 'transition').map(event => event.detail)).toEqual([
+        expect.stringMatching(/^applied [a-f0-9]{64}$/),
+        expect.stringMatching(/^rolled-back [a-f0-9]{64}$/),
+      ])
+      expect(await fetchBody(port)).toBe('previous-with-v3')
+      expect(readFileSync(legacyState, 'utf8')).toBe('previous-version-3')
+      expect(readFileSync(join(
+        stateDir, 'launch-transitions', receipt!.id,
+        'rejected-target/storages/session_projcache/sessions/rebuilt.json',
+      ), 'utf8')).toBe('rejected-target-version-5')
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 90_000)
+
+  it('does not accept a stale 200 when the target reports EADDRINUSE, and counts failures before restoring previous', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const releaseStale = join(env.home, 'release-stale-listener')
+    const previousProgram = `const fs=require('fs');const server=require('http').createServer((q,s)=>s.end('previous-after-eaddr'));server.on('error',error=>{fs.writeFileSync(${JSON.stringify(releaseStale)},'release');throw error});server.listen(${port},'127.0.0.1')`
+    const previousStart = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(previousProgram)}`
+    const staleServer = join(env.home, 'stale-listener.cjs')
+    writeFileSync(staleServer, `const fs=require('fs');const server=require('http').createServer((q,s)=>s.end('stale-old-listener-200'));server.listen(${port},'127.0.0.1');const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(releaseStale)})){clearInterval(timer);server.close(()=>process.exit(0))}},25);setTimeout(()=>server.close(()=>process.exit(0)),10000)\n`)
+    const orphanLauncher = join(env.home, 'orphan-listener.cjs')
+    writeFileSync(orphanLauncher, `const {spawn}=require('child_process');const child=spawn(process.execPath,[${JSON.stringify(staleServer)}],{detached:true,stdio:'ignore'});child.unref()\n`)
+    const targetScript = join(env.home, 'target-eaddr.sh')
+    writeFileSync(targetScript, `#!/bin/bash
+"${process.execPath}" "${orphanLauncher}"
+sleep 0.2
+"${process.execPath}" -e "require('http').createServer().listen(${port},'127.0.0.1')" || true
+printf 'EADDRINUSE :${port}\\n' >&2
+sleep 0.6
+exit 1
+`)
+    chmodSync(targetScript, 0o700)
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', previousStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)).toBe(0)
+      stubPreflight('true')
+      stubSandboxProbe(false)
+      expect(await runCli([
+        'reconfigure', '--start', `/bin/bash ${JSON.stringify(targetScript)}`,
+        '--on-failure', 'restore-previous', '--browser-handoff', 'off',
+        '--delay-ms', '200', '--state-dir', stateDir, '--repo', repo,
+        ...boundPreflightArgs(),
+      ], io().io)).toBe(0)
+
+      const deadline = Date.now() + 35_000
+      while (readCutoverReceipt(stateDir)?.phase !== 'restored' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 200))
+      }
+      expect(await fetchBody(port)).toBe('previous-after-eaddr')
+      const receipt = readCutoverReceipt(stateDir)
+      const targetAttempts = receipt?.attempts.filter(attempt => attempt.role === 'target') ?? []
+      expect(targetAttempts).toHaveLength(2)
+      expect(targetAttempts.every(attempt => attempt.outcome === 'failed')).toBe(true)
+      expect(receipt).toMatchObject({ phase: 'restored', failureCount: { target: 2, previous: 1 }, recovery: { result: 'restored' } })
+      expect(receipt?.ownership.target).toBeUndefined()
+      const log = readFileSync(join(stateDir, STATE_FILES.watchdogLog), 'utf8')
+      expect(log).toContain(`cutover target hit EADDRINUSE on :${port}`)
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
+
+  it('rejects a target that exits after authenticated 200 without handing its URL to the browser, then restores previous', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const previousStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('previous-after-short-ready')).listen(${port},'127.0.0.1')"`
+    const shortTargetFixture = join(env.home, 'short-protected-target.cjs')
+    writeFileSync(shortTargetFixture, `
+const http = require('http')
+const grant = 'short-' + process.pid
+http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1:${port}')
+  if (url.searchParams.get('grant') === grant) {
+    res.statusCode = 303
+    res.setHeader('location', '/')
+    res.setHeader('set-cookie', 'short-ready=yes; Path=/; HttpOnly')
+    res.end()
+  } else if ((req.headers.cookie || '').includes('short-ready=yes')) {
+    res.statusCode = 200
+    res.end('short-target')
+  } else {
+    res.statusCode = 401
+    res.end('authentication required')
+  }
+}).listen(${port}, '127.0.0.1', () => console.log('http://127.0.0.1:${port}/?grant=' + grant))
+setTimeout(() => process.exit(23), 1800)
+`)
+    const shortTarget = `"${process.execPath}" ${JSON.stringify(shortTargetFixture)}`
+    const handoffFile = join(env.home, 'rejected-target-handoff.txt')
+    const opener = join(env.home, 'rejected-target-open.sh')
+    writeFileSync(opener, `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(handoffFile)}\n`)
+    chmodSync(opener, 0o700)
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', previousStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)).toBe(0)
+      stubPreflight('true')
+      stubSandboxProbe(false)
+      const previousOpenCommand = process.env.WD_BROWSER_OPEN_COMMAND
+      process.env.WD_BROWSER_OPEN_COMMAND = opener
+      try {
+        expect(await runCli([
+          'reconfigure', '--start', shortTarget,
+          '--on-failure', 'restore-previous', '--browser-handoff', 'required',
+          '--delay-ms', '200', '--state-dir', stateDir, '--repo', repo,
+          ...boundPreflightArgs(),
+        ], io().io)).toBe(0)
+      } finally {
+        if (previousOpenCommand === undefined) delete process.env.WD_BROWSER_OPEN_COMMAND
+        else process.env.WD_BROWSER_OPEN_COMMAND = previousOpenCommand
+      }
+
+      const deadline = Date.now() + 50_000
+      while (readCutoverReceipt(stateDir)?.phase !== 'restored' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 200))
+      }
+      expect(await fetchBody(port)).toBe('previous-after-short-ready')
+      const receipt = readCutoverReceipt(stateDir)
+      const log = readFileSync(join(stateDir, STATE_FILES.watchdogLog), 'utf8')
+      expect(receipt, `${JSON.stringify(receipt, null, 2)}\n${log.slice(-12000)}`).toMatchObject({
+        phase: 'restored', recovery: { result: 'restored' },
+      })
+      expect(receipt?.attempts.filter(attempt => attempt.role === 'target')).toHaveLength(2)
+      expect(receipt?.attempts.some(attempt => attempt.role === 'target' && attempt.outcome === 'ready')).toBe(false)
+      expect(receipt?.readiness?.role).toBe('previous')
+      expect(receipt?.authentication.browserHandoff).toBe('not-required')
+      expect(existsSync(handoffFile)).toBe(false)
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 65_000)
+
+  it('restore-previous interrupts an in-flight target and overrides a recorded wait-for-user policy', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const previousStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('previous-after-operator-restore')).listen(${port},'127.0.0.1')"`
+    const pendingTarget = `"${process.execPath}" -e "require('http').createServer((q,s)=>{s.statusCode=503;s.end('target-not-ready')}).listen(${port},'127.0.0.1')"`
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', previousStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)).toBe(0)
+      stubPreflight('true')
+      stubSandboxProbe(false)
+      expect(await runCli([
+        'reconfigure', '--start', pendingTarget,
+        '--on-failure', 'wait-for-user', '--browser-handoff', 'off',
+        '--delay-ms', '200', '--state-dir', stateDir, '--repo', repo,
+        ...boundPreflightArgs(),
+      ], io().io)).toBe(0)
+      const targetDeadline = Date.now() + 15_000
+      while (readCutoverReceipt(stateDir)?.phase !== 'target-starting' && Date.now() < targetDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      expect(readCutoverReceipt(stateDir)?.phase).toBe('target-starting')
+      const restore = io()
+      expect(await runCli(['restore-previous', '--state-dir', stateDir], restore.io)).toBe(0)
+      expect(restore.out.join('')).toContain('explicit restore-previous requested')
+
+      const deadline = Date.now() + 25_000
+      while (readCutoverReceipt(stateDir)?.phase !== 'restored' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 200))
+      }
+      const lifecycleReceipt = readCutoverReceipt(stateDir)
+      const lifecycleLog = readFileSync(join(stateDir, STATE_FILES.watchdogLog), 'utf8')
+      expect(lifecycleReceipt?.phase, `${JSON.stringify(lifecycleReceipt, null, 2)}\n${lifecycleLog.slice(-12000)}`).toBe('restored')
+      expect(await fetchBody(port)).toBe('previous-after-operator-restore')
+      const receipt = lifecycleReceipt
+      expect(receipt).toMatchObject({
+        phase: 'restored',
+        recovery: { policy: 'wait-for-user', result: 'restored' },
+      })
+      expect(receipt?.events.some(event => event.kind === 'control-requested' && event.detail === 'restore-previous')).toBe(true)
+      expect(readCutoverControl(stateDir)).toBeNull()
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
+
+  it('abort-cutover applies the recorded wait-for-user policy and parks without declaring target ready', async () => {
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const previousStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('previous-before-abort')).listen(${port},'127.0.0.1')"`
+    const pendingTarget = `"${process.execPath}" -e "require('http').createServer((q,s)=>{s.statusCode=503;s.end('target-not-ready')}).listen(${port},'127.0.0.1')"`
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', previousStart,
+        '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForPort(port)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo], io().io)).toBe(0)
+      stubPreflight('true')
+      stubSandboxProbe(false)
+      expect(await runCli([
+        'reconfigure', '--start', pendingTarget,
+        '--on-failure', 'wait-for-user', '--browser-handoff', 'off',
+        '--delay-ms', '200', '--state-dir', stateDir, '--repo', repo,
+        ...boundPreflightArgs(),
+      ], io().io)).toBe(0)
+      const targetDeadline = Date.now() + 15_000
+      while (readCutoverReceipt(stateDir)?.phase !== 'target-starting' && Date.now() < targetDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      const abort = io()
+      expect(await runCli(['abort-cutover', '--state-dir', stateDir], abort.io)).toBe(0)
+      expect(abort.out.join('')).toContain('apply the pre-approved wait-for-user policy')
+
+      const deadline = Date.now() + 15_000
+      while (readCutoverReceipt(stateDir)?.phase !== 'awaiting-user' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 200))
+      }
+      expect(readCutoverReceipt(stateDir)).toMatchObject({
+        phase: 'awaiting-user', recovery: { policy: 'wait-for-user', result: 'waiting-for-user' },
+      })
+      // The durable receipt is intentionally written before the crash page is
+      // spawned. Wait for the presentation side instead of assuming the state
+      // rename and socket bind are one atomic operation.
+      let parkedStatus: number | undefined
+      const pageDeadline = Date.now() + 5_000
+      while (Date.now() < pageDeadline) {
+        try {
+          parkedStatus = await fetchStatus(port)
+          if (parkedStatus === 503) break
+        } catch { /* receipt is durable; the page bind follows */ }
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      expect(parkedStatus).toBe(503)
+      expect(readCutoverReceipt(stateDir)?.attempts.some(attempt => attempt.role === 'target' && attempt.outcome === 'ready')).toBe(false)
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 40_000)
+
+  it('a foreground supervisor waiting behind a cutover reloads restored previous state before takeover', async () => {
+    const env = supervisedEnv()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const previousRepo = makeRepo()
+    const targetRepo = makeRepo()
+    const previousHarness = tmpDir('guard-waiter-previous-host-')
+    const targetHarness = tmpDir('guard-waiter-target-host-')
+    const previousMarker = join(env.home, 'previous-started.txt')
+    const targetMarker = join(env.home, 'target-started.txt')
+    const hostCommand = (marker: string, body: string): string => {
+      const program = `const fs=require('fs'),http=require('http');fs.writeFileSync(${JSON.stringify(marker)},process.env.DSH_HARNESS||'');http.createServer((q,s)=>s.end(${JSON.stringify(body)})).listen(${port},'127.0.0.1')`
+      return `${JSON.stringify(process.execPath)} -e ${JSON.stringify(program)}`
+    }
+    const previous: LaunchSpec = {
+      version: 1,
+      command: hostCommand(previousMarker, 'previous-after-wait'),
+      port,
+      home: env.home,
+      credentialRepo: previousRepo,
+      harnessRoot: previousHarness,
+      profile: 'web',
+    }
+    const target: LaunchSpec = {
+      ...previous,
+      command: hostCommand(targetMarker, 'rejected-target'),
+      credentialRepo: targetRepo,
+      harnessRoot: targetHarness,
+    }
+    const successor = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' })
+    const waiterOutput = io()
+    let waiter: Promise<number> | undefined
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, STATE_FILES.watchdogPid), String(successor.pid))
+      prepareLaunchCutover(stateDir, {
+        id: 'waiter-refresh-cutover', previous, target,
+        recoveryPolicy: 'restore-previous', browserHandoff: 'off',
+        previousSupervisorPid: successor.pid!, previousSupervisorStartToken: 'successor-start', previousOwnership: fakeOwnership(successor.pid!), now: NOW,
+      })
+
+      // This models launchd/systemd restarting its stable foreground launcher
+      // while the cutover successor owns supervision. It initially observes
+      // selected target, then waits behind that live owner.
+      waiter = runCli(['supervise', '--foreground', '--state-dir', stateDir], waiterOutput.io)
+      const waitingDeadline = Date.now() + 5_000
+      while (!waiterOutput.out.join('').includes('waiting for it to exit') && Date.now() < waitingDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      expect(waiterOutput.out.join('')).toContain('waiting for it to exit')
+
+      recordCutoverEvent(stateDir, 'waiter-refresh-cutover', 'restoring', ['target rejected'], NOW + 1)
+      recordCutoverEvent(stateDir, 'waiter-refresh-cutover', 'child-started', ['previous', '1', String(successor.pid), 'waiter-previous-start'], NOW + 2)
+      recordCutoverEvent(stateDir, 'waiter-refresh-cutover', 'ownership-stable', ['previous', String(successor.pid), 'waiter-previous-start', String(successor.pid), 'waiter-listener-start', '3000', '0'], NOW + 3)
+      recordCutoverEvent(stateDir, 'waiter-refresh-cutover', 'canary', ['pass'], NOW + 4)
+      recordCutoverEvent(stateDir, 'waiter-refresh-cutover', 'ready', ['previous'], NOW + 5)
+      lifecycle.signalExact(successor, 'SIGTERM')
+
+      const previousDeadline = Date.now() + 15_000
+      while (!existsSync(previousMarker) && Date.now() < previousDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      expect(readFileSync(previousMarker, 'utf8')).toBe(previousHarness)
+      expect(existsSync(targetMarker)).toBe(false)
+      await waitForPort(port)
+      expect(await fetchBody(port)).toBe('previous-after-wait')
+      expect(readLaunchState(stateDir)).toMatchObject({
+        mode: 'stable',
+        active: { command: previous.command, credentialRepo: previousRepo, harnessRoot: previousHarness },
+      })
+      expect(waiterOutput.out.join('')).toContain('launch state refreshed after wait')
+    } finally {
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, STATE_FILES.watchdogStop), '')
+      await killListener(port)
+      if (waiter !== undefined) await Promise.race([waiter, new Promise<number>(resolve => setTimeout(() => resolve(-1), 3_000))])
+      env.stop()
+      env.restore()
+    }
+  }, 30_000)
+
+  it('treats naked 401 as transport-up and requires launch URL → 303 → cookie 200 for server readiness', async () => {
+    const home = tmpDir('guard-auth-ready-')
+    const repo = makeRepo()
+    const stateDir = join(home, 'state')
+    mkdirSync(join(home, 'home'), { recursive: true })
+    mkdirSync(stateDir, { recursive: true })
+    const port = await freePort()
+    const hostFixture = join(home, 'protected-host.cjs')
+    writeFileSync(hostFixture, `
+const http = require('http')
+const port = Number(process.argv[2])
+const grant = 'process-' + process.pid + '-' + Date.now()
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1:' + port)
+  if (url.searchParams.get('grant') === grant) {
+    res.statusCode = 303
+    res.setHeader('location', '/')
+    res.setHeader('set-cookie', 'guard-session=ready; Path=/; HttpOnly')
+    res.end()
+    return
+  }
+  if ((req.headers.cookie || '').includes('guard-session=ready')) {
+    res.statusCode = 200
+    res.end('authenticated')
+    return
+  }
+  res.statusCode = 401
+  res.end('authentication required')
+})
+server.listen(port, '127.0.0.1', () => {
+  console.log('host launch: http://127.0.0.1:' + port + '/?grant=' + grant)
+})
+`)
+    const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
+    let output = ''
+    const watchdog = spawn('bash', [script, '--supervise'], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: watchdogEnv({
+        WD_HOME: home,
+        WD_STATE_DIR: stateDir,
+        WD_PORT: String(port),
+        WD_REPO: repo,
+        WD_START: `${JSON.stringify(process.execPath)} ${JSON.stringify(hostFixture)} ${port}`,
+        WD_BOOT_TIMEOUT: '10',
+        WD_BROWSER_HANDOFF: 'off',
+      }),
+    })
+    watchdog.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    watchdog.stderr.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    try {
+      const deadline = Date.now() + 20_000
+      while (!output.includes('instance ready') && Date.now() < deadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 100) })
+      }
+      expect(output).toContain(`transport up on :${port} (HTTP 401)`)
+      expect(output).toContain('instance ready')
+      expect(await fetchStatus(port)).toBe(401)
+      const attempt = readFileSync(join(stateDir, STATE_FILES.bootAttemptLog), 'utf8')
+      expect(attempt).toContain('[launch-url-redacted]')
+      expect(attempt).not.toContain('?grant=')
+      expect(output).not.toContain('?grant=')
+    } finally {
+      await killListener(port)
+    }
+  }, 30_000)
+
+  it('does not treat a successful system opener as browser acknowledgement', async () => {
+    const home = tmpDir('guard-browser-no-ack-')
+    const repo = makeRepo()
+    const stateDir = join(home, 'state')
+    mkdirSync(stateDir, { recursive: true })
+    const port = await freePort()
+    const hostFixture = join(home, 'protected-no-ack.cjs')
+    writeFileSync(hostFixture, `
+const http = require('http')
+const port = Number(process.argv[2])
+const grant = 'attempt-' + process.pid
+http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1:' + port)
+  if (url.searchParams.get('grant') === grant) {
+    res.writeHead(303, { location: '/', 'set-cookie': 'guard-session=ready; Path=/; HttpOnly' })
+    res.end()
+  } else if ((req.headers.cookie || '').includes('guard-session=ready')) {
+    res.end('authenticated')
+  } else {
+    res.statusCode = 401
+    res.end('authentication required')
+  }
+}).listen(port, '127.0.0.1', () => console.log('http://127.0.0.1:' + port + '/?grant=' + grant))
+`)
+    const opened = join(home, 'open-returned-zero')
+    const opener = join(home, 'browser-open.sh')
+    writeFileSync(opener, `#!/bin/sh\nprintf opened > ${JSON.stringify(opened)}\n`)
+    chmodSync(opener, 0o700)
+    const cutoverId = 'cutover-browser-no-ack'
+    const targetCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(hostFixture)} ${port}`
+    const previous = {
+      version: 1, command: 'previous-host', port, home,
+      credentialRepo: repo, harnessRoot: home, profile: 'web',
+    } satisfies LaunchSpec
+    prepareLaunchCutover(stateDir, {
+      id: cutoverId,
+      previous,
+      target: { ...previous, command: targetCommand },
+      recoveryPolicy: 'wait-for-user',
+      browserHandoff: 'required',
+      previousSupervisorPid: 999_998,
+      previousSupervisorStartToken: 'gone-supervisor',
+      previousOwnership: {
+        childPid: 999_999,
+        childStartToken: 'gone-child',
+        listenerPid: 999_999,
+        listenerStartToken: 'gone-listener',
+      },
+    })
+    recordCredential(stateDir, {
+      scope: 'build+test', revision: currentHead(repo)!, command: 'test fixture',
+    }, Date.now())
+    const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
+    let output = ''
+    const watchdog = spawn('bash', [script, '--supervise'], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: watchdogEnv({
+        WD_HOME: home,
+        WD_STATE_DIR: stateDir,
+        WD_PORT: String(port),
+        WD_REPO: repo,
+        WD_HARNESS_ROOT: home,
+        WD_START: targetCommand,
+        WD_BOOT_TIMEOUT: '10',
+        WD_BROWSER_HANDOFF: 'required',
+        WD_BROWSER_HANDOFF_TIMEOUT_SECONDS: '1',
+        WD_BROWSER_OPEN_COMMAND: opener,
+        WD_CUTOVER_ID: cutoverId,
+        WD_CUTOVER_POLICY: 'wait-for-user',
+        WD_CUTOVER_ROLE: 'target',
+        WD_PREVIOUS_START: previous.command,
+        WD_PREVIOUS_HOME: previous.home,
+        WD_PREVIOUS_REPO: previous.credentialRepo,
+        WD_PREVIOUS_HARNESS_ROOT: previous.harnessRoot,
+        WD_PREVIOUS_PROFILE: previous.profile,
+        WD_PREVIOUS_CHILD_PID: '999999',
+        WD_PREVIOUS_CHILD_START: 'gone-child',
+        WD_PREVIOUS_LISTENER_PID: '999999',
+        WD_PREVIOUS_LISTENER_START: 'gone-listener',
+        WD_GUARD: `${process.execPath} ${fileURLToPath(new URL('../lib/cli.js', import.meta.url))}`,
+      }),
+    })
+    watchdog.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    watchdog.stderr.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    try {
+      await waitForCondition('the browser handoff failure output', () => output.includes('no page acknowledgement'), 30_000)
+      await waitForCondition('the terminal awaiting-user receipt', () => readCutoverReceipt(stateDir)?.phase === 'awaiting-user', 30_000, 50)
+      expect(existsSync(opened), output).toBe(true)
+      expect(output).toContain('browser fallback open requested')
+      expect(output).toContain('browser handoff failed: no page acknowledgement')
+      expect(output).toContain('instance ready')
+      expect(readCutoverReceipt(stateDir)).toMatchObject({
+        phase: 'awaiting-user',
+        canary: { outcome: 'pass' },
+        browserHandoff: { status: 'failed' },
+        failureCount: { target: 1 },
+      })
+    } finally {
+      await killListener(port)
+    }
+  }, 75_000)
+
   it('reclaims a pidfile deleted underneath it, and yields to a live replacement owner', async () => {
     // The state dir cleaned under a RUNNING watchdog must not fork
     // supervision: the watchdog reclaims its claim within one poll; and when
@@ -1672,10 +3472,6 @@ describe('supervise', () => {
     })
     wd.unref()
     const pidfile = join(home, 'state', 'watchdog.pid')
-    cleanups.unshift(() => {
-      try { process.kill(-(wd.pid ?? 0), 'SIGKILL') } catch { /* not a group leader */ }
-      try { process.kill(wd.pid ?? 0, 'SIGKILL') } catch { /* already gone */ }
-    })
     const until = async (fn: () => boolean, ms: number): Promise<boolean> => {
       const deadline = Date.now() + ms
       while (Date.now() < deadline) {
@@ -1713,15 +3509,6 @@ describe('supervise', () => {
     mkdirSync(join(home, 'home'), { recursive: true })
     const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
     const port = await freePort()
-    const killTree = (pid: number): void => {
-      let children: number[] = []
-      try {
-        children = execFileSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' })
-          .split('\n').map(Number).filter((n) => Number.isInteger(n) && n > 0)
-      } catch { /* pgrep exits 1 when the pid has no children */ }
-      for (const child of children) killTree(child)
-      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
-    }
     // One launcher backgrounding all racers from a single shell: they reach the
     // claim within the same few milliseconds. Spawning them one-by-one from
     // node staggers them by enough process-setup time that the first racer has
@@ -1730,10 +3517,6 @@ describe('supervise', () => {
       env: watchdogEnv({ WD_HOME: home, WD_PORT: String(port), WD_TEST_FAKE: '1' }),
       stdio: 'ignore',
     })
-    // unshift for the same reason as `supervisedEnv`: the survivor must die
-    // before `tmpDir` removes the WD_HOME it keeps writing into. The racers are
-    // NOT setsid'd (they share this process's group), so reap the tree by pid.
-    cleanups.unshift(() => { if (launcher.pid !== undefined) killTree(launcher.pid) })
     const survivors = (): number[] => {
       try {
         return execFileSync('pgrep', ['-P', String(launcher.pid)], { encoding: 'utf8' })
@@ -1777,10 +3560,6 @@ describe('supervise', () => {
       detached: true,
     })
     wd.unref()
-    cleanups.unshift(() => {
-      try { process.kill(-(wd.pid ?? 0), 'SIGKILL') } catch { /* not a group leader */ }
-      try { process.kill(wd.pid ?? 0, 'SIGKILL') } catch { /* already gone */ }
-    })
     const attempts = (): number => (readFileSync(wdLog, 'utf8').match(/starting instance/g) ?? []).length
     const until = async (fn: () => boolean, ms: number): Promise<boolean> => {
       const deadline = Date.now() + ms
@@ -1813,10 +3592,10 @@ describe('supervise', () => {
       expect(log).toContain('crash page cannot bind')
       try { process.kill(holder.pid ?? 0, 0) } catch { throw new Error('port holder was killed') }
       // SIGUSR1 re-arms the boot loop.
-      process.kill(wd.pid ?? 0, 'SIGUSR1')
-      expect(await until(() => attempts() > settled, 15_000)).toBe(true)
+      lifecycle.signalExact(wd, 'SIGUSR1')
+      expect(await until(() => attempts() > settled, 15_000), readFileSync(wdLog, 'utf8')).toBe(true)
     } finally {
-      holder?.kill('SIGKILL')
+      if (holder !== undefined) lifecycle.signalExact(holder, 'SIGKILL')
       await new Promise((resolve) => { setTimeout(resolve, 300) })
       await killListener(port)
     }
@@ -1825,12 +3604,15 @@ describe('supervise', () => {
   it('schedule-exit refuses without a credential (the gate)', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
+    const port = await freePort()
+    markLiveWatchdog(join(env.home, 'state'))
     const out = io()
     expect(await runCli(
-      ['schedule-exit', '--port', '3099', '--delay-ms', '1000', '--state-dir', join(env.home, 'state'), '--repo', repo],
+      ['schedule-exit', '--port', String(port), '--delay-ms', '1000', '--state-dir', join(env.home, 'state'), '--repo', repo],
       out.io,
     )).toBe(1)
-    expect(out.err.join('')).toContain('refused')
+    expect(out.err.join('')).toContain('no green-build credential')
+    rmSync(join(env.home, 'state', STATE_FILES.watchdogPid), { force: true })
     env.restore()
   })
 
@@ -1861,22 +3643,22 @@ describe('supervise', () => {
     }
   })
 
-  it('schedule-exit warns when no live watchdog will respawn the instance', async () => {
+  it('schedule-exit hard-refuses when no live watchdog will respawn the instance', async () => {
     const env = supervisedEnv()
     const repo = makeRepo()
     const stateDir = join(env.home, 'state')
     try {
-      expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
       stubPreflight('true')
       const port = await freePort()
       const out = io()
-      // No watchdog has ever run here: the first-install bootstrap gap must
-      // surface as a warning, not as a silently dead service.
+      // No watchdog has ever run here: scheduling the kill would guarantee an outage.
       expect(await runCli(
         ['schedule-exit', '--port', String(port), '--delay-ms', '60000', '--state-dir', stateDir, '--repo', repo],
         out.io,
-      )).toBe(0)
-      expect(out.err.join('')).toContain('no live watchdog')
+      )).toBe(1)
+      expect(out.err.join('')).toContain('schedule-exit refused: no live watchdog')
+      expect(existsSync(join(stateDir, 'restart-requested.json'))).toBe(false)
     } finally {
       env.restore()
     }
@@ -1888,7 +3670,7 @@ describe('supervise', () => {
     const stateDir = join(env.home, 'state')
     const flags = ['--state-dir', stateDir, '--repo', repo]
     try {
-      expect(await runCli(['record', 'build', ...flags], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', ...flags], io().io)).toBe(0)
       stubSandboxProbe(true)
       const refused = io()
       expect(await runCli(['restart', '--sync', '--port', '1', '--start', 'true', ...flags], refused.io)).toBe(1)
@@ -1937,7 +3719,7 @@ describe('supervise', () => {
     const port = await freePort()
     // Green credential in the throwaway state (bound to the throwaway HEAD).
     const rec = io()
-    expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', join(env.home, 'state')], rec.io)).toBe(0)
+    expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--repo', repo, '--state-dir', join(env.home, 'state')], rec.io)).toBe(0)
     stubPreflight('true')
     const host = spawn(process.execPath, ['-e',
       `require('http').createServer((q,s)=>s.end('host')).listen(${port},'127.0.0.1')`],
@@ -1984,7 +3766,6 @@ describe('supervise', () => {
       expect(readFileSync(join(env.home, 'state', 'last-restart.json'), 'utf8')).toContain('"initiator":"session-scheduler"')
     } finally {
       env.stop()
-      host.kill('SIGKILL')
       await killListener(port)
       env.restore()
     }
@@ -1999,7 +3780,8 @@ describe('supervise', () => {
     const stateDir = tmpDir('guard-cli-')
     const port = await freePort()
     try {
-      expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      markLiveWatchdog(stateDir)
       stubPreflight('true')
       expect(await runCli(
         ['schedule-exit', '--port', String(port), '--delay-ms', '20', '--initiator', 'session-x',
@@ -2033,7 +3815,8 @@ describe('supervise', () => {
     const previousSession = process.env.DSH_SESSION_ID
     process.env.DSH_SESSION_ID = 'session-real'
     try {
-      expect(await runCli(['record', 'build', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      expect(await runCli(['record', 'build', '--trust-command', '--command', 'test fixture', '--repo', repo, '--state-dir', stateDir], io().io)).toBe(0)
+      markLiveWatchdog(stateDir)
       stubPreflight('true')
       const out = io()
       expect(await runCli(
@@ -2314,7 +4097,10 @@ describe('supervise', () => {
       let log = ''
       while (Date.now() < deadline) {
         log = existsSync(logPath) ? readFileSync(logPath, 'utf8') : ''
-        if (log.includes('other than the supervised')) break
+        // The classification line is written before the generic counted-
+        // failure line. Under load, observing only the first is not a settled
+        // attempt and used to race the assertion immediately below.
+        if (log.includes('other than the supervised') && log.includes('instance failed to come up')) break
         await new Promise((resolve) => { setTimeout(resolve, 300) })
       }
       expect(log).toContain('other than the supervised')
@@ -2375,6 +4161,48 @@ describe('supervise', () => {
 })
 
 describe('restart context injection', () => {
+  it('holds wake-up until the cutover receipt is terminal, then reports exactly once', async () => {
+    const repo = makeRepo()
+    const stateDir = tmpDir('guard-ctx-cutover-')
+    const launchBase = {
+      version: 1 as const,
+      port: 3080,
+      home: join(stateDir, 'home'),
+      credentialRepo: repo,
+      harnessRoot: join(stateDir, 'harness-root'),
+      profile: 'web',
+    }
+    prepareLaunchCutover(stateDir, {
+      id: 'wake-gated-cutover',
+      previous: { ...launchBase, command: 'previous-host' },
+      target: { ...launchBase, command: 'target-host' },
+      recoveryPolicy: 'restore-previous', browserHandoff: 'off',
+      previousSupervisorPid: 701, previousSupervisorStartToken: 'supervisor-start-701', previousOwnership: fakeOwnership(702),
+      initiator: 'session-cutover-owner', now: NOW,
+    })
+    const followup = vi.fn()
+    const agent = { id: 'session-cutover-owner', followup } as never
+    const ctx = new Context()
+    await ctx.plugin(Loader)
+    ctx.provide('agents', { roots: () => [agent], list: () => [agent] } as never)
+    const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
+    await fiber.await()
+    ctx.emit('agent/created', { agent })
+    expect(followup).not.toHaveBeenCalled()
+
+    recordCutoverEvent(stateDir, 'wake-gated-cutover', 'child-started', ['target', '1', '703', 'target-start-703'], NOW + 1)
+    recordCutoverEvent(stateDir, 'wake-gated-cutover', 'ownership-stable', ['target', '703', 'target-start-703', '704', 'listener-start-704', '3000', '0'], NOW + 2)
+    recordCutoverEvent(stateDir, 'wake-gated-cutover', 'canary', ['pass'], NOW + 3)
+    recordCutoverEvent(stateDir, 'wake-gated-cutover', 'ready', ['target'], NOW + 4)
+    const deadline = Date.now() + 3000
+    while (followup.mock.calls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 50) })
+    }
+    expect(followup).toHaveBeenCalledTimes(1)
+    expect(pendingRestartRecord(stateDir)).toBeNull()
+    await fiber.dispose()
+  })
+
   it('queues the restart report as a followup turn on root-agent creation (autonomous)', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-ctx-')
@@ -2970,7 +4798,6 @@ describe('restart context injection', () => {
       }
       expect(await portListening(port)).toBe(false)
     } finally {
-      host.kill('SIGKILL')
       await killListener(port)
     }
   })
@@ -3033,7 +4860,7 @@ describe('pack smoke', () => {
   it('the tarball contains every relative import of the lib entries', async () => {
     const pkgDir = fileURLToPath(new URL('..', import.meta.url))
     const libDir = join(pkgDir, 'lib')
-    const entries = ['index.js', 'invariant.js', 'cli.js']
+    const entries = ['index.js', 'invariant.js', 'cli.js', 'client.js']
     for (const entry of entries) {
       expect(existsSync(join(libDir, entry)), `lib/${entry} missing — run the host build first`).toBe(true)
     }

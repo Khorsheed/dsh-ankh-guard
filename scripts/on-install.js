@@ -16,7 +16,7 @@ if (process.cwd().includes(`${sep}node_modules${sep}`)) {
 the running instance has not loaded the plugin and no watchdog exists yet, so a bare
 exit leaves the service DOWN:
   node_modules/@khorsheed/dsh-ankh-guard/lib/cli.js check-env
-  node_modules/@khorsheed/dsh-ankh-guard/lib/cli.js record build+test --state-dir "$DSH_HOME/state" --repo "$PWD"
+  node_modules/@khorsheed/dsh-ankh-guard/lib/cli.js record build+test --state-dir "$DSH_HOME/state" --repo "$PWD" --run -- sh -c 'pnpm run build && pnpm run test'
   node_modules/@khorsheed/dsh-ankh-guard/lib/cli.js restart --port <port> --start "<start command>"
 or establish the watchdog first with \`supervise\`. NEVER hand-roll sleep/kill/nohup restart
 scripts — they die with the instance (its teardown reaps managed processes).

@@ -30,13 +30,16 @@ import type { AgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
 // failure this dual-host probing exists to survive. The derivation below
 // reads both surfaces through one structural cast.
 import * as agentPresetsHost from '@deepseek-ai/dsh-agent-presets'
-import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveRepoDir, resolveStateDir, SRC_ARTIFACT_PATTERN } from './defaults.ts'
-import { commitCheckpoint, currentHead, resetToCheckpoint } from './git.ts'
+import { commitCheckpoint, currentHead, isWorkingTreeClean, resetToCheckpoint } from './git.ts'
+import { listeningPortsForPid } from './processes.ts'
+import { cutoverBlocksWake } from './launch-spec.ts'
 import { stateFile } from './state-files.ts'
+import { registerBrowserHandoff } from './browser-handoff.ts'
+import { requestRestart, type RestartRequest, type RestartRequestResult } from './restart-request.ts'
 import {
   acknowledgeRestartRecord, buildLaunchCommand, continueAndReportText, continueInterruptedText, interruptedSnapshotFile,
   isParkedOnUserInput,
@@ -160,7 +163,7 @@ export interface CanaryResult {
 
 /** Result of a checkpoint request. */
 export type CheckpointResult =
-  | { ok: true; sha: string; artifacts: string[] }
+  | { ok: true; sha: string; artifacts: string[]; createdCommit: boolean }
   | { ok: false; error: string }
 
 /**
@@ -174,11 +177,13 @@ export interface SelfRestartGuard {
    */
   verify(): VerifyResult
   /**
-   * Record a green credential for the current HEAD.
+   * Record an externally proven green credential for the current clean HEAD.
+   * This synchronous service is a trusted orchestrator seam; agent/CLI flows
+   * must use `record --run -- PROGRAM` so the guard observes the exit status.
    * @param scope - what passed, e.g. 'build+test'.
    * @param options - optional command that produced the green state.
    * @returns the persisted state including the new credential.
-   * @throws outside a git repository (no HEAD to bind to).
+   * @throws outside a git repository or while the checkout is dirty.
    */
   record(scope: string, options?: { command?: string }): GuardState
   /**
@@ -192,7 +197,9 @@ export interface SelfRestartGuard {
    */
   status(): GuardState
   /**
-   * Commit the whole tree as a pre-batch checkpoint and remember it.
+   * Remember the existing clean HEAD as a pre-batch checkpoint. Dirty trees
+   * are refused; the CLI's reviewed `--include-dirty` path is deliberately
+   * unavailable through this convenience service.
    * @param message - batch description; defaults to 'batch snapshot'.
    * @returns the checkpoint commit sha, or a failure reason.
    */
@@ -210,6 +217,17 @@ export interface SelfRestartGuard {
    * @returns one check line per probe; ok only when every check passed.
    */
   canary(options?: { port?: number }): Promise<CanaryResult>
+  /**
+   * Trigger a guarded restart onto a new launch command (a UI-grade
+   * mode/profile switch). Dispatches on supervision: no live watchdog → the
+   * restart verb's stop→start→canary; supervised → reconfigure's transactional
+   * cutover (the only safe way to change the launch command under a live
+   * watchdog). The full gate chain applies — credential, composition
+   * preflight, marker/lock — and a refusal never stops the running instance.
+   * @param request - start: the successor launch command; profile: the dsh profile to preflight; initiator: the session id the restart report returns to (required — the UI caller knows the real session, never invent one).
+   * @returns the structured verdict; terminal hint text never crosses this seam.
+   */
+  requestRestart(request: RestartRequest): Promise<RestartRequestResult>
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -338,6 +356,7 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
   // (default-on!) with no warning — a misconfiguration failing silent.
   const followupReport = reportMode === 'followup'
   registerRestartSkill(ctx, stateDir)
+  registerBrowserHandoff(ctx, stateDir)
 
   if (followupReport || resumeInterrupted) {
     type FollowupAgent = { followup: (message: ReturnType<typeof createUserMessage>) => void }
@@ -397,6 +416,11 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     // injection fires; the restart's initiator gets the report — merged into
     // one message when it is both. The map makes repeat calls no-ops.
     const deliver = (agent: FollowupAgent & { id: unknown }): void => {
+      // Transport can be up before the watchdog has exchanged the launch URL,
+      // handed it to the browser, or run the canary. Do not let that early
+      // mount wake a session; the release poll below retries live roots once
+      // the durable receipt reaches a terminal phase.
+      if (cutoverBlocksWake(stateDir)) return
       const id = agent.id as string
       const exitAt = pendingContinue.get(id)
       const record = followupReport ? pendingRestartRecord(stateDir) : null
@@ -535,6 +559,10 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     // happens through `deliver` below, from the `agent/created` listener or
     // the live branch here.
     const resumePass = async (): Promise<void> => {
+      while (!disposed && cutoverBlocksWake(stateDir)) {
+        await new Promise(resolve => setTimeout(resolve, 250))
+      }
+      if (disposed) return
       const snapshot = readInterruptedSnapshot(stateDir)
       if (snapshot === null) return
       // A stale snapshot (a stop/start hours later) is dropped: only a recent
@@ -576,6 +604,18 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       ctx.effect(() => () => { clearTimeout(timer) })
     }
 
+    // The browser handoff can create an agent while the receipt still says
+    // canary-pending. agent/created is one-shot, so retry already-live roots
+    // after release; acknowledgement and pendingContinue preserve exact-once.
+    if (cutoverBlocksWake(stateDir)) {
+      const releaseTimer = setInterval(() => {
+        if (disposed || cutoverBlocksWake(stateDir)) return
+        clearInterval(releaseTimer)
+        for (const agent of ctx.agents.roots()) deliver(agent)
+      }, 250)
+      ctx.effect(() => () => { clearInterval(releaseTimer) })
+    }
+
     ctx.on('agent/created', ({ agent }) => {
       if (!ctx.agents.roots().includes(agent)) return
       deliver(agent)
@@ -590,6 +630,7 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       if (decision.kind === 'reject' || signal.aborted) return decision
       const record = pendingRestartRecord(stateDir)
       if (record === null) return decision
+      if (cutoverBlocksWake(stateDir)) return decision
       const canaryPending = existsSync(stateFile(stateDir, 'restartRequested'))
       const text = restartContextText(record, canaryPending)
       if (text === '') return decision
@@ -611,10 +652,13 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
   }
 
   const service: SelfRestartGuard = {
-    verify: () => verifyCredential(loadState(stateDir), currentHead(repoDir), Date.now(), maxAgeMinutes),
+    verify: () => verifyCredential(
+      loadState(stateDir), currentHead(repoDir), Date.now(), maxAgeMinutes, isWorkingTreeClean(repoDir),
+    ),
     record: (scope, options) => {
       const head = currentHead(repoDir)
       if (head === null) throw new Error('ankh-guard: cannot record a credential outside a git repository')
+      if (!isWorkingTreeClean(repoDir)) throw new Error('ankh-guard: cannot record a credential while the working tree is dirty')
       return recordCredential(stateDir, { scope, revision: head, command: options?.command ?? '' }, Date.now())
     },
     clear: () => clearCredential(stateDir, Date.now()),
@@ -626,6 +670,7 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       return result
     },
     reset: sha => resetToCheckpoint(repoDir, sha),
+    requestRestart: request => requestRestart(request, { stateDir, repoDir }),
     canary: async (options) => {
       const checks: CanaryCheck[] = []
       const verdict = service.verify()
@@ -653,14 +698,7 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       for (const [key, value] of Object.entries(process.env)) {
         if (key.startsWith('DSH_') && value !== undefined) env[key] = value
       }
-      let port: number | undefined
-      try {
-        const out = execFileSync('lsof', ['-a', '-p', String(process.pid), '-iTCP', '-sTCP:LISTEN', '-P'], { encoding: 'utf8', stdio: 'pipe' })
-        const match = /:(\d+) \(LISTEN\)/.exec(out)
-        if (match !== null) port = Number(match[1])
-      } catch {
-        // lsof unavailable or nothing listening yet — the record still helps.
-      }
+      const port = listeningPortsForPid(process.pid)[0]
       writeInstanceLaunch(stateDir, {
         command: buildLaunchCommand(process.execPath, process.execArgv, process.argv.slice(1), process.cwd(), env),
         source: 'instance',

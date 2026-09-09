@@ -2,20 +2,10 @@
  * Package-local tsdown config: the root host-pass default emits only
  * lib/types/{index,invariant,startup}.js, but the guard's CLI must ship as a
  * published artifact (lib/cli.js, wired to the `dsh-ankh-guard` bin and the
- * `./cli` export). The Client pass emits nothing for this host-side package.
+ * `./cli` export). The companion browser bundle owns original-tab handoff.
  */
-import { defineConfig } from 'tsdown'
+import { clientBundle } from '../../build/tsdown.client.ts'
 
-export default defineConfig(({ env }) => {
-  const client = env?.DSH_BUILD_FACE === 'client'
-  return {
-    entry: client ? '' : ['lib/types/{index,invariant,cli,preflight-runner,exit-agent}.js'],
-    outDir: 'lib',
-    format: ['esm'],
-    platform: 'node',
-    target: 'es2024',
-    fixedExtension: false,
-    dts: false,
-    clean: false,
-  }
-})
+export default clientBundle('@khorsheed/dsh-ankh-guard', [
+  'lib/types/{index,invariant,cli,preflight-runner,exit-agent,test-seam,test-seam-cli}.js',
+], { hostPhase: true })

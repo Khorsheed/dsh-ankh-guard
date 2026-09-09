@@ -4,6 +4,9 @@
  * are synchronous child-process invocations scoped to the repo directory.
  */
 import { execFileSync } from 'node:child_process'
+import { copyFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 /**
  * The repository's current HEAD, or null when the directory is not inside a
@@ -23,14 +26,37 @@ export function currentHead(repoDir: string): string | null {
   }
 }
 
+/**
+ * Porcelain entries for every tracked or untracked working-tree change.
+ * `null` means git could not inspect the checkout; callers must fail closed.
+ */
+export function workingTreeChanges(repoDir: string): string[] | null {
+  try {
+    const out = execFileSync(
+      'git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+      { cwd: repoDir, encoding: 'utf8', stdio: 'pipe' },
+    )
+    return out.split('\0').filter(entry => entry !== '')
+  } catch {
+    return null
+  }
+}
+
+/** Whether the checkout has no staged, unstaged, or untracked changes. */
+export function isWorkingTreeClean(repoDir: string): boolean {
+  const changes = workingTreeChanges(repoDir)
+  return changes !== null && changes.length === 0
+}
+
 /** Result of a checkpoint commit. */
 export type CheckpointCommitResult =
-  | { ok: true; sha: string; artifacts: string[] }
+  | { ok: true; sha: string; artifacts: string[]; createdCommit: boolean }
   | { ok: false; error: string }
 
 /**
- * Commit the whole working tree as a checkpoint snapshot (empty commits
- * allowed — a clean tree still records a rollback point).
+ * Record a clean HEAD directly, or commit the whole dirty working tree as an
+ * explicitly approved checkpoint snapshot. Dirty commits use a temporary git
+ * index: a hook/commit failure leaves the caller's real index untouched.
  * @param repoDir - repository directory.
  * @param message - checkpoint commit message.
  * @param artifactPattern - staged paths matching this are reported as
@@ -38,19 +64,56 @@ export type CheckpointCommitResult =
  * SRC_ARTIFACT_PATTERN in defaults.ts; omit for none).
  * @returns the new HEAD sha, or a failure reason.
  */
-export function commitCheckpoint(repoDir: string, message: string, artifactPattern?: RegExp): CheckpointCommitResult {
+export function commitCheckpoint(
+  repoDir: string,
+  message: string,
+  artifactPattern?: RegExp,
+  includeDirty = false,
+): CheckpointCommitResult {
+  let tempDir: string | undefined
   try {
-    execFileSync('git', ['add', '-A'], { cwd: repoDir, stdio: 'pipe' })
-    const staged = execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: repoDir, encoding: 'utf8' })
+    const changes = workingTreeChanges(repoDir)
+    if (changes === null) return { ok: false, error: 'git checkpoint failed: working tree status is unavailable' }
+    if (changes.length > 0 && !includeDirty) {
+      const shown = changes.slice(0, 10).map(entry => `  ${entry}`).join('\n')
+      const more = changes.length > 10 ? `\n  … (${changes.length - 10} more)` : ''
+      return {
+        ok: false,
+        error: `checkpoint refused: working tree has ${changes.length} change(s); review them, then rerun with --include-dirty to commit the complete snapshot:\n${shown}${more}`,
+      }
+    }
+    const previousHead = currentHead(repoDir)
+    if (previousHead === null) return { ok: false, error: 'git checkpoint failed: current HEAD is unavailable' }
+    if (changes.length === 0) return { ok: true, sha: previousHead, artifacts: [], createdCommit: false }
+
+    const indexPathRaw = execFileSync('git', ['rev-parse', '--git-path', 'index'], { cwd: repoDir, encoding: 'utf8', stdio: 'pipe' }).trim()
+    const indexPath = resolve(repoDir, indexPathRaw)
+    tempDir = mkdtempSync(join(tmpdir(), 'ankh-guard-index-'))
+    const tempIndex = join(tempDir, 'index')
+    copyFileSync(indexPath, tempIndex)
+    const env = { ...process.env, GIT_INDEX_FILE: tempIndex }
+    execFileSync('git', ['add', '-A'], { cwd: repoDir, env, stdio: 'pipe' })
+    const staged = execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: repoDir, env, encoding: 'utf8' })
     const artifacts = artifactPattern === undefined
       ? []
       : staged.split('\n').filter(file => artifactPattern.test(file))
-    execFileSync('git', ['commit', '--allow-empty', '-m', message], { cwd: repoDir, stdio: 'pipe' })
+    execFileSync('git', ['commit', '-m', message], { cwd: repoDir, env, stdio: 'pipe' })
     const sha = currentHead(repoDir)
     if (sha === null) return { ok: false, error: 'checkpoint commit succeeded but HEAD became unreadable' }
-    return { ok: true, sha, artifacts }
+    try {
+      // The complete snapshot is now HEAD; make the real index match it. This
+      // is the successful-path equivalent of the old `git add -A && commit`,
+      // while the temporary index protected the failure path.
+      execFileSync('git', ['reset', '--mixed', 'HEAD'], { cwd: repoDir, stdio: 'pipe' })
+    } catch (error) {
+      try { execFileSync('git', ['update-ref', 'HEAD', previousHead, sha], { cwd: repoDir, stdio: 'pipe' }) } catch { /* best effort */ }
+      return { ok: false, error: `checkpoint commit could not settle the real index: ${String(error)}` }
+    }
+    return { ok: true, sha, artifacts, createdCommit: true }
   } catch (error) {
     return { ok: false, error: `git checkpoint failed: ${String(error)}` }
+  } finally {
+    if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true })
   }
 }
 

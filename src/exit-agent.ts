@@ -15,6 +15,7 @@
 import { writeFileSync } from 'node:fs'
 import { isDirectInvocation } from './defaults.ts'
 import { findPidOnPort } from './processes.ts'
+import { registerCurrentTestProcess } from './test-seam.ts'
 
 /** The exit agent's environment input. */
 export interface ExitAgentEnv {
@@ -59,5 +60,6 @@ export function exitAgentMain(env: ExitAgentEnv = process.env): void {
 
 // Direct invocation only: imported (tests, bundling) it must never fire.
 if (isDirectInvocation(import.meta.url)) {
+  registerCurrentTestProcess()
   exitAgentMain()
 }

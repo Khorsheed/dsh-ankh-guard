@@ -5,10 +5,11 @@
  * deploy line) was wiped by the upstream reset and cannot be re-applied
  * without re-forking apps/cli on every release — which we cannot upstream
  * (no PR access). This runner replaces it WITHOUT touching the harness: it
- * resolves the official published packages (`@deepseek-ai/dsh-app-boot`,
- * `dsh-home-paths`, `dsh-launch-environment`, `dsh-cmdline`) from the LIVE
- * harness checkout's node_modules, so it always dry-runs the exact engine
- * the next boot will use and follows host updates automatically.
+ * resolves the official packages (`@deepseek-ai/dsh-app-boot`,
+ * `dsh-home-paths`, `dsh-launch-environment`, `dsh-cmdline`) from an explicit
+ * execution binding: source files in the host checkout for a source launch,
+ * or the npm toolchain selected by a built launch's dsh package.json. It never
+ * infers that choice from Node's execArgv.
  *
  * What it verifies (same contract as the old patch):
  * - the profile's full patch stack composes (bundle layers from
@@ -27,15 +28,16 @@
  *   error, env load failure): NOT a verdict on the composition.
  *
  * Run directly (any profile) or via the guard CLI:
- *   node --import <harness>/node_modules/tsx/dist/esm/index.mjs \
- *     packages/ankh-guard/src/preflight-runner.ts --profile web [--patch FILE]...
+ *   node packages/ankh-guard/lib/preflight-runner.js --profile web \
+ *     --host-surface built --install-anchor <toolchain>/node_modules/@deepseek-ai/dsh/package.json
  *
  * @module @khorsheed/dsh-ankh-guard/preflight-runner
  */
 
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { createRequire } from 'node:module'
+import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { isDirectInvocation } from './defaults.ts'
 
@@ -44,6 +46,14 @@ const PROFILE_ROOT_FILENAME = 'cordis.yml'
 const HOME_PATCH_FILENAME = 'cordis.patch.yml'
 const TELEMETRY_ROW_ID = 'session-telemetry-otel'
 const DSH_HARNESS_ENV = 'DSH_HARNESS'
+
+export type PreflightHostSurface = 'source' | 'built'
+
+export interface PreflightHostBinding {
+  surface: PreflightHostSurface
+  /** Real dsh package.json used by the successor's module graph. */
+  installAnchor: string
+}
 
 /**
  * The empty root entry list every profile tree patches over — the exact
@@ -76,14 +86,6 @@ const HARNESS_PACKAGE_DIRS: Record<string, string> = {
 }
 
 /**
- * Whether this runtime can import TypeScript sources (the runner is launched
- * through tsx; a plain-node consumer of the published package cannot).
- */
-function canImportTypeScript(): boolean {
-  return process.execArgv.some(arg => arg.includes('tsx'))
-}
-
-/**
  * The module-fallback heal, whose calling convention is the sharpest
  * composition-layering difference between the supported host lines:
  * - rc line (through 0.1.1-rc.*): positional, sync, and runs BEFORE the
@@ -97,11 +99,9 @@ type HealProfilesModuleFallback = {
 }
 
 /**
- * Dynamically import a harness package from the live checkout, SOURCE FIRST:
- * a source-launched prod instance (tsx … apps/cli/src/bin.ts) boots the
- * source, so the preflight engine must be the source too — a stale `lib/`
- * must never make the preflight greener than the real boot. The built entry
- * is the fallback for harnesses that ship only artifacts.
+ * Dynamically import one host package from the explicitly selected surface.
+ * A source launch uses checkout source and fails rather than falling back to
+ * stale lib; a built launch resolves only through its npm install anchor.
  *
  * The composition layers below (bundle layers, user layers, overlays, the
  * agent-presets roots, the telemetry switch) mirror the launcher's private
@@ -113,25 +113,35 @@ type HealProfilesModuleFallback = {
  * @param name - package name (a key of {@link HARNESS_PACKAGE_DIRS}).
  * @returns the imported module.
  */
-async function loadHarnessPackage(root: string, name: string): Promise<Record<string, unknown>> {
+async function loadHarnessPackage(
+  root: string,
+  name: string,
+  binding: PreflightHostBinding,
+): Promise<Record<string, unknown>> {
+  if (binding.surface === 'built') {
+    let entry: string
+    try {
+      entry = createRequire(binding.installAnchor).resolve(name)
+    } catch (error) {
+      throw new Error(`built host package ${name} is not resolvable from ${binding.installAnchor}: ${String(error)}`, { cause: error })
+    }
+    return await import(pathToFileURL(entry).href) as Record<string, unknown>
+  }
   const relative = HARNESS_PACKAGE_DIRS[name]
   if (relative === undefined) throw new Error(`no known harness layout entry for ${name}`)
   const base = join(root, relative)
   const source = join(base, 'src', 'index.ts')
-  if (canImportTypeScript() && existsSync(source)) {
-    try {
-      return await import(pathToFileURL(source).href) as Record<string, unknown>
-    } catch (error) {
-      // A broken source import (syntax error, unresolved workspace dep) is
-      // EXACTLY what the next source boot would hit — surface it as a
-      // composition verdict, never silently fall back to a stale build.
-      throw new Error(`harness source ${source} failed to import (this is what a source boot would hit): ${String(error)}`, { cause: error })
-    }
+  if (!existsSync(source)) {
+    throw new Error(`harness source entry does not exist: ${source}`)
   }
-  const manifest = JSON.parse(readFileSync(join(base, 'package.json'), 'utf8')) as { main?: string }
-  const entry = manifest.main ?? 'lib/index.js'
-  const module = await import(pathToFileURL(join(base, entry)).href)
-  return module as Record<string, unknown>
+  try {
+    return await import(pathToFileURL(source).href) as Record<string, unknown>
+  } catch (error) {
+    // A broken source import (syntax error, unresolved workspace dep) is
+    // EXACTLY what the next source boot would hit — surface it as a
+    // composition verdict, never silently fall back to a stale build.
+    throw new Error(`harness source ${source} failed to import (this is what a source boot would hit): ${String(error)}`, { cause: error })
+  }
 }
 
 /** Thrown for harness-side load failures — preflight infrastructure, never a composition verdict. */
@@ -169,12 +179,16 @@ export async function composePreflightPatches(
   patchFiles: readonly string[],
   root: string,
   home?: string,
+  binding: PreflightHostBinding = {
+    surface: 'source',
+    installAnchor: join(root, 'apps', 'cli', 'package.json'),
+  },
 ): Promise<PreflightComposition> {
   let appBoot: Record<string, unknown>
   let homePaths: Record<string, unknown>
   try {
-    appBoot = await loadHarnessPackage(root, '@deepseek-ai/dsh-app-boot')
-    homePaths = await loadHarnessPackage(root, '@deepseek-ai/dsh-home-paths')
+    appBoot = await loadHarnessPackage(root, '@deepseek-ai/dsh-app-boot', binding)
+    homePaths = await loadHarnessPackage(root, '@deepseek-ai/dsh-home-paths', binding)
   } catch (error) {
     throw new PreflightInfraError(`harness packages unavailable under ${root}: ${String(error)}`, { cause: error })
   }
@@ -194,7 +208,7 @@ export async function composePreflightPatches(
   // healing then re-points fallback links into self-referential loops
   // (observed on a second preflight from the installed CLI: ~20 links looped,
   // the next real boot would have failed).
-  const anchor = join(root, 'apps', 'cli', 'package.json')
+  const anchor = binding.installAnchor
   const resolvedHome = resolveDshHome(home)
   // Which app-boot API generation this host speaks. The 0.1.2 line re-layered
   // the profile composition: the heal moved behind the async options API and
@@ -230,7 +244,9 @@ export async function composePreflightPatches(
   // 0.1.2 line removed apps/cli/config/agent-presets and lets the preset
   // package self-ship its root, so the overlay follows the directory, not
   // the host line.
-  const shippedPresetRoot = join(root, 'apps/cli/config/agent-presets/')
+  const shippedPresetRoot = binding.surface === 'built'
+    ? join(dirname(binding.installAnchor), 'config', 'agent-presets')
+    : join(root, 'apps', 'cli', 'config', 'agent-presets')
   if (rows.has('agent-presets') && existsSync(shippedPresetRoot)) {
     composedOverlays.push({
       id: 'agent-presets',
@@ -348,6 +364,10 @@ export async function runPreflight(
   profile: string,
   patchFiles: readonly string[] = [],
   root: string = resolveHarnessRoot(),
+  binding: PreflightHostBinding = {
+    surface: 'source',
+    installAnchor: join(root, 'apps', 'cli', 'package.json'),
+  },
 ): Promise<number> {
   // Environment loading sits outside the composition pipeline; a failure here
   // is preflight infrastructure, not a verdict on the tree.
@@ -355,9 +375,9 @@ export async function runPreflight(
   let launchEnvironment: Record<string, unknown>
   let cmdline: Record<string, unknown>
   try {
-    appBoot = await loadHarnessPackage(root, '@deepseek-ai/dsh-app-boot')
-    launchEnvironment = await loadHarnessPackage(root, '@deepseek-ai/dsh-launch-environment')
-    cmdline = await loadHarnessPackage(root, '@deepseek-ai/dsh-cmdline')
+    appBoot = await loadHarnessPackage(root, '@deepseek-ai/dsh-app-boot', binding)
+    launchEnvironment = await loadHarnessPackage(root, '@deepseek-ai/dsh-launch-environment', binding)
+    cmdline = await loadHarnessPackage(root, '@deepseek-ai/dsh-cmdline', binding)
   } catch (error) {
     process.stderr.write(`preflight could not execute (harness packages unavailable under ${root}): ${
       error instanceof Error ? error.message : String(error)}\n`)
@@ -377,7 +397,7 @@ export async function runPreflight(
     return 3
   }
   try {
-    const composed = await composePreflightPatches(profile, patchFiles, root)
+    const composed = await composePreflightPatches(profile, patchFiles, root, undefined, binding)
     const patches = [...composed.patches]
     const rows = composed.rows
 
@@ -427,10 +447,17 @@ export async function runPreflight(
   }
 }
 
-/** Minimal argv parse for `--profile NAME` and repeatable `--patch FILE`. */
-export function parsePreflightArgs(argv: readonly string[]): { profile: string; patchFiles: string[]; error?: string } {
+/** Minimal argv parse; the host execution surface is mandatory and explicit. */
+export function parsePreflightArgs(argv: readonly string[]): {
+  profile: string
+  patchFiles: string[]
+  binding?: PreflightHostBinding
+  error?: string
+} {
   const patchFiles: string[] = []
   let profile = ''
+  let surface = ''
+  let installAnchor = ''
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--profile') {
@@ -438,20 +465,28 @@ export function parsePreflightArgs(argv: readonly string[]): { profile: string; 
     } else if (arg === '--patch') {
       const file = argv[++i]
       if (file !== undefined) patchFiles.push(file)
+    } else if (arg === '--host-surface') {
+      surface = argv[++i] ?? ''
+    } else if (arg === '--install-anchor') {
+      installAnchor = argv[++i] ?? ''
     } else if (arg === '--help' || arg === '-h') {
-      return { profile: '', patchFiles: [], error: 'usage: preflight-runner --profile <name> [--patch FILE]...' }
+      return { profile: '', patchFiles: [], error: 'usage: preflight-runner --profile <name> --host-surface source|built --install-anchor FILE [--patch FILE]...' }
     }
   }
   if (profile === '') return { profile: '', patchFiles: [], error: 'preflight requires --profile <name>' }
-  return { profile, patchFiles }
+  if (surface !== 'source' && surface !== 'built') {
+    return { profile, patchFiles, error: 'preflight requires --host-surface source|built' }
+  }
+  if (installAnchor === '') return { profile, patchFiles, error: 'preflight requires --install-anchor FILE' }
+  return { profile, patchFiles, binding: { surface, installAnchor } }
 }
 
 // Standalone entry: only when executed directly (not imported by the CLI).
 if (isDirectInvocation(import.meta.url)) {
-  const { profile, patchFiles, error } = parsePreflightArgs(process.argv.slice(2))
-  if (error !== undefined) {
+  const { profile, patchFiles, binding, error } = parsePreflightArgs(process.argv.slice(2))
+  if (error !== undefined || binding === undefined) {
     process.stderr.write(`${error}\n`)
     process.exit(2)
   }
-  process.exitCode = await runPreflight(profile, patchFiles)
+  process.exitCode = await runPreflight(profile, patchFiles, resolveHarnessRoot(), binding)
 }
