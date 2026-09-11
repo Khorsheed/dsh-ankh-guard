@@ -23,6 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { composePreflightPatches, resolveHarnessRoot } from '../src/preflight-runner.ts'
+import { driftBuiltCliAvailable, driftTripwireRunnable } from './preflight-environment.mjs'
 
 const exec = promisify(execFile)
 async function run(executable: string, args: string[], options: ExecFileOptions) {
@@ -69,12 +70,12 @@ const harness = resolveHarnessRoot()
 // composition differs wildly between homes, and a tripwire that validates a
 // tree nobody runs is a blank round — the resolved home goes into the test
 // name so a green line says WHICH tree it validated.
+// The two gate predicates live in ./preflight-environment.mjs, shared with
+// the lane runner's expected-passing inventory — they must never drift apart.
 const home = [process.env.DSH_WD_HOME, process.env.DSH_HOME]
   .find(value => value !== undefined && value !== '')
   ?? (existsSync(join(homedir(), '.dsh-official')) ? join(homedir(), '.dsh-official') : join(homedir(), '.dsh'))
 const profile = process.env.DSH_PREFLIGHT_PROFILE ?? 'web'
-const harnessPresent = existsSync(join(harness, 'apps/cli'))
-const profilePresent = existsSync(join(home, 'profiles', profile, 'package.json'))
 const tsx = join(harness, 'node_modules/tsx/dist/esm/index.mjs')
 const dshCli = join(harness, 'apps/cli/src/bin.ts')
 const builtDshCli = [
@@ -107,7 +108,7 @@ describe('preflight composition drift tripwire', () => {
     }
   })
 
-  const test = harnessPresent && profilePresent ? it : it.skip
+  const test = driftTripwireRunnable() ? it : it.skip
   test(`the runner composes the same entry ids as the launcher dump-config (home ${home})`, async () => {
     // cwd matters: the dump must resolve the harness's workspace packages,
     // not this repo's published ones (a foreign @deepseek-ai/cordis lacks
@@ -137,7 +138,7 @@ describe('preflight composition drift tripwire', () => {
     }
   }, 60_000)
 
-  const generatedHomeTest = builtDshCli === undefined ? it.skip : it
+  const generatedHomeTest = driftBuiltCliAvailable() ? it : it.skip
   generatedHomeTest('runs a built candidate against a DSH-generated home with a cyclic pnpm/Cordis link graph', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ankh-generated-dsh-home-'))
     const generatedHome = join(root, 'home')

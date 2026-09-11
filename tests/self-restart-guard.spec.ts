@@ -4369,7 +4369,12 @@ describe('restart context injection', () => {
       mount,
     } as never)
     ctx.provide('sessionPersistence', {
-      inspect: async (id: string) => ({ meta: { agentPreset: `preset-of-${id}` }, events: [] }),
+      // Host 0.1.5 handle API: open(id, 'read') hands a one-pass read handle.
+      open: async (id: string) => ({
+        header: { agentPreset: `preset-of-${id}` },
+        read: async () => ({ events: [], eventState: 'detached' }),
+        close: async () => {},
+      }),
     } as never)
     const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 1 })
     await fiber.await()
@@ -4435,9 +4440,14 @@ describe('restart context injection', () => {
       },
     } as never)
     ctx.provide('sessionPersistence', {
-      inspect: async (id: string) => ({
-        meta: {},
-        events: id === 'session-parked' ? parkedEvents : workingEvents,
+      // Host 0.1.5 handle API: open(id, 'read') hands a one-pass read handle.
+      open: async (id: string) => ({
+        header: {},
+        read: async () => ({
+          events: id === 'session-parked' ? parkedEvents : workingEvents,
+          eventState: 'detached',
+        }),
+        close: async () => {},
       }),
     } as never)
     const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5, resumeDelayMs: 1 })

@@ -197,11 +197,11 @@ dsh-ankh-guard restart \
 
 ## Compatibility
 
-- npm 发布线（`@deepseek-ai/dsh@0.1.2-rc.1`）：⚠️ 降级——一切可用；composition-preflight 门禁通过独立的 `preflight-runner` 运行（0.1.2-rc.1 仍未导出 `composeProfile`，runner 改经已发布的 `@deepseek-ai/dsh-app-boot` 原语组装，带漂移绊线测试），只要能解析到 dsh app 布局——`--harness-root`、耐久 launch spec、`DSH_HARNESS` 或默认检出路径——就完整运行。没有 harness 检出的纯 npm 部署下门禁退化为提示后放行。原标签页桥会探测可选 WebServer/connection 认证 seam，不使用 token 认证的宿主自然走现有 Cookie 路径；其余能力在 npm 线上完整。minHost 前移至 0.1.2-rc.1，旧宿主请停留在旧发布线。
+- npm 发布线（`@deepseek-ai/dsh@0.1.5-rc.1`）：⚠️ 降级——一切可用；composition-preflight 门禁通过独立的 `preflight-runner` 运行（0.1.5-rc.1 仍未导出 `composeProfile`，runner 改经已发布的 `@deepseek-ai/dsh-app-boot` 原语组装，带漂移绊线测试），只要能解析到 dsh app 布局——`--harness-root`、耐久 launch spec、`DSH_HARNESS` 或默认检出路径——就完整运行。没有 harness 检出的纯 npm 部署下门禁退化为提示后放行。原标签页桥会探测可选 WebServer/connection 认证 seam，不使用 token 认证的宿主自然走现有 Cookie 路径；冷读（停靠探测与 preset 推导）走 0.1.5 的 handle 制 sessionPersistence（`open(id, 'read')` → `read` → `close`，一次性 `inspect` 已移除）。其余能力在 npm 线上完整。minHost 前移至 0.1.5-rc.1，旧宿主请停留在旧发布线。
 - 历史验证：npm host 的 0.1.1-rc.2 → 0.1.2-alpha.4 隔离切换已通过（transition preflight 在 home 副本上移开带旧 schema record 的 v3 whole-unit projection cache，live apply 隔离旧文件，target 以零重试完成 Token URL → 303 → Cookie 200、ownership 稳定窗口与 canary；旧文件逐字节保留在 cutover 目录。相同 home 的无 transition 对照因缺少 Alpha.4 record 字段而拒绝，证明验收覆盖了真实 schema 断裂面）。
-- 源码线（deepseek-harness master，fork 或上游）：✅（verifiedHost: 0.1.2-rc.1）——门禁通过独立的 `preflight-runner` 运行（从在线 checkout 解析已发布的 `@deepseek-ai/dsh-app-boot` 等），不再需要 fork 补丁。
+- 源码线（deepseek-harness master，fork 或上游）：✅（verifiedHost: 0.1.5-rc.1）——门禁通过独立的 `preflight-runner` 运行（从在线 checkout 解析已发布的 `@deepseek-ai/dsh-app-boot` 等），不再需要 fork 补丁。
 
-**版本线对照**：0.2.0 起支持宿主 `0.1.2-rc.1` 及以后；宿主 `0.1.0-rc.6` ~ `0.1.1-rc.2` 的用户请停留在 0.1.x 发布线（末版 `0.1.1`）。
+**版本线对照**：0.2.0 之后的首个发布起支持宿主 `0.1.5-rc.1` 及以后；宿主 `0.1.2-rc.1` 请停留在 `0.2.0`，宿主 `0.1.0-rc.6` ~ `0.1.1-rc.2` 请停留在 0.1.x 发布线（末版 `0.1.1`）。
 
 ## Known Limitations and Deferred Work
 

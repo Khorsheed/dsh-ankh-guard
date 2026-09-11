@@ -98,6 +98,49 @@ export function deriveSessionPreset(host: PresetDerivationSurface, session: Pers
   return host.resolveSessionPreset?.(session)
 }
 
+/** One cold-read event row (structural — only the fields the probes read). */
+interface ColdReadEvent {
+  readonly type: string
+  readonly seq?: number
+  readonly data: Record<string, unknown>
+}
+
+/**
+ * The sessionPersistence face this plugin consumes for cold log reads. The
+ * 0.1.5 host replaced one-shot `inspect` with handle-based access:
+ * `open(id, 'read')` hands a handle owning one read pass; `close()` releases
+ * it. Structural and probed per call, like every host surface here — a host
+ * without `open` degrades to "no persistence".
+ */
+interface ColdReadPersistence {
+  open(id: string, access: 'read'): Promise<{
+    readonly header: unknown
+    read(offset?: number): Promise<{ readonly events: readonly ColdReadEvent[] }>
+    close(): Promise<void>
+  }>
+}
+
+/** Probe the session-persistence service's cold-read face. */
+function probeColdReader(ctx: Context): ColdReadPersistence | undefined {
+  const service = ctx.get('sessionPersistence') as ColdReadPersistence | undefined
+  if (service === undefined || service === null) return undefined
+  return typeof service.open === 'function' ? service : undefined
+}
+
+/** Read one persisted session's header and full log through a read handle. */
+async function readColdLog(
+  persistence: ColdReadPersistence,
+  id: string,
+): Promise<{ meta: unknown; events: readonly ColdReadEvent[] }> {
+  const handle = await persistence.open(id, 'read')
+  try {
+    const cold = await handle.read(0)
+    return { meta: handle.header, events: cold.events }
+  } finally {
+    await handle.close()
+  }
+}
+
 /** Plugin configuration. */
 export interface SelfRestartGuardConfig {
   /** Credential freshness window in minutes (default 10). */
@@ -383,11 +426,9 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       if (probe === undefined) {
         probe = (async () => {
           try {
-            const persistence = ctx.get('sessionPersistence') as
-              | { inspect(sessionId: string): Promise<{ events: readonly { type: string; seq?: number; data: Record<string, unknown> }[] }> }
-              | undefined
+            const persistence = probeColdReader(ctx)
             if (persistence === undefined) return false
-            const { events } = await persistence.inspect(id)
+            const { events } = await readColdLog(persistence, id)
             return isParkedOnUserInput(events)
           } catch {
             return false
@@ -525,12 +566,13 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       const presets = ctx.get('agentPresets') as
         | { resolve(presetId?: string): Promise<{ id: string }>; mount(agentCtx: Context, presetId?: string): Promise<unknown> }
         | undefined
-      const persistence = ctx.get('sessionPersistence') as
-        | { inspect(sessionId: string): Promise<{ meta: PersistedPresetSource['header']; events: PersistedPresetSource['events'] }> }
-        | undefined
+      const persistence = probeColdReader(ctx)
       if (presets !== undefined && persistence !== undefined) {
-        const inspected = await persistence.inspect(id)
-        const presetId = deriveSessionPreset(agentPresetsHost as unknown as PresetDerivationSurface, { header: inspected.meta, events: inspected.events })
+        const inspected = await readColdLog(persistence, id)
+        const presetId = deriveSessionPreset(agentPresetsHost as unknown as PresetDerivationSurface, {
+          header: inspected.meta as PersistedPresetSource['header'],
+          events: inspected.events,
+        })
         setup = async (agentCtx) => { await presets.mount(agentCtx, (await presets.resolve(presetId)).id) }
       }
       return { resumeSessionId: id, agentOptions, ...(setup === undefined ? {} : { setup }) } as ResumeAgentOptions

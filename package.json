@@ -1,7 +1,7 @@
 {
   "name": "@khorsheed/dsh-ankh-guard",
   "description": "Hard gate for self-modification restarts: a green-build credential bound to the git HEAD, checked before any restart of the running instance",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publishConfig": {
     "access": "public"
   },
@@ -65,12 +65,12 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-agent-presets": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-invariants": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-session-persistence": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-skill": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-agent": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-agent-presets": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-skill": "^0.1.5-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^22.0.0",
     "tsdown": "^0.22.2",
@@ -109,9 +109,9 @@
       "immediately": true
     },
     "compat": {
-      "minHost": "0.1.2-rc.1",
+      "minHost": "0.1.5-rc.1",
       "notes": "composition-preflight runs via the standalone preflight-runner and degrades to a notice when no live harness checkout resolves; original-tab browser handoff feature-probes optional WebServer/connection auth seams; reversible state quarantine was exercised in a live 0.1.1-rc.2 to 0.1.2-alpha.4 cutover",
-      "verifiedHost": "0.1.2-rc.1"
+      "verifiedHost": "0.1.5-rc.1"
     }
   }
 }
