@@ -1,5 +1,21 @@
 # 变更记录
 
+## 0.3.2（2026-09-27）
+
+适配宿主 0.1.7-rc.2 线：verifiedHost 前移至 0.1.7-rc.2（3080 生产实证线随宿主基线切到 rc.2）；rc.1→rc.2 对本包无破坏性变更（逐类清点见 [Agent Note](../../.agents/notes/implemented/architecture/2026-09-27-host-017-rc2-breaking-changes.md)），全量构建+测试双绿。
+
+- **修复 tarball profile 上 preflight 误报 FAIL**：runner 把 compose 算出的 runtime resolution（0.1.7 的 `resolution` / 0.1.6 的 `generation`）算完即丢，boot prepare 从不挂载——tarball profile 的 node_modules 没有任何 `@deepseek-ai/*` 条目，原生解析全灭（实测 177 个条目 failed to import，真实启动完全干净）。现在 composePreflightPatches 保留并按两线键名返回 pluginPackagesConfig，prepare 按 runProfile 顺序挂载（profileContext → 启动环境 → PluginPackages → provideCmdline）；提供 profileContext 的线追加 dry-run 覆写 `{ id: 'hmr', disabled: true }` 守住 no-HMR 契约。判定契约（0/1/3）与诊断强度不变
+- **skill 防踩坑**：`dsh-self-restart-guard` 的取证步骤写明「证据命令作用域到改动所在仓库」——凭证绑定 harness 检出的 git HEAD；家族外改动（tarball 进 profile 的插件）由部署驱动器（`pnpm deploy:3080`）在自己的绿色门禁里记录。对 harness 全量套件手跑 `record --run` 会先清空既有有效凭证再撞上本机无关红（~11 分钟、561 个与本改动无关的失败），跑完门禁零证据
+
+## 0.3.1（2026-09-26）
+
+适配宿主 rc.1 线并实证 0.1.5/0.1.7 双线可用（0.1.5-rc.1 全量 boot 实证，2026-09-25；0.1.7-rc.1 为 3080 生产验证线）。
+
+- **修复 0.1.5 上 boot 即死**：preset 派生对宿主 preset-registry 包的导入从顶层静态导入改为运行期双名探测（0.1.7-rc.1 把官方包从 `dsh-agent-presets` 改名为 `dsh-agent-preset-registry`，0.1.5 宿主只装旧名，静态导入在模块解析期就炸穿整个 loader 树）；两个名字都装不上时按既定「无 preset 回落部署默认预设」降级，不再抛错
+- rc.1 适配波：中断续跑消息的 source 改为 V4 生产者归属 kind（退役的 `plugin` 外壳在 rc.1 持久层写入即抛）；preflight 执行器按宿主代际探测组合解析面（三代际→四代际）；`agent/created` 监听在 0.1.6 串行模式下保持 fire-and-forget
+- 插件清单展示元数据（`locale/*.json`）：rc.1 宿主插件页的卡面标题/描述中文化
+- 修复 boot 代际刷新过早：代际通道此前只凭「boot id 变了」就回 `ready/reload`，而 Web-server 座位与兄弟行共用——端口刚监听时 `/api` 路由 owner 可能还没挂上，被刷新的页面于是向半挂载的宿主发出第一次、也是唯一一次会话列表拉取，左侧列表只剩重启时被召回的那个会话（重新手动刷新才恢复）。现在代际回答先等新进程的 Loader 树结算（与 web-app 放行浏览器用的是同一信号）；就绪前的 poll 回 `waiting` 且**不下发 boot id**，标签页保持陈旧 id 持续重询，就绪即刷；无 Loader 的裸组合仍视为就绪。宿主侧新增「就绪前不回 reload、就绪后仍一次性刷新」单测，客户端侧新增「held 响应不消费代际判定」单测
+
 ## 0.3.0（2026-09-11）
 
 适配宿主 0.1.5 线。

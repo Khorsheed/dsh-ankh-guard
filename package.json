@@ -1,7 +1,7 @@
 {
   "name": "@khorsheed/dsh-ankh-guard",
   "description": "Hard gate for self-modification restarts: a green-build credential bound to the git HEAD, checked before any restart of the running instance",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "publishConfig": {
     "access": "public"
   },
@@ -33,7 +33,8 @@
       "types": "./lib/types/client/index.d.ts",
       "default": "./lib/client.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "lib/*.js",
@@ -44,12 +45,14 @@
     "scripts/install-launchd.sh",
     "scripts/install-systemd.sh",
     "skills/**/*.md",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "locale/*.json"
   ],
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-preset-registry": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-agent-presets": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-client-connection": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.6",
@@ -59,18 +62,21 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-agent-preset-registry": { "optional": true },
+    "@deepseek-ai/dsh-agent-presets": { "optional": true },
     "@deepseek-ai/dsh-client-connection": { "optional": true },
     "@deepseek-ai/dsh-host-webserver": { "optional": true }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.5-rc.1",
-    "@deepseek-ai/dsh-agent-presets": "^0.1.5-rc.1",
-    "@deepseek-ai/dsh-invariants": "^0.1.5-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.5-rc.1",
-    "@deepseek-ai/dsh-session-persistence": "^0.1.5-rc.1",
-    "@deepseek-ai/dsh-skill": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-agent": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-agent-preset-registry": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-agent-presets": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-invariants": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-skill": "^0.1.7-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^22.0.0",
     "tsdown": "^0.22.2",
@@ -110,8 +116,8 @@
     },
     "compat": {
       "minHost": "0.1.5-rc.1",
-      "notes": "composition-preflight runs via the standalone preflight-runner and degrades to a notice when no live harness checkout resolves; original-tab browser handoff feature-probes optional WebServer/connection auth seams; reversible state quarantine was exercised in a live 0.1.1-rc.2 to 0.1.2-alpha.4 cutover",
-      "verifiedHost": "0.1.5-rc.1"
+      "notes": "0.1.5-rc.1 full-line boot-verified 2026-09-25 (42 packages including capture) through the three compat layers: preset-registry dual-name probe, dual-shape typert codecs, and typert faces carrying zod@4; 0.1.7-rc.2 is the 3080 production-verified line; composition-preflight runs via the standalone preflight-runner and degrades to a notice when no live harness checkout resolves; original-tab browser handoff feature-probes optional WebServer/connection auth seams; reversible state quarantine was exercised in a live 0.1.1-rc.2 to 0.1.2-alpha.4 cutover",
+      "verifiedHost": "0.1.7-rc.2"
     }
   }
 }

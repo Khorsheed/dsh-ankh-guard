@@ -20,16 +20,19 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { connect } from 'node:net'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+// The producer-owned message source (V4): each producer declares its own
+// `kind`; the retired shared `plugin` wrapper is rejected by native V4
+// admission. Historical V3 events migrate to the `plugin:ankh-guard` kind —
+// no reader here consumes them, the followup is fire-and-forget.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'ankh-guard': { kind: 'ankh-guard'; plugin: string } & ContextFormed
+  }
+}
 // Type-only: pulls the agent package's event merge ('agent/pre-step').
 import type {} from '@deepseek-ai/dsh-agent'
 import type { AgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
-// Namespace handle for runtime feature detection: the 0.1.2 host replaced
-// the `resolveSessionPreset` free function (and the `PresetBearingSession`
-// type) with the `agentPresetProjectionDefinition` unit, and a STATIC named
-// import of a removed export is a SyntaxError at module load — exactly the
-// failure this dual-host probing exists to survive. The derivation below
-// reads both surfaces through one structural cast.
-import * as agentPresetsHost from '@deepseek-ai/dsh-agent-presets'
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -74,6 +77,34 @@ export interface PresetDerivationSurface {
     apply(state: string | null, event: { type: string; data?: unknown }): string | null
   }
   resolveSessionPreset?: (session: PersistedPresetSource) => string | undefined
+}
+
+let presetRegistryProbe: Promise<unknown> | undefined
+
+/**
+ * Resolve the preset-registry module by name. The 0.1.7-rc.1 host renamed
+ * `@deepseek-ai/dsh-agent-presets` to `@deepseek-ai/dsh-agent-preset-registry`
+ * (the resolve/mount/livePresetMounts/agentPresetProjectionDefinition API
+ * carried over); 0.1.5/0.1.6 hosts install only the old name, and a host
+ * without preset composition installs neither — `null`, and the derivation
+ * then receives `{}`, the established no-preset degrade (the resume falls
+ * back to the deployment's default preset). A STATIC import of either name is
+ * a module-resolution failure at load on hosts installing only the other —
+ * pack-dist strips `dependencies`, so the specifier resolves against the
+ * host's install tree. Both specifiers stay static string literals so tsdown
+ * externalizes them and tsc type-checks them.
+ * @returns the module namespace, or null when neither name resolves.
+ */
+export function loadPresetRegistry(): Promise<unknown> {
+  presetRegistryProbe ??= import('@deepseek-ai/dsh-agent-preset-registry')
+    .catch((): unknown => import('@deepseek-ai/dsh-agent-presets'))
+    .catch((): null => null)
+  return presetRegistryProbe
+}
+
+/** Test seam: drop the cached probe so a mocked resolution path re-runs. */
+export function resetPresetRegistryProbeForTest(): void {
+  presetRegistryProbe = undefined
 }
 
 /**
@@ -144,11 +175,11 @@ async function readColdLog(
 /** Plugin configuration. */
 export interface SelfRestartGuardConfig {
   /** Credential freshness window in minutes (default 10). */
-  maxAgeMinutes?: number
+  maxAgeMinutes?: number | undefined
   /** State directory; defaults to $DSH_HOME/state, else `<cwd>/.dsh-guard-state`. */
-  stateDir?: string
+  stateDir?: string | undefined
   /** Repository the credential binds to; defaults to the process cwd. */
-  repoDir?: string
+  repoDir?: string | undefined
   /**
    * How to surface a scheduled restart's record to the agent (default
    * `followup` — fully autonomous: the plugin queues the report as the next
@@ -156,7 +187,7 @@ export interface SelfRestartGuardConfig {
    * system uses for reminders, so the agent reports without any user message).
    * `step` rides the first step of whatever turn comes next; `off` disables.
    */
-  reportRestartContext?: 'followup' | 'step' | 'off'
+  reportRestartContext?: 'followup' | 'step' | 'off' | undefined
   /**
    * Resume the sessions a restart interrupted (default true). At SIGTERM the
    * plugin snapshots which root sessions had a live turn (plus the restart's
@@ -166,22 +197,22 @@ export interface SelfRestartGuardConfig {
    * The pass only runs on a restart boot (restart marker or pending restart
    * record present); a cold start drops the snapshot without acting.
    */
-  resumeInterrupted?: boolean
+  resumeInterrupted?: boolean | undefined
   /**
    * Delay before the interrupted-session resume pass runs after plugin load
    * (default 5000 ms), so the pass starts turns only after the app's services
    * are up.
    */
-  resumeDelayMs?: number
+  resumeDelayMs?: number | undefined
   /**
    * Maximum age of the interrupted-session snapshot the resume pass honors
    * (default 600000 ms, ten minutes). A snapshot older than that comes from a
    * manual stop/start, not a restart, and is dropped without acting.
    */
-  resumeMaxSnapshotAgeMs?: number
+  resumeMaxSnapshotAgeMs?: number | undefined
 }
 
-export const Config: z<SelfRestartGuardConfig> = z.object({
+export const Config: z = z.object({
   maxAgeMinutes: z.natural().min(1).default(10),
   stateDir: z.string().default(''),
   repoDir: z.string().default(''),
@@ -405,7 +436,7 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
     type FollowupAgent = { followup: (message: ReturnType<typeof createUserMessage>) => void }
     const pluginMessage = (text: string): ReturnType<typeof createUserMessage> => createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: name, form: 'snapshot', sections: [{ name: 'restart', text }] },
+      source: { kind: 'ankh-guard', plugin: name, form: 'snapshot', sections: [{ name: 'restart', text }] },
     })
     // Interrupted sessions awaiting their `agent/created` to receive the
     // "continue" followup: session id → exitAt of the interrupting exit.
@@ -464,7 +495,19 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       if (cutoverBlocksWake(stateDir)) return
       const id = agent.id as string
       const exitAt = pendingContinue.get(id)
-      const record = followupReport ? pendingRestartRecord(stateDir) : null
+      let record = followupReport ? pendingRestartRecord(stateDir) : null
+      // A bare PLANNED outcome with no initiating session (the restart was
+      // driven from outside the host — the operator's terminal already has
+      // the announcement) has no in-host owner: settle the record instead of
+      // waking whichever root session happens to mount first. Records
+      // carrying diagnostics someone must hear about — an unplanned
+      // recovery, a composition rollback, a failed restart — keep the
+      // first-created claim.
+      if (record !== null && record.initiator === undefined
+        && record.unexpected !== true && record.compositionRecovered !== true && record.error === undefined) {
+        acknowledgeRestartRecord(stateDir, record, Date.now())
+        record = null
+      }
       const owesReport = record !== null && (record.initiator === undefined || id === record.initiator)
       if (exitAt !== undefined) {
         void (async () => {
@@ -569,7 +612,8 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       const persistence = probeColdReader(ctx)
       if (presets !== undefined && persistence !== undefined) {
         const inspected = await readColdLog(persistence, id)
-        const presetId = deriveSessionPreset(agentPresetsHost as unknown as PresetDerivationSurface, {
+        const host = await loadPresetRegistry()
+        const presetId = deriveSessionPreset((host ?? {}) as PresetDerivationSurface, {
           header: inspected.meta as PersistedPresetSource['header'],
           events: inspected.events,
         })
@@ -658,7 +702,10 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
       ctx.effect(() => () => { clearInterval(releaseTimer) })
     }
 
-    ctx.on('agent/created', ({ agent }) => {
+    // agent/created went @mode serial in 0.1.6: the creation transaction
+    // awaits whatever a listener returns, so delivery stays fire-and-forget
+    // here — return nothing, and never await agent.whenIdle in this listener.
+    ctx.on('agent/created', ({ agent }): undefined => {
       if (!ctx.agents.roots().includes(agent)) return
       deliver(agent)
     })
@@ -684,7 +731,7 @@ export function apply(ctx: Context, config: SelfRestartGuardConfig): void {
           createUserMessage({
             content: [{ type: 'text', text }],
             source: {
-              kind: 'plugin', plugin: name, form: 'snapshot',
+              kind: 'ankh-guard', plugin: name, form: 'snapshot',
               sections: [{ name: 'restart', text }],
             },
           }),

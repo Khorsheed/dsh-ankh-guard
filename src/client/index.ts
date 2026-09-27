@@ -2,7 +2,7 @@
  * Browser half of the original-tab launch-cutover handoff, plus the
  * boot-generation reload loop: polls carry the last-seen boot id, a stale id
  * with no cutover in flight reloads the tab once, and a sustained disconnection
- * (not a transient blip) raises a neutral overlay.
+ * (not a transient blip) raises a non-blocking connection notice.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 
@@ -14,8 +14,10 @@ const FALLBACK_HASH_KEY = 'ankh-guard-handoff'
 const ACTIVE_RETRY_MS = 250
 const ERROR_RETRY_MIN_MS = 1_000
 const ERROR_RETRY_MAX_MS = 30_000
-/** Sustained-failure threshold for the disconnected overlay; transient blips never show it. */
-const DISCONNECTED_OVERLAY_MS = 5_000
+/** Sustained-failure threshold for the connection notice; transient blips never show it. */
+const DISCONNECTED_NOTICE_MS = 5_000
+// Server idle polls hold for 25s; bound a stalled browser request beyond that.
+const REQUEST_TIMEOUT_MS = 35_000
 
 type HandoffChannel = 'original-tab' | 'fallback-tab'
 type HandoffAuthentication = 'existing-cookie' | 'launch-url'
@@ -121,31 +123,47 @@ function consumeFallbackFragment(): PendingHandoff | null {
   return pending
 }
 
-function waitingOverlay(kind: 'restarting' | 'disconnected' = 'restarting'): HTMLElement {
+function waitingOverlay(kind: 'restarting' | 'disconnected' = 'restarting', retry?: () => void): HTMLElement {
   const existing = document.getElementById('ankh-guard-browser-handoff')
-  if (existing !== null) return existing
+  // A confirmed restart cannot be downgraded by a subsequent transport failure.
+  if (existing?.dataset.kind === 'restarting' && kind === 'disconnected') return existing
+  const element = existing ?? document.createElement('div')
   const zh = navigator.language.toLowerCase().startsWith('zh')
-  const element = document.createElement('div')
   element.id = 'ankh-guard-browser-handoff'
+  element.dataset.kind = kind
   element.setAttribute('role', 'status')
   element.setAttribute('aria-live', 'polite')
-  // 'disconnected' covers failures without a known restart in flight (a bare
-  // exit may never come back) — neutral copy, no auto-recovery promise.
   element.textContent = kind === 'disconnected'
-    ? (zh ? '连接已断开,等待服务恢复。' : 'Connection lost; waiting for the service to recover.')
+    ? (zh ? '连接暂时中断，正在重试…' : 'Connection interrupted; retrying…')
     : (zh ? 'dsh 正在重启；此标签页会自动恢复。' : 'dsh is restarting; this tab will recover automatically.')
-  element.style.cssText = [
+  element.style.cssText = kind === 'restarting' ? [
     'position:fixed', 'inset:0', 'z-index:2147483647', 'display:grid', 'place-items:center',
     'padding:24px', 'background:rgba(15,18,24,.92)', 'color:#fff',
     'font:500 16px/1.5 system-ui,sans-serif', 'text-align:center',
+  ].join(';') : [
+    'position:fixed', 'top:calc(env(safe-area-inset-top,0px) + 12px)', 'left:12px', 'right:12px',
+    'max-width:520px', 'margin:0 auto', 'box-sizing:border-box', 'z-index:2147483647',
+    'display:flex', 'align-items:center', 'justify-content:space-between', 'gap:12px',
+    'padding:12px 16px', 'border:1px solid var(--dsw-alias-border-l2,#8885)', 'border-radius:16px',
+    'background:var(--dsw-alias-bg-base,#fff)', 'color:var(--dsw-alias-label-primary,#181a20)',
+    'box-shadow:0 4px 24px #0002', 'font:400 15px/1.5 system-ui,sans-serif',
   ].join(';')
-  document.documentElement.append(element)
+  if (kind === 'disconnected' && retry) {
+    const button = document.createElement('button')
+    button.textContent = zh ? '重试' : 'Retry'
+    button.style.cssText = 'flex:none;border:0;background:transparent;color:var(--dsw-alias-state-business-primary,#4d6bfe);font:inherit;min-height:36px;cursor:pointer'
+    button.onclick = retry
+    element.append(button)
+  }
+  // Official theme tokens live on body, so the notice must inherit from it.
+  if (!existing) (document.body ?? document.documentElement).append(element)
   return element
 }
 
-async function post(body: unknown): Promise<Response> {
+async function post(body: unknown, signal: AbortSignal): Promise<Response> {
   return fetch(ROUTE, {
     method: 'POST',
+    signal,
     credentials: 'same-origin',
     cache: 'no-store',
     headers: { 'content-type': 'application/json' },
@@ -153,7 +171,7 @@ async function post(body: unknown): Promise<Response> {
   })
 }
 
-async function acknowledge(pending: PendingHandoff): Promise<boolean> {
+async function acknowledge(pending: PendingHandoff, signal: AbortSignal): Promise<boolean> {
   const response = await post({
     version: 1,
     operation: 'ack',
@@ -161,7 +179,7 @@ async function acknowledge(pending: PendingHandoff): Promise<boolean> {
     channel: pending.channel,
     authentication: pending.authentication,
     ...(pending.capability !== undefined ? { capability: pending.capability } : {}),
-  })
+  }, signal)
   return response.status === 204
 }
 
@@ -173,23 +191,52 @@ export function apply(_ctx: ClientContext): () => void {
   let cap: string | undefined
   let errorRetryMs = ERROR_RETRY_MIN_MS
   let firstFailureAt: number | undefined
+  let request: AbortController | undefined
+  let lastWakeAt = -Infinity
+  const foreground = () => document.visibilityState !== 'hidden' && navigator.onLine !== false
+  const clearConnectionNotice = () => {
+    const notice = document.getElementById('ankh-guard-browser-handoff')
+    if (notice?.dataset.kind === 'disconnected') notice.remove()
+  }
+  const pause = () => {
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+    const previous = request; request = undefined; previous?.abort()
+    firstFailureAt = undefined; errorRetryMs = ERROR_RETRY_MIN_MS
+    clearConnectionNotice()
+  }
+  const wake = () => {
+    if (disposed || !foreground() || Date.now() - lastWakeAt < 500) return
+    lastWakeAt = Date.now()
+    pause()
+    schedule()
+  }
+  const visibility = () => {
+    if (!foreground()) { lastWakeAt = -Infinity; pause() } else wake()
+  }
+  const page = (event: PageTransitionEvent) => { if (event.persisted) wake() }
 
-  // Fullscreen notice only for SUSTAINED disconnection (restart window, bare
-  // exit): transient network blips and the backoff cadence never trip it.
+  // Only visible failures count. Ordinary outages never block the page.
   const noteDisconnected = (): void => {
     firstFailureAt ??= Date.now()
-    if (Date.now() - firstFailureAt >= DISCONNECTED_OVERLAY_MS) waitingOverlay('disconnected')
+    if (Date.now() - firstFailureAt >= DISCONNECTED_NOTICE_MS) waitingOverlay('disconnected', wake)
   }
 
   const schedule = (delayMs = 0): void => {
-    if (!disposed) timer = setTimeout(() => { void tick() }, delayMs)
+    if (timer !== undefined) clearTimeout(timer)
+    if (!disposed && foreground()) timer = setTimeout(() => { timer = undefined; void tick() }, delayMs)
   }
   const tick = async (): Promise<void> => {
-    if (disposed) return
+    if (disposed || !foreground() || request) return
+    const current = new AbortController(); request = current
+    const stale = () => disposed || request !== current || !foreground()
+    const deadline = setTimeout(() => current.abort(), REQUEST_TIMEOUT_MS)
     try {
       if (pending !== null) {
         waitingOverlay()
-        if (await acknowledge(pending)) {
+        const acknowledged = await acknowledge(pending, current.signal)
+        if (stale()) return
+        if (acknowledged) {
           const returnPath = pending.returnPath
           const originalTab = pending.channel === 'original-tab'
           sessionStorage.removeItem(PENDING_KEY)
@@ -212,7 +259,8 @@ export function apply(_ctx: ClientContext): () => void {
       const response = await post({
         version: 1, operation: 'poll', capability: tabCapability,
         ...(knownBootId === null ? {} : { knownBootId }),
-      })
+      }, current.signal)
+      if (stale()) return
       if (!response.ok) {
         noteDisconnected()
         schedule(errorRetryMs)
@@ -222,6 +270,7 @@ export function apply(_ctx: ClientContext): () => void {
       errorRetryMs = ERROR_RETRY_MIN_MS
       firstFailureAt = undefined
       const result = await response.json() as PollResponse
+      if (stale()) return
       // Learn the serving boot id before acting on it — storing the successor's
       // id ahead of the reload is what makes the generation check one-shot.
       if (typeof result.bootId === 'string') sessionStorage.setItem(BOOT_ID_KEY, result.bootId)
@@ -278,17 +327,32 @@ export function apply(_ctx: ClientContext): () => void {
         return
       }
     } catch {
+      if (stale()) return
       // The expected restart interval rejects fetches; keep the old page and retry.
       noteDisconnected()
       schedule(errorRetryMs)
       errorRetryMs = Math.min(errorRetryMs * 2, ERROR_RETRY_MAX_MS)
       return
+    } finally {
+      clearTimeout(deadline)
+      if (request === current) request = undefined
     }
     schedule(ACTIVE_RETRY_MS)
   }
+  document.addEventListener('visibilitychange', visibility)
+  window.addEventListener('online', wake)
+  window.addEventListener('offline', visibility)
+  window.addEventListener('pageshow', page)
+  window.addEventListener('dsh-mobile-foreground', wake)
   void tick()
   return () => {
     disposed = true
-    if (timer !== undefined) clearTimeout(timer)
+    pause()
+    document.removeEventListener('visibilitychange', visibility)
+    window.removeEventListener('online', wake)
+    window.removeEventListener('offline', visibility)
+    window.removeEventListener('pageshow', page)
+    window.removeEventListener('dsh-mobile-foreground', wake)
+    document.getElementById('ankh-guard-browser-handoff')?.remove()
   }
 }

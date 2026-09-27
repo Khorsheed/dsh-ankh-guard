@@ -2,12 +2,17 @@
  * Restart-record context injection and interrupted-session continuity. After
  * a scheduled restart, the FULL report waits for the initiating session's
  * root agent, whenever it resumes (session restore is lazy, so no other
- * session is ever woken for reporting); a record without an initiator is
- * claimed by the first root agent created. Separately, a snapshot written at
- * SIGTERM time (`interrupted-sessions.json`) records which root sessions had
- * a live turn when the process stopped, so the next restart boot can resume
- * those sessions and queue a "continue" turn. Pure logic reads the durable
- * files; the plugin wires them into `agent/created` and `agent.followup`.
+ * session is ever woken for reporting). A record without an initiator splits
+ * by kind: one carrying diagnostics someone must hear about (an unplanned
+ * recovery, a composition rollback, a failed restart) is claimed by the
+ * first root agent created, while a bare planned outcome — the restart was
+ * driven from outside the host and the operator's terminal already has the
+ * announcement — is settled without waking anyone. Separately, a snapshot
+ * written at SIGTERM time (`interrupted-sessions.json`) records which root
+ * sessions had a live turn when the process stopped, so the next restart
+ * boot can resume those sessions and queue a "continue" turn. Pure logic
+ * reads the durable files; the plugin wires them into `agent/created` and
+ * `agent.followup`.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { stateFile } from './state-files.ts'

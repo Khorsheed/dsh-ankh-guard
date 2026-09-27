@@ -202,8 +202,14 @@ worker & wait`], {
     )
     expect(inspectMachineTestLeases().root).toBe(expectedMachineRoot)
 
+    // The holder is judged by its stderr being EMPTY (it reports through its
+    // stdout protocol, not through diagnostics). Node's own process warnings
+    // are not the holder's output: with NODE_USE_ENV_PROXY set in the parent
+    // shell, every Node process prints an "EnvHttpProxyAgent is experimental"
+    // warning at startup, which failed this assertion in that environment only.
     const holder = spawn(process.execPath, ['--import', tsxImport, reclaimLockHolder, root], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, NODE_NO_WARNINGS: '1' },
     })
     const lines = createInterface({ input: holder.stdout! })
     const closed = once(holder, 'close')

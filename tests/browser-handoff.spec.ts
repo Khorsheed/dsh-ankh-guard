@@ -383,6 +383,31 @@ describe('browser handoff boot-generation channel', () => {
     })
   })
 
+  it('holds the generation reload until the successor composition has settled', async () => {
+    const dir = stateDir()
+    const capability = 'J'.repeat(43)
+    let ready = false
+    await withHandler(createBrowserHandoffHandler({
+      stateDir: dir, pid: 103, identityMatches: () => true, longPollMs: 0,
+      identityProvider: pid => ({ pid, startToken: 'token-A' }),
+      applicationReady: () => ready,
+    }), async (_setHandler, origin) => {
+      // The successor answers on the shared Web-server seat while sibling rows
+      // are still mounting. Hold — and deliberately do NOT teach the boot id:
+      // the tab must keep its stale id so the one-shot check survives.
+      expect(await (await post(origin, {
+        version: 1, operation: 'poll', capability, knownBootId: '999:stale',
+      })).json()).toEqual({ state: 'waiting' })
+      // The same stale poll reloads once the tree settles.
+      ready = true
+      expect(await (await post(origin, {
+        version: 1, operation: 'poll', capability, knownBootId: '999:stale',
+      })).json()).toEqual({
+        state: 'ready', action: 'reload', authentication: 'existing-cookie', bootId: '103:token-A',
+      })
+    })
+  })
+
   it('degrades to the pre-generation flow when the serving identity is unavailable', async () => {
     const dir = stateDir()
     await withHandler(createBrowserHandoffHandler({

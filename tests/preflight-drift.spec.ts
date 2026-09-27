@@ -22,7 +22,7 @@ import {
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { composePreflightPatches, resolveHarnessRoot } from '../src/preflight-runner.ts'
+import { composePreflightPatches, resolveHarnessRoot, runPreflight } from '../src/preflight-runner.ts'
 import { driftBuiltCliAvailable, driftTripwireRunnable } from './preflight-environment.mjs'
 
 const exec = promisify(execFile)
@@ -257,4 +257,215 @@ process.exit(result.status === null ? 1 : result.status)
       await rm(root, { recursive: true, force: true })
     }
   }, 120_000)
+})
+
+/**
+ * Regression coverage for the runtime-resolution mount (the tarball-profile
+ * false FAIL): on the 0.1.6/0.1.7 host lines the runner must hand the
+ * composed resolution to the boot's PluginPackages mount and provide the
+ * launcher's profileContext service — a tarball profile's own node_modules
+ * holds no `@deepseek-ai/*` entries, so without the in-process interception
+ * every entry import fails natively while the real boot is clean. These
+ * tests boot against a fake built host surface, so they run everywhere.
+ */
+interface FakeHostOptions {
+  line: 'rc' | '0.1.2' | '0.1.6' | '0.1.7'
+  /** Include an `hmr` row in the profile's own patch layer. */
+  hmrRow?: boolean
+  /** Make the fake boot throw, simulating a tree that fails to boot. */
+  bootError?: boolean
+}
+
+interface FakeHost {
+  root: string
+  home: string
+  profileDir: string
+  installAnchor: string
+  recordsFile: string
+}
+
+function writeFakeBuiltHost(options: FakeHostOptions): FakeHost {
+  const root = mkdtempSync(join(tmpdir(), 'ankh-preflight-mount-'))
+  const home = join(root, 'home')
+  const profileDir = join(home, 'profiles', 'web')
+  const recordsFile = join(root, 'records.jsonl')
+  const installAnchor = join(root, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+  mkdirSync(profileDir, { recursive: true })
+  mkdirSync(dirname(installAnchor), { recursive: true })
+  writeFileSync(installAnchor, `${JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.0.0-test' }, null, 2)}\n`)
+  writeFileSync(recordsFile, '')
+
+  const recordPrelude = `import { appendFileSync } from 'node:fs'
+const RECORDS = ${JSON.stringify(recordsFile)}
+const record = (entry) => appendFileSync(RECORDS, JSON.stringify(entry) + '\\n')
+`
+  const writePackage = (name: string, code: string) => {
+    const dir = join(root, 'node_modules', '@deepseek-ai', name)
+    mkdirSync(join(dir, 'lib'), { recursive: true })
+    writeFileSync(join(dir, 'package.json'), `${JSON.stringify({
+      name: `@deepseek-ai/${name}`, version: '0.0.0-test', type: 'module', main: './lib/index.js',
+    }, null, 2)}\n`)
+    writeFileSync(join(dir, 'lib', 'index.js'), code)
+  }
+
+  const profileRows = options.hmrRow === true
+    ? [{ id: 'hmr', name: '@deepseek-ai/dsh-hmr', config: { root: [] } }]
+    : []
+  const lineExports = {
+    rc: `export const healProfilesModuleFallback = (anchor, home) => record({ heal: [String(anchor), String(home)] })
+`,
+    '0.1.2': `export const DEFAULT_PROFILE_PATCH_RELOAD = 'marker'
+export const healProfilesModuleFallback = async (options) => record({ heal: options })
+`,
+    '0.1.6': `export const createProfileResolutionGeneration = async (options) => ({ sentinel: 'generation-0.1.6' })
+`,
+    '0.1.7': `export const createRuntimeResolution = async (options) => ({ sentinel: 'resolution-0.1.7' })
+`,
+  }[options.line]
+  writePackage('dsh-app-boot', `${recordPrelude}
+export const composeEntries = (layers) => layers.flatMap(layer => layer.flatMap(row => row !== null && typeof row === 'object' && Array.isArray(row.insert) ? row.insert : [row]))
+export const loadOptionalPatches = () => undefined
+export const loadOverlayPatches = () => []
+export const loadProfile = () => ({
+  dir: ${JSON.stringify(profileDir)},
+  patchPath: ${JSON.stringify(join(profileDir, 'cordis.patch.yml'))},
+  patches: ${JSON.stringify(profileRows)},
+  layers: [{ packageName: '@fixture/bundle', patches: [] }],
+})
+export const loadLayeredEnv = () => ({})
+export class PluginPackages {
+  constructor(ctx, config) { record({ pluginPackages: config }) }
+}
+export const boot = async (bin, config, patches, prepare) => {
+  const hostCtx = {
+    provide: (key, value) => record({ provide: key }),
+    plugin: async (service, config) => record({ plugin: config }),
+  }
+  await prepare?.(hostCtx)
+  ${options.bootError === true ? "throw new Error('fixture tree failed to boot')" : ''}
+  return { get: () => undefined, fiber: { dispose: async () => record({ disposed: true }) } }
+}
+${lineExports}`)
+  writePackage('dsh-home-paths', `export const resolveDshHome = (configured) => configured ?? ${JSON.stringify(home)}
+`)
+  writePackage('dsh-launch-environment', `export const DSH_LAUNCH_ENVIRONMENT_KEY = 'launchEnvironment'
+`)
+  writePackage('dsh-cmdline', `${recordPrelude}
+export const provideCmdline = (ctx, options) => record({ cmdline: true })
+`)
+  return { root, home, profileDir, installAnchor, recordsFile }
+}
+
+function readRecords(host: FakeHost): Array<Record<string, unknown>> {
+  return readFileSync(host.recordsFile, 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>)
+}
+
+describe('preflight runner runtime-resolution mount', () => {
+  it('0.1.7 line: mounts the computed runtime resolution through PluginPackages and provides profileContext', async () => {
+    const host = writeFakeBuiltHost({ line: '0.1.7', hmrRow: true })
+    try {
+      const binding = { surface: 'built', installAnchor: host.installAnchor } as const
+      const composed = await composePreflightPatches('web', [], host.root, host.home, binding)
+      // The compose keeps the resolution for the boot instead of discarding it.
+      expect(composed.pluginPackagesConfig).toEqual({ resolution: { sentinel: 'resolution-0.1.7' } })
+      expect(composed.profileContext).toMatchObject({
+        name: 'web',
+        dir: host.profileDir,
+        patchPath: join(host.profileDir, 'cordis.patch.yml'),
+        installAnchor: host.installAnchor,
+        startedBundles: ['@fixture/bundle'],
+        home: host.home,
+      })
+      // profileContext would enable the hmr row's file watchers; the one-shot
+      // dry-run disables the row instead (no HMR, no user-patch watchers).
+      expect(composed.patches).toContainEqual({ id: 'hmr', disabled: true })
+
+      writeFileSync(host.recordsFile, '')
+      const code = await runPreflight('web', [], host.root, binding)
+      expect(code).toBe(0)
+      const records = readRecords(host)
+      // The launcher order: profileContext, launch environment, PluginPackages, cmdline.
+      expect(records.map(record => Object.keys(record)[0])).toEqual(['provide', 'provide', 'plugin', 'cmdline', 'disposed'])
+      expect(records[0].provide).toBe('profileContext')
+      expect(records[1].provide).toBe('launchEnvironment')
+      expect(records[2].plugin).toEqual({ resolution: { sentinel: 'resolution-0.1.7' } })
+    } finally {
+      rmSync(host.root, { recursive: true, force: true })
+    }
+  })
+
+  it('0.1.6 line: mounts the computed resolution generation through PluginPackages', async () => {
+    const host = writeFakeBuiltHost({ line: '0.1.6', hmrRow: true })
+    try {
+      const binding = { surface: 'built', installAnchor: host.installAnchor } as const
+      const composed = await composePreflightPatches('web', [], host.root, host.home, binding)
+      expect(composed.pluginPackagesConfig).toEqual({ generation: { sentinel: 'generation-0.1.6' } })
+      expect(composed.profileContext).toMatchObject({ name: 'web', dir: host.profileDir })
+      expect(composed.patches).toContainEqual({ id: 'hmr', disabled: true })
+
+      writeFileSync(host.recordsFile, '')
+      const code = await runPreflight('web', [], host.root, binding)
+      expect(code).toBe(0)
+      const records = readRecords(host)
+      expect(records.map(record => Object.keys(record)[0])).toEqual(['provide', 'provide', 'plugin', 'cmdline', 'disposed'])
+      expect(records[2].plugin).toEqual({ generation: { sentinel: 'generation-0.1.6' } })
+    } finally {
+      rmSync(host.root, { recursive: true, force: true })
+    }
+  })
+
+  it('rc line: heals fallback links and mounts no PluginPackages and no profileContext', async () => {
+    const host = writeFakeBuiltHost({ line: 'rc', hmrRow: true })
+    try {
+      const binding = { surface: 'built', installAnchor: host.installAnchor } as const
+      const composed = await composePreflightPatches('web', [], host.root, host.home, binding)
+      expect(composed.pluginPackagesConfig).toBeUndefined()
+      expect(composed.profileContext).toBeUndefined()
+      // No profileContext, so nothing enables the hmr row: no dry-run override either.
+      expect(composed.patches).not.toContainEqual({ id: 'hmr', disabled: true })
+
+      writeFileSync(host.recordsFile, '')
+      const code = await runPreflight('web', [], host.root, binding)
+      expect(code).toBe(0)
+      const records = readRecords(host)
+      // The rc heal is positional and synchronous, before the profile load.
+      expect(records[0]).toEqual({ heal: [host.installAnchor, host.home] })
+      expect(records.some(record => 'plugin' in record)).toBe(false)
+      expect(records.some(record => record.provide === 'profileContext')).toBe(false)
+    } finally {
+      rmSync(host.root, { recursive: true, force: true })
+    }
+  })
+
+  it('0.1.2 line: heals through the async options API and mounts no PluginPackages', async () => {
+    const host = writeFakeBuiltHost({ line: '0.1.2', hmrRow: true })
+    try {
+      const binding = { surface: 'built', installAnchor: host.installAnchor } as const
+      const composed = await composePreflightPatches('web', [], host.root, host.home, binding)
+      expect(composed.pluginPackagesConfig).toBeUndefined()
+      expect(composed.profileContext).toBeUndefined()
+
+      writeFileSync(host.recordsFile, '')
+      const code = await runPreflight('web', [], host.root, binding)
+      expect(code).toBe(0)
+      const records = readRecords(host)
+      expect(records[0]).toMatchObject({ heal: { installAnchor: host.installAnchor, home: host.home } })
+      expect(records.some(record => 'plugin' in record)).toBe(false)
+    } finally {
+      rmSync(host.root, { recursive: true, force: true })
+    }
+  })
+
+  it('a boot failure with the resolution mounted remains a composition verdict (exit 1)', async () => {
+    const host = writeFakeBuiltHost({ line: '0.1.7', bootError: true })
+    try {
+      const binding = { surface: 'built', installAnchor: host.installAnchor } as const
+      const code = await runPreflight('web', [], host.root, binding)
+      expect(code).toBe(1)
+      // The PluginPackages mount ran before the failure — the prepare order is intact.
+      expect(readRecords(host).some(record => 'plugin' in record)).toBe(true)
+    } finally {
+      rmSync(host.root, { recursive: true, force: true })
+    }
+  })
 })

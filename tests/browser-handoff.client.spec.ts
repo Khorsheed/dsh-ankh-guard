@@ -22,6 +22,8 @@ describe('browser handoff client lifecycle', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    vi.useRealTimers()
   })
 
   it('keeps the final launch URL out of storage and replaces the original tab', async () => {
@@ -206,7 +208,37 @@ describe('browser handoff client lifecycle', () => {
     dispose()
   })
 
-  it('shows the neutral disconnected overlay only after sustained failure', async () => {
+  it('holds a stale tab while the successor composition is still mounting', async () => {
+    const reload = vi.fn()
+    vi.stubGlobal('location', {
+      hash: '',
+      href: 'http://127.0.0.1:3080/session/one',
+      origin: 'http://127.0.0.1:3080',
+      reload,
+      replace: vi.fn(),
+    })
+    sessionStorage.setItem(BOOT_ID_KEY, '100:old')
+    const bodies: Array<Record<string, unknown>> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      // The successor's Web-server seat answers before its rows mount: a hold
+      // that deliberately carries no boot id.
+      if (bodies.length === 1) return response(200, { state: 'waiting' })
+      return response(200, {
+        state: 'ready', action: 'reload', authentication: 'existing-cookie', bootId: '200:new',
+      })
+    }))
+
+    const dispose = apply({} as never)
+    await vi.waitFor(() => { expect(reload).toHaveBeenCalledOnce() })
+    // The held poll neither reloads nor teaches the successor's id — the tab
+    // re-asks with the same stale id until readiness lands, then reloads.
+    expect(bodies[1]?.knownBootId).toBe('100:old')
+    expect(reload).toHaveBeenCalledOnce()
+    dispose()
+  })
+
+  it('shows a non-blocking retry notice only after sustained visible failure', async () => {
     vi.useFakeTimers()
     try {
       vi.stubGlobal('location', {
@@ -226,10 +258,84 @@ describe('browser handoff client lifecycle', () => {
       await vi.advanceTimersByTimeAsync(5_000)
       const overlay = document.getElementById('ankh-guard-browser-handoff')
       expect(overlay).not.toBeNull()
-      expect(overlay?.textContent).toContain('waiting for the service to recover')
+      expect(overlay?.textContent).toContain('Connection interrupted')
+      expect(overlay?.style.inset).not.toBe('0')
+      expect(overlay?.querySelector('button')?.textContent).toBe('Retry')
       dispose()
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+
+describe('foreground recovery of the handoff observer', () => {
+  let visible: DocumentVisibilityState, dispose: (() => void) | undefined
+  const reload = vi.fn()
+  beforeEach(() => {
+    vi.useFakeTimers(); sessionStorage.clear(); document.documentElement.innerHTML = '<head></head><body></body>'
+    visible = 'visible'; reload.mockClear()
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visible)
+    vi.stubGlobal('location', { hash: '', href: 'http://localhost/', origin: 'http://localhost', reload, replace: vi.fn() })
+  })
+  afterEach(() => { dispose?.(); dispose = undefined; vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
+  const visibility = (value: DocumentVisibilityState) => { visible = value; document.dispatchEvent(new Event('visibilitychange')) }
+  it('ignores background time, restarts promptly and coalesces native/visibility wakeups', async () => {
+    const fetch = vi.fn(async () => { throw new Error('offline') }); vi.stubGlobal('fetch', fetch)
+    dispose = apply({} as never)
+    await vi.advanceTimersByTimeAsync(8000)
+    expect(document.getElementById('ankh-guard-browser-handoff')?.dataset.kind).toBe('disconnected')
+    visibility('hidden'); const before = fetch.mock.calls.length
+    await vi.advanceTimersByTimeAsync(60000)
+    expect(fetch).toHaveBeenCalledTimes(before)
+    expect(document.getElementById('ankh-guard-browser-handoff')).toBeNull()
+    visibility('visible'); window.dispatchEvent(new Event('dsh-mobile-foreground'))
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetch).toHaveBeenCalledTimes(before + 1)
+    expect(document.getElementById('ankh-guard-browser-handoff')).toBeNull()
+    await vi.advanceTimersByTimeAsync(7000)
+    const banner = document.getElementById('ankh-guard-browser-handoff')!
+    expect(banner.dataset.kind).toBe('disconnected')
+    const attempts = fetch.mock.calls.length
+    banner.querySelector('button')!.click(); await vi.advanceTimersByTimeAsync(1)
+    expect(fetch).toHaveBeenCalledTimes(attempts + 1)
+    expect(document.getElementById('ankh-guard-browser-handoff')).toBeNull()
+  })
+  it('aborts suspended polls and ignores late generation results rather than reloading', async () => {
+    const polls: { signal: AbortSignal; resolve: (response: Response) => void }[] = []
+    vi.stubGlobal('fetch', vi.fn((_input, init) => new Promise<Response>(resolve => polls.push({ signal: init.signal, resolve }))))
+    dispose = apply({} as never)
+    visibility('hidden'); expect(polls[0]!.signal.aborted).toBe(true)
+    await vi.advanceTimersByTimeAsync(60000)
+    visibility('visible'); await vi.advanceTimersByTimeAsync(1)
+    expect(polls).toHaveLength(2)
+    polls[0]!.resolve(response(200, { state: 'ready', action: 'reload', bootId: 'stale' }))
+    await vi.advanceTimersByTimeAsync(1)
+    expect(reload).not.toHaveBeenCalled(); expect(sessionStorage.getItem(BOOT_ID_KEY)).toBeNull()
+    dispose(); expect(polls[1]!.signal.aborted).toBe(true)
+    polls[1]!.resolve(response(200, { state: 'ready', action: 'reload', bootId: 'disposed' }))
+    await vi.advanceTimersByTimeAsync(1); expect(reload).not.toHaveBeenCalled()
+  })
+  it('bounds hung requests and retains a full overlay only for confirmed restarts', async () => {
+    const fetch = vi.fn((_input, init) => new Promise<Response>((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted')))))
+    vi.stubGlobal('fetch', fetch); dispose = apply({} as never)
+    await vi.advanceTimersByTimeAsync(36000); expect(fetch).toHaveBeenCalledTimes(2)
+    dispose(); dispose = undefined
+    let attempt = 0
+    vi.stubGlobal('fetch', vi.fn(async () => { if (++attempt === 1) return response(200, { state: 'waiting' }); throw new Error('offline') }))
+    dispose = apply({} as never); await vi.advanceTimersByTimeAsync(9000)
+    const overlay = document.getElementById('ankh-guard-browser-handoff')!
+    expect(overlay.dataset.kind).toBe('restarting'); expect(overlay.querySelector('button')).toBeNull()
+    visibility('hidden'); visibility('visible'); await vi.advanceTimersByTimeAsync(1)
+    expect(overlay.dataset.kind).toBe('restarting')
+  })
+  it('retries on network restoration without waiting out the old backoff', async () => {
+    let online = true; vi.spyOn(navigator, 'onLine', 'get').mockImplementation(() => online)
+    const fetch = vi.fn(async () => { throw new Error('offline') }); vi.stubGlobal('fetch', fetch)
+    dispose = apply({} as never); await vi.advanceTimersByTimeAsync(16000)
+    online = false; window.dispatchEvent(new Event('offline')); const before = fetch.mock.calls.length
+    await vi.advanceTimersByTimeAsync(60000); expect(fetch).toHaveBeenCalledTimes(before)
+    online = true; window.dispatchEvent(new Event('online')); await vi.advanceTimersByTimeAsync(1)
+    expect(fetch).toHaveBeenCalledTimes(before + 1)
   })
 })

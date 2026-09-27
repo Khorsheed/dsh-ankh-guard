@@ -2968,13 +2968,19 @@ process.exit(1)
     const previousProgram = `const fs=require('fs');const server=require('http').createServer((q,s)=>s.end('previous-after-eaddr'));server.on('error',error=>{fs.writeFileSync(${JSON.stringify(releaseStale)},'release');throw error});server.listen(${port},'127.0.0.1')`
     const previousStart = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(previousProgram)}`
     const staleServer = join(env.home, 'stale-listener.cjs')
-    writeFileSync(staleServer, `const fs=require('fs');const server=require('http').createServer((q,s)=>s.end('stale-old-listener-200'));server.listen(${port},'127.0.0.1');const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(releaseStale)})){clearInterval(timer);server.close(()=>process.exit(0))}},25);setTimeout(()=>server.close(()=>process.exit(0)),10000)\n`)
+    writeFileSync(staleServer, `const fs=require('fs');const server=require('http').createServer((q,s)=>s.end('stale-old-listener-200'));server.listen(${port},'127.0.0.1',()=>process.send?.('ready'));const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(releaseStale)})){clearInterval(timer);server.close(()=>process.exit(0))}},25);setTimeout(()=>server.close(()=>process.exit(0)),90000)\n`)
     const orphanLauncher = join(env.home, 'orphan-listener.cjs')
-    writeFileSync(orphanLauncher, `const {spawn}=require('child_process');const child=spawn(process.execPath,[${JSON.stringify(staleServer)}],{detached:true,stdio:'ignore'});child.unref()\n`)
+    // Wait for the actual listener, not a scheduling guess under CI load.
+    writeFileSync(orphanLauncher, `
+const {spawn}=require('child_process')
+const child=spawn(process.execPath,[${JSON.stringify(staleServer)}],{detached:true,stdio:['ignore','ignore','ignore','ipc']})
+const timeout=setTimeout(()=>{child.kill();process.exit(1)},10000)
+child.once('message',()=>{clearTimeout(timeout);child.disconnect();child.unref()})
+child.once('exit',code=>{clearTimeout(timeout);process.exit(code || 0)})
+`)
     const targetScript = join(env.home, 'target-eaddr.sh')
     writeFileSync(targetScript, `#!/bin/bash
 "${process.execPath}" "${orphanLauncher}"
-sleep 0.2
 "${process.execPath}" -e "require('http').createServer().listen(${port},'127.0.0.1')" || true
 printf 'EADDRINUSE :${port}\\n' >&2
 sleep 0.6
@@ -2997,10 +3003,10 @@ exit 1
         ...boundPreflightArgs(),
       ], io().io)).toBe(0)
 
-      const deadline = Date.now() + 35_000
-      while (readCutoverReceipt(stateDir)?.phase !== 'restored' && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 200))
-      }
+      // The contract is recovery after exactly two rejected target attempts,
+      // not a wall-clock benchmark of several identity-checked Node launches.
+      await waitForCondition('stale-listener cutover restores previous',
+        () => readCutoverReceipt(stateDir)?.phase === 'restored', 60_000, 200)
       expect(await fetchBody(port)).toBe('previous-after-eaddr')
       const receipt = readCutoverReceipt(stateDir)
       const targetAttempts = receipt?.attempts.filter(attempt => attempt.role === 'target') ?? []
@@ -3015,7 +3021,7 @@ exit 1
       await killListener(port)
       env.restore()
     }
-  }, 45_000)
+  }, 90_000)
 
   it('rejects a target that exits after authenticated 200 without handing its URL to the browser, then restores previous', async () => {
     const env = supervisedEnv()
@@ -4037,16 +4043,9 @@ http.createServer((req, res) => {
         ['supervise', '--port', String(port), '--start', startCmd, '--state-dir', stateDir, '--repo', repo],
         sup.io,
       )).toBe(0)
-      const deadline = Date.now() + 20_000
-      let body = ''
-      while (Date.now() < deadline) {
-        try {
-          body = await fetchBody(port)
-          if (body === 'new') break
-        } catch { /* not up yet */ }
-        await new Promise((resolve) => { setTimeout(resolve, 300) })
-      }
-      expect(body).toBe('new')
+      await waitForCondition('six EADDRINUSE attempts reach the healthy server',
+        async () => await fetchBody(port) === 'new', 60_000, 300)
+      expect(Number(readFileSync(counter, 'utf8'))).toBe(6)
       const log = readFileSync(join(env.home, 'state', 'watchdog.log'), 'utf8')
       expect(log).toContain('boot hit EADDRINUSE')
       expect(log).not.toContain('rolling repo back')
@@ -4058,9 +4057,9 @@ http.createServer((req, res) => {
       await killListener(port)
       env.restore()
     }
-    // Six spawn-and-fail cycles do not fit in vitest's 5 s default, which the
-    // 20 s deadline above already assumed.
-  }, 30_000)
+    // Bound the full lifecycle while allowing six real process launches on a
+    // busy machine; exact attempts and no rollback/give-up remain asserted.
+  }, 90_000)
 
   it('counts an EADDRINUSE on a foreign port as a boot failure instead of retrying forever', async () => {
     const env = supervisedEnv()
@@ -4203,7 +4202,7 @@ describe('restart context injection', () => {
     await fiber.dispose()
   })
 
-  it('queues the restart report as a followup turn on root-agent creation (autonomous)', async () => {
+  it('settles a bare ownerless planned outcome without waking any session', async () => {
     const repo = makeRepo()
     const stateDir = tmpDir('guard-ctx-')
     writeFileSync(join(stateDir, 'last-restart.json'), JSON.stringify({ exitAt: 1_700_000_000_000, pid: 9 }))
@@ -4214,13 +4213,41 @@ describe('restart context injection', () => {
     ctx.provide('agents', { roots: () => [agent] } as never)
     const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
     await fiber.await()
+    // No initiator, nothing worth reporting in-host (the operator's terminal
+    // has the announcement): the record settles on the first delivery pass
+    // and NO session is woken — a mounted ended session must stay ended.
     ctx.emit('agent/created', { agent })
-    expect(followup).toHaveBeenCalledTimes(1)
-    // Acknowledged: a second creation does not re-followup.
-    ctx.emit('agent/created', { agent })
-    expect(followup).toHaveBeenCalledTimes(1)
+    expect(followup).not.toHaveBeenCalled()
     expect(pendingRestartRecord(stateDir)).toBeNull()
+    // Settled for good: a later creation stays silent too.
+    ctx.emit('agent/created', { agent })
+    expect(followup).not.toHaveBeenCalled()
     await fiber.dispose()
+  })
+
+  it('an ownerless recovery record (unexpected / composition rollback / error) is claimed by the first root agent created', async () => {
+    for (const record of [
+      { exitAt: 1_700_000_000_000, unexpected: true },
+      { exitAt: 1_700_000_000_000, compositionRecovered: true, detail: 'unmounted demo' },
+      { exitAt: 1_700_000_000_000, error: 'listener died' },
+    ]) {
+      const repo = makeRepo()
+      const stateDir = tmpDir('guard-ctx-')
+      writeFileSync(join(stateDir, 'last-restart.json'), JSON.stringify(record))
+      const followup = vi.fn()
+      const agent = { followup } as never
+      const ctx = new Context()
+      await ctx.plugin(Loader)
+      ctx.provide('agents', { roots: () => [agent] } as never)
+      const fiber = ctx.plugin(selfRestartGuard, { stateDir, repoDir: repo, maxAgeMinutes: 5 })
+      await fiber.await()
+      ctx.emit('agent/created', { agent })
+      // Diagnostics someone must hear about: the first root agent reports,
+      // exactly once.
+      expect(followup).toHaveBeenCalledTimes(1)
+      expect(pendingRestartRecord(stateDir)).toBeNull()
+      await fiber.dispose()
+    }
   })
 
   it('does not followup for a non-root (subagent) agent', async () => {

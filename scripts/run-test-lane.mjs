@@ -7,6 +7,7 @@ import { cpus, loadavg, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { acquireTestResource } from './test-resource.mjs'
 import { assessTestResult } from './test-result.mjs'
+import { testConcurrency } from './test-concurrency.mjs'
 import { driftBuiltCliAvailable, driftTripwireRunnable } from '../tests/preflight-environment.mjs'
 
 const lane = process.argv[2]
@@ -23,6 +24,7 @@ const pureSpecs = [
   'tests/deployment-proof.spec.ts',
   'tests/patch.spec.ts',
   'tests/preset-derive.spec.ts',
+  'tests/preset-registry-probe.spec.ts',
   'tests/restart-request.spec.ts',
   'tests/state-files.spec.ts',
   'tests/transition.spec.ts',
@@ -56,9 +58,9 @@ const tasks = lane === 'unit' ? unitTasks : lane === 'integration' ? integration
 // test needs a built dsh CLI in the toolchain cache. Neither exists in CI, so
 // the expected count follows the same shared probes instead of hardcoding a
 // deployment-machine count.
-const lifecycleDriftExpected = 9 + (driftTripwireRunnable() ? 1 : 0) + (driftBuiltCliAvailable() ? 1 : 0)
-const inventory = { pure: 53, 'self-unit': 21, 'supervise-1-of-4': 15, 'supervise-2-of-4': 10,
-  'supervise-3-of-4': 15, 'supervise-4-of-4': 12, 'self-process': 67, 'lifecycle-drift': lifecycleDriftExpected }
+const lifecycleDriftExpected = 14 + (driftTripwireRunnable() ? 1 : 0) + (driftBuiltCliAvailable() ? 1 : 0)
+const inventory = { pure: 63, 'self-unit': 21, 'supervise-1-of-4': 15, 'supervise-2-of-4': 10,
+  'supervise-3-of-4': 15, 'supervise-4-of-4': 12, 'self-process': 68, 'lifecycle-drift': lifecycleDriftExpected }
 for (const task of tasks) task.expected = inventory[task.name]
 const artifacts = mkdtempSync(join(tmpdir(), 'ankh-test-results-'))
 process.stdout.write(`ankh-guard test artifacts: ${artifacts}\n`)
@@ -100,7 +102,7 @@ function captureBaseline() {
 const baseline = captureBaseline()
 process.stdout.write(`${JSON.stringify(baseline)}\n`)
 
-const maxParallel = lane === 'unit' ? 2 : 4
+const maxParallel = testConcurrency(lane)
 // Match the repository preset for spawn-heavy tests without adding a package
 // vitest.config.ts: the public ankh-guard mirror owns its standalone config.
 // Individual lifecycle cases keep their larger explicit budgets.

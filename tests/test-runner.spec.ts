@@ -4,8 +4,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { assessTestResult } from '../scripts/test-result.mjs'
+import { testConcurrency } from '../scripts/test-concurrency.mjs'
 
 const task = { name: 'supervise-fixture', expected: 12 }
+it('honors the repo worker budget without exceeding lane caps or changing invalid defaults', () => {
+  expect(testConcurrency('all', '1')).toBe(1)
+  expect(testConcurrency('integration', '2')).toBe(2)
+  expect(testConcurrency('unit', '8')).toBe(2)
+  expect(testConcurrency('all', '8')).toBe(4)
+  for (const value of ['', '0', '-1', '1.5', 'NaN', 'Infinity']) {
+    expect(testConcurrency('all', value)).toBe(4)
+    expect(testConcurrency('unit', value)).toBe(2)
+  }
+})
 const exited = { code: 0, signal: null }
 const report = (overrides = {}) => ({
   success: true, numPassedTests: 12, numFailedTests: 0, numPendingTests: 128,

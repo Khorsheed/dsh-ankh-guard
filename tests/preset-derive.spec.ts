@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import * as agentPresetsHost from '@deepseek-ai/dsh-agent-presets'
+import * as agentPresetsHost from '@deepseek-ai/dsh-agent-preset-registry'
 import { deriveSessionPreset, type PresetDerivationSurface } from '../src/index.ts'
 
 describe('deriveSessionPreset', () => {

@@ -185,7 +185,7 @@ dsh-ankh-guard restart \
 
 以 cordis 插件挂载（base bundle）后，同一套能力以 `selfRestartGuard` 服务的形式供应用内闸门使用。配置：`maxAgeMinutes`（默认 10）、`stateDir`、`repoDir`、`reportRestartContext`（默认 `followup`）、`fallbackGraceMs`（默认 300000）。
 
-除 verify/record/canary 等闸门外，服务还暴露 `requestRestart({ start, profile, initiator })`——UI 级调用方（如 mode-switcher）的进程内重启触发缝：`initiator` 必填（发起会话的真实 id），端口从 launch 记录自知；无活 watchdog 走 `restart`，受监督走 `reconfigure` 事务 cutover（受监督下唯一安全的换命令通道），凭证/preflight/marker/lock 全套闸门与 CLI 同源，拒绝返回结构化 `{ accepted, stage, reason }` 且绝不停机。浏览器侧，除 cutover receipt 通道外还有 boot 代际通道：普通重启或崩溃救回后，打开的标签页经 handoff 长轮询发现进程 boot id 已变，自动全页刷新一次拿到新 bundle；持续断连约 5 秒挂中性遮罩（不承诺自动恢复），瞬时抖动不闪屏。
+除 verify/record/canary 等闸门外，服务还暴露 `requestRestart({ start, profile, initiator })`——UI 级调用方（如 mode-switcher）的进程内重启触发缝：`initiator` 必填（发起会话的真实 id），端口从 launch 记录自知；无活 watchdog 走 `restart`，受监督走 `reconfigure` 事务 cutover（受监督下唯一安全的换命令通道），凭证/preflight/marker/lock 全套闸门与 CLI 同源，拒绝返回结构化 `{ accepted, stage, reason }` 且绝不停机。浏览器侧，除 cutover receipt 通道外还有 boot 代际通道：普通重启或崩溃救回后，打开的标签页经 handoff 长轮询发现进程 boot id 已变，自动全页刷新一次拿到新 bundle；刷新前会等新进程的组合挂载完成（Web-server 座位与兄弟行共用，端口刚应答时 `/api` 路由 owner 可能还没挂上；Loader 结算前一律回 `waiting` 且不下发 boot id，标签页保持陈旧 id 继续问，就绪即刷）；仅前台持续失败约 5 秒后显示带重试按钮的轻量连接提示；只有确认的 cutover 使用重启遮罩。后台或离线时间不计入失败时长；回前台或恢复联网立即清除退避并重新轮询；挂起的请求在 35 秒后超时，过期响应不能触发刷新。
 
 ## Model Experience
 
@@ -197,9 +197,10 @@ dsh-ankh-guard restart \
 
 ## Compatibility
 
-- npm 发布线（`@deepseek-ai/dsh@0.1.5-rc.1`）：⚠️ 降级——一切可用；composition-preflight 门禁通过独立的 `preflight-runner` 运行（0.1.5-rc.1 仍未导出 `composeProfile`，runner 改经已发布的 `@deepseek-ai/dsh-app-boot` 原语组装，带漂移绊线测试），只要能解析到 dsh app 布局——`--harness-root`、耐久 launch spec、`DSH_HARNESS` 或默认检出路径——就完整运行。没有 harness 检出的纯 npm 部署下门禁退化为提示后放行。原标签页桥会探测可选 WebServer/connection 认证 seam，不使用 token 认证的宿主自然走现有 Cookie 路径；冷读（停靠探测与 preset 推导）走 0.1.5 的 handle 制 sessionPersistence（`open(id, 'read')` → `read` → `close`，一次性 `inspect` 已移除）。其余能力在 npm 线上完整。minHost 前移至 0.1.5-rc.1，旧宿主请停留在旧发布线。
+- npm 发布线（`@deepseek-ai/dsh@0.1.5-rc.1`）：支持——0.1.5-rc.1 全量 boot 实证通过（42 包含 capture，2026-09-25）——带两处设计内降级。composition-preflight 门禁通过独立的 `preflight-runner` 运行（0.1.5-rc.1 仍未导出 `composeProfile`，runner 改经已发布的 `@deepseek-ai/dsh-app-boot` 原语组装，带漂移绊线测试），只要能解析到 dsh app 布局——`--harness-root`、耐久 launch spec、`DSH_HARNESS` 或默认检出路径——就完整运行。没有 harness 检出的纯 npm 部署下门禁退化为提示后放行。原标签页桥会探测可选 WebServer/connection 认证 seam，不使用 token 认证的宿主自然走现有 Cookie 路径；冷读（停靠探测与 preset 推导）走 0.1.5 的 handle 制 sessionPersistence（`open(id, 'read')` → `read` → `close`，一次性 `inspect` 已移除）。其余能力在 npm 线上完整。minHost 保持 0.1.5-rc.1，旧宿主请停留在旧发布线。
 - 历史验证：npm host 的 0.1.1-rc.2 → 0.1.2-alpha.4 隔离切换已通过（transition preflight 在 home 副本上移开带旧 schema record 的 v3 whole-unit projection cache，live apply 隔离旧文件，target 以零重试完成 Token URL → 303 → Cookie 200、ownership 稳定窗口与 canary；旧文件逐字节保留在 cutover 目录。相同 home 的无 transition 对照因缺少 Alpha.4 record 字段而拒绝，证明验收覆盖了真实 schema 断裂面）。
-- 源码线（deepseek-harness master，fork 或上游）：✅（verifiedHost: 0.1.5-rc.1）——门禁通过独立的 `preflight-runner` 运行（从在线 checkout 解析已发布的 `@deepseek-ai/dsh-app-boot` 等），不再需要 fork 补丁。
+- 源码线（deepseek-harness master，fork 或上游）：✅（verifiedHost: 0.1.7-rc.2）——门禁通过独立的 `preflight-runner` 运行（从在线 checkout 解析已发布的 `@deepseek-ai/dsh-app-boot` 等），不再需要 fork 补丁。
+- 双线证据：0.1.5 的 boot 经三层兼容修复端到端通过——[preset-registry 双名探测](../../.agents/notes/implemented/bug-fix/2026-09-25-preset-registry-dual-name-probe.md)、[typert codec 双形状](../../.agents/notes/implemented/bug-fix/2026-09-25-typert-codec-dual-shape.md)、[face 自带 zod@4](../../.agents/notes/implemented/bug-fix/2026-09-25-typert-faces-carry-zod-v4.md)。
 
 **版本线对照**：0.2.0 之后的首个发布起支持宿主 `0.1.5-rc.1` 及以后；宿主 `0.1.2-rc.1` 请停留在 `0.2.0`，宿主 `0.1.0-rc.6` ~ `0.1.1-rc.2` 请停留在 0.1.x 发布线（末版 `0.1.1`）。
 
@@ -214,6 +215,10 @@ dsh-ankh-guard restart \
 - **脏树 checkpoint 默认拒绝**——`--include-dirty` 会提交整个 staged/unstaged/untracked 路径集，只能在逐项复核、用户明确批准且仓库策略允许时使用；纯重启直接跳过 checkpoint。
 - **`restart`/`supervise` 通过 `lsof` 发现监听者**（macOS / 带 lsof 的 Linux）；guard 优先使用系统绝对路径，其他平台需用 `--pid`。
 - **杀进程一律按单 pid identity + 后代回收，从不按进程组**——实例不是 setsid 的，所以 `restart`、`schedule-exit` 的退出代理和 watchdog 清理都针对已记录的 child/listener；cutover 强制路径先 `SIGSTOP`，再用 Linux boot/start-tick 或 macOS `proc_pidinfo` 微秒启动时间复核 identity，不匹配就只 `SIGCONT` 并拒绝，然后才沿 `pgrep -P` 冻结、复核亲缘并回收后代。普通非 cutover 端口恢复仍有受限的 listener 清理兜底；cutover 禁止凭端口选择或杀进程。
+
+## 测试并发
+
+进程集成测试默认并行运行 4 个分片，unit lane 上限为 2。资源紧张时可用 `DSH_TEST_MAX_WORKERS=1 pnpm --filter @khorsheed/dsh-ankh-guard test` 串行调度全部分片；全仓 `pnpm gate` 也可使用这个环境变量。只降低调度并发，不减少测试、延长断言期限或改变生产重启行为；无效值保留默认值。
 
 ## 变更记录
 

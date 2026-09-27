@@ -16,6 +16,14 @@
  * means the process it knew is gone — answer ready/reload. A cutover receipt
  * always wins over the generation check: during a cutover the old tab's known
  * id is already stale, and the receipt protocol owns the pacing.
+ *
+ * The generation answer waits for the successor's composition to settle. The
+ * shared Web-server seat answers as soon as it listens — well before sibling
+ * rows mount — and a page that loads then calls into a half-mounted /api
+ * surface (the Web app gates its own browser handoff on the same Loader
+ * settlement for that reason). Until then the poll is answered `waiting`
+ * WITHOUT the boot id: teaching the tab the successor's id would consume its
+ * one-shot generation check and strand it on an unusable page.
  */
 import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, linkSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -104,6 +112,12 @@ interface BrowserHandoffDependencies {
   connection?: ConnectionSlice
   /** Resolve lazily because WebServer can activate before the optional connection service. */
   connectionProvider?: () => ConnectionSlice | undefined
+  /**
+   * Whether the serving composition has finished mounting, consulted only by
+   * the boot-generation channel. Omitted means ready — a hand-built tree
+   * without a Loader is already complete.
+   */
+  applicationReady?: () => boolean
   /** Test seams; production defaults turn idle polling into a held request. */
   longPollMs?: number
   longPollIntervalMs?: number
@@ -411,6 +425,13 @@ export function createBrowserHandoffHandler(dependencies: BrowserHandoffDependen
       // would race the registration/ack dance.
       if (bootId !== undefined && message.knownBootId !== undefined && message.knownBootId !== bootId
         && activeCutover(dependencies.stateDir) === null) {
+        if (dependencies.applicationReady?.() === false) {
+          // The successor's composition is still mounting. Answer WITHOUT the
+          // boot id (not through `respond`): the tab must keep its stale id so
+          // this one-shot generation check survives until readiness lands.
+          json(res, 200, { state: 'waiting' })
+          return
+        }
         respond(200, { state: 'ready', action: 'reload', authentication: 'existing-cookie' })
         return
       }
@@ -597,7 +618,36 @@ export function registerBrowserHandoff(ctx: Context, stateDir: string): void {
     const handler = createBrowserHandoffHandler({
       stateDir,
       connectionProvider: () => webCtx.get('connection') as ConnectionSlice | undefined,
+      applicationReady: applicationReadyProbe(webCtx),
     })
     webCtx.effect(() => webServer.register({ kind: 'exact', path: BROWSER_HANDOFF_ROUTE, handler }), 'ankh-guard: browser handoff route')
   })
+}
+
+/** The Loader settlement seam this bridge needs, read structurally. */
+interface LoaderReadiness {
+  await(): Promise<void>
+}
+
+/**
+ * Build the generation channel's readiness probe from the Loader tree.
+ *
+ * The Web-server seat is shared: it answers as soon as it listens, while
+ * sibling rows — including the /api route owner a reloaded page immediately
+ * calls into — are still mounting. The Web app gates its own URL line and
+ * browser handoff on this exact settlement, so the guard's automatic reload
+ * must wait for it too. A composition without a Loader is already complete.
+ *
+ * Only settlement counts as ready: a failed tree leaves the tab on its old
+ * page (the watchdog's crash recovery owns that outcome), and the next healthy
+ * process answers the still-stale poll.
+ * @param ctx - context owning the Loader service.
+ * @returns probe consulted by every boot-generation poll.
+ */
+function applicationReadyProbe(ctx: Context): () => boolean {
+  const settled = (ctx.get('loader') as LoaderReadiness | undefined)?.await()
+  if (settled === undefined) return () => true
+  let ready = false
+  void settled.then(() => { ready = true }, () => {})
+  return () => ready
 }
