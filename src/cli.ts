@@ -51,7 +51,7 @@ import {
 } from './launch-spec.ts'
 import {
   applyTransition, createPreflightSnapshot, createTransitionPreflightSnapshot, prepareTransition, rollbackTransition,
-  validateTransitionPlan, type TransitionPlan,
+  validateTransitionPlan, type SnapshotProgress, type TransitionPlan,
 } from './transition.ts'
 import {
   appendTestLifecycleEvent, appendTestLifecycleEventForProcess, registerCurrentTestProcess, registerTestProcess,
@@ -77,6 +77,7 @@ interface CliOptions {
   delayMs: number | undefined
   stopTimeoutMs: number | undefined
   supervisorYieldTimeoutMs: number | undefined
+  bootTimeoutMs: number | undefined
   log: string | undefined
   foreground: boolean
   rollback: boolean
@@ -292,12 +293,14 @@ commands:
           [--home DIR] [--repo DIR] [--harness-root DIR] [--profile NAME] [--browser-handoff required|off]
           --preflight-surface source|built [--preflight-runner FILE] --preflight-install-anchor FILE
           --candidate-probe-command "CMD"
-          [--transition-file FILE] [--delay-ms MS] [--supervisor-yield-timeout-ms MS] [--preflight-timeout-ms MS] [--state-dir DIR]
+          [--transition-file FILE] [--delay-ms MS] [--supervisor-yield-timeout-ms MS] [--preflight-timeout-ms MS]
+          [--boot-timeout-ms MS] [--state-dir DIR]
   restart --port N --start "CMD" [--pid PID] [--timeout-ms MS] [--delay-ms MS] [--stop-timeout-ms MS] [--rollback]
           [--profile NAME] [--harness-root DIR] [--preflight-timeout-ms MS] [--state-dir DIR] [--repo DIR] [--max-age MIN]
   schedule-exit [--port N] --delay-ms MS [--initiator ID] [--log FILE] [--profile NAME]
-          [--harness-root DIR] [--preflight-timeout-ms MS] [--state-dir DIR] [--repo DIR]
+          [--harness-root DIR] [--preflight-timeout-ms MS] [--boot-timeout-ms MS] [--state-dir DIR] [--repo DIR]
   supervise --port N --start "CMD" [--foreground] [--log FILE] [--state-dir DIR] [--repo DIR] [--harness-root DIR] [--home DIR]
+          [--cutover-id ID] [--boot-timeout-ms MS]
 flags:
   --state-dir DIR  state directory (default: $DSH_HOME/state, else <cwd>/.dsh-guard-state)
   --repo DIR       repository the credential binds to (default: cwd)
@@ -324,6 +327,16 @@ flags:
                    (agent-driven graceful self-restart: schedule, complete, then restart);
                    schedule-exit: delay before the detached exit agent kills the host;
                    reconfigure: grace after successor supervisor claim before old-child stop
+  --boot-timeout-ms MS  reconfigure/schedule-exit/supervise: readiness budget for one
+                   boot (the watchdog's WD_BOOT_TIMEOUT, whole seconds, default 60).
+                   reconfigure/supervise hand it to the spawned watchdog's environment;
+                   schedule-exit records it in the restart marker for the respawn's boot
+                   window only (the running watchdog then falls back to its own budget)
+  --cutover-id ID  supervise: resume the durable launch-cutover transaction after its
+                   supervisor chain died (the id is in launch-status / the receipt);
+                   without it a bare supervise on an awaiting-user receipt only holds
+                   the claim and consumes operator control markers, never booting the
+                   rejected side
   --log FILE       supervise (detached only — with --foreground the external supervisor's
                    redirection owns the log) / schedule-exit: log file (default: <state-dir>/*.log)
   --home DIR       supervise: the dsh home the supervised instance boots with (profiles,
@@ -368,6 +381,7 @@ export function parse(
   const options: CliOptions = {
     stateDir: '', repoDir: '', harnessRoot: '', home: '', maxAgeMinutes: 10, port: undefined, command: undefined, run: false, runArgv: undefined, message: undefined, detail: undefined,
     start: undefined, pid: undefined, timeoutMs: undefined, delayMs: undefined, stopTimeoutMs: undefined, supervisorYieldTimeoutMs: undefined,
+    bootTimeoutMs: undefined,
     log: undefined,
     foreground: false, rollback: false, force: false, sync: false, initiator: undefined, profile: undefined, preflightTimeoutMs: undefined,
     preflightSurface: undefined, preflightRunner: undefined, preflightInstallAnchor: undefined, candidateProbeCommand: undefined,
@@ -448,6 +462,16 @@ export function parse(
           const n = Number(raw)
           if (raw === undefined || !Number.isInteger(n) || n < 100) throw new Error('--supervisor-yield-timeout-ms must be an integer >= 100')
           options.supervisorYieldTimeoutMs = n
+          i++
+          break
+        }
+        case '--boot-timeout-ms': {
+          const raw = flagValue(arg, true)
+          const n = Number(raw)
+          // The wrapper's budget is whole seconds; sub-second values are
+          // rejected rather than silently rounded away.
+          if (raw === undefined || !Number.isInteger(n) || n < 1000) throw new Error('--boot-timeout-ms must be an integer >= 1000')
+          options.bootTimeoutMs = n
           i++
           break
         }
@@ -587,12 +611,17 @@ function verifyRepoCredential(stateDir: string, repoDir: string, maxAgeMinutes: 
 }
 
 /**
- * How the spawned watchdog should invoke the guard CLI: the built form runs
- * `node <cli>`; the source form needs tsx with an absolute path (the watchdog
- * runs with a deployment cwd that resolves no node_modules).
+ * How the spawned watchdog should invoke the guard CLI. The executable is
+ * always the ABSOLUTE process.execPath, never a bare `node`: the watchdog runs
+ * under whatever PATH spawned it, and a launcher chain (launchd/systemd) has a
+ * minimal PATH without homebrew — a bare `node` there makes every guard
+ * invocation the watchdog issues (canary, record-proven-deployment, cutover
+ * events) fail with command-not-found (the 2026-09-30 launchd incident). The
+ * source form additionally needs tsx with an absolute path (the watchdog runs
+ * with a deployment cwd that resolves no node_modules).
  * @returns the command prefix (verb args are appended by the watchdog).
  */
-function guardInvocation(): string {
+export function guardInvocation(): string {
   const cliPath = fileURLToPath(import.meta.url)
   if (cliPath.includes(`${sep}src${sep}`)) {
     // Source form: locate the tsx loader relative to this file's own
@@ -600,10 +629,10 @@ function guardInvocation(): string {
     // package tree alike), falling back to plain node when absent.
     const nodeModules = resolve(dirname(cliPath), '../../../node_modules')
     const tsx = join(nodeModules, 'tsx', 'dist', 'esm', 'index.mjs')
-    if (existsSync(tsx)) return `node --import ${tsx} ${cliPath}`
-    return `node ${cliPath}`
+    if (existsSync(tsx)) return `${process.execPath} --import ${tsx} ${cliPath}`
+    return `${process.execPath} ${cliPath}`
   }
-  return `node ${cliPath}`
+  return `${process.execPath} ${cliPath}`
 }
 
 /**
@@ -1603,7 +1632,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       }
       const watchdogPid = liveWatchdogPid(stateDir)
       if (watchdogPid === null) {
-        io.stderr(`${command} refused: no live watchdog can consume the durable control request\n`)
+        io.stderr(`${command} refused: no live watchdog can consume the durable control request. Start the consumer first: \`supervise --state-dir ${stateDir}\` holds the awaiting-user cutover ${transaction.receipt.id} without launching anything, or \`supervise --cutover-id ${transaction.receipt.id} --state-dir ${stateDir}\` resumes the selected side directly\n`)
         return 1
       }
       const requested = command === 'restore-previous' ? 'restore-previous' : 'abort'
@@ -1925,21 +1954,34 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         return refuseQuiet('sandbox', 'reconfigure refused: the environment is sandboxed, so the detached replacement supervisor would be reaped mid-flight')
       }
       const snapshotStartedAt = Date.now()
-      let snapshot: { home: string; cleanup(): void }
+      let snapshot: { home: string; copiedFiles: number; copiedBytes: number; cleanup(): void }
       try {
+        // The copy runs synchronously before any stop; without progress output
+        // a multi-GB prepare looked exactly like a hang (2026-09-27: 848 s of
+        // silence dragging the host checkout's node_modules into the snapshot).
+        let lastProgressAt = 0
+        const onProgress = (progress: SnapshotProgress): void => {
+          const now = Date.now()
+          if (now - lastProgressAt < 2000) return
+          lastProgressAt = now
+          io.stdout(`preflight snapshot: ${progress.files} files / ${Math.round(progress.bytes / 1024 / 1024)} MB copied…\n`)
+        }
         snapshot = transitionPlan === undefined
-          ? createPreflightSnapshot(target.home)
-          : createTransitionPreflightSnapshot(transitionPlan)
+          ? createPreflightSnapshot(target.home, { onProgress })
+          : createTransitionPreflightSnapshot(transitionPlan, { onProgress })
       } catch (error) {
         return refuse('preflight-snapshot', `reconfigure refused: could not prepare an isolated${transitionPlan === undefined ? '' : ' transitioned'} home: ${String(error)}\n`)
       }
       // A large home copy eats the credential's freshness window: the post-boot
       // canary revalidates the same credential, so a slow prepare can expire it
-      // mid-cutover and force a restore (observed with a 24 GB scratch tree —
-      // scratch/ is now excluded; warn early when the remaining copy is slow).
+      // mid-cutover and force a restore (observed with a 24 GB scratch tree).
+      // The snapshot copies only the composition's boot inputs
+      // (SNAPSHOT_INCLUDED_TOP_LEVEL), so size tracks the host's boot surface —
+      // warn when it still comes in slow.
       const snapshotMs = Date.now() - snapshotStartedAt
+      io.stdout(`isolated home snapshot ready: ${snapshot.copiedFiles} files / ${Math.round(snapshot.copiedBytes / 1024 / 1024)} MB in ${Math.round(snapshotMs / 1000)}s\n`)
       if (snapshotMs > options.maxAgeMinutes * 60_000 / 2) {
-        io.stdout(`note: the isolated-home snapshot took ${Math.round(snapshotMs / 1000)}s — over half the ${options.maxAgeMinutes}min credential window; re-record the credential immediately before reconfigure, and keep the home slim (top-level scratch/ is excluded from the copy)\n`)
+        io.stdout(`note: the isolated-home snapshot took ${Math.round(snapshotMs / 1000)}s — over half the ${options.maxAgeMinutes}min credential window; re-record the credential immediately before reconfigure\n`)
       }
       try {
         const timeout = options.preflightTimeoutMs ?? DEFAULT_PREFLIGHT_TIMEOUT_MS
@@ -2012,6 +2054,9 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
           '--takeover-from', String(previousSupervisorPid), '--cutover-id', cutoverId,
           '--delay-ms', String(options.delayMs ?? 5000),
           '--supervisor-yield-timeout-ms', String(options.supervisorYieldTimeoutMs ?? 15_000),
+          // The successor watchdog's readiness budget rides the driver argv;
+          // the durable spec stays free of per-restart tuning.
+          ...(options.bootTimeoutMs !== undefined ? ['--boot-timeout-ms', String(options.bootTimeoutMs)] : []),
           ...(initiator !== undefined ? ['--initiator', initiator] : []),
         ]
         const cutoverDriverEnv: NodeJS.ProcessEnv = { ...process.env }
@@ -2244,10 +2289,21 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         io.stderr(`supervise refused: cutover ${options.cutoverId} is not the selected launch transaction\n`)
         return 1
       }
+      // A receipt parked in awaiting-user must never auto-boot the rejected
+      // side — but exiting here leaves NO live consumer for the operator
+      // control markers, and abort-cutover/restore-previous then refuse with
+      // "no live watchdog" (the 2026-09-30 mid-cutover wedge). Hold instead:
+      // spawn the watchdog in its parked mode, which claims the pidfile and
+      // consumes those markers without launching anything.
+      let parkedCutover = false
       if (options.cutoverId === undefined && transaction?.receipt.phase === 'awaiting-user') {
-        io.stderr(`supervise: cutover ${transaction.receipt.id} is waiting for user action; refusing to restart the rejected target automatically (receipt ${stateFile(stateDir, 'launchCutover')})\n`)
-        return 0
+        parkedCutover = true
       }
+      // An explicit --cutover-id resume against a live PARKED holder: the
+      // driver-started event below flips the receipt out of awaiting-user,
+      // which is the hold's release signal. Remember the entry phase so the
+      // pidfile branch below knows the live owner is expected to let go.
+      const resumeFromAwaitingUser = options.cutoverId !== undefined && transaction?.receipt.phase === 'awaiting-user'
       // A detached watchdog spawned from a sandboxed turn is reaped with it —
       // refuse before claiming anything. Foreground mode is driven by the
       // external supervisor (launchd/systemd) and stays exempt.
@@ -2297,7 +2353,28 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
                 return 1
               }
               if (durable === null) writeStableLaunchSpec(stateDir, spec)
-              if (options.foreground) {
+              if (resumeFromAwaitingUser) {
+                // The live owner is the awaiting-user hold (or a wrapper still
+                // parked on its crash page). The hold releases its claim as
+                // soon as the driver-started event above flips the receipt out
+                // of awaiting-user — wait for that release, bounded: an owner
+                // that keeps the claim is not the hold, and waiting behind it
+                // forever would wedge the explicit resume it never sees.
+                const existingIdentity = processIdentity(existingPid)
+                if (existingIdentity === null) {
+                  io.stderr(`supervise refused: could not capture watchdog ${existingPid} start identity before waiting\n`)
+                  return 1
+                }
+                io.stdout(`watchdog ${existing} holds the parked cutover — waiting for it to release, then resuming\n`)
+                const releaseDeadline = Date.now() + 15_000
+                while (processIdentityMatches(existingIdentity) && Date.now() < releaseDeadline) await sleep(250)
+                if (processIdentityMatches(existingIdentity)) {
+                  io.stderr(`supervise refused: watchdog ${existingPid} did not release the parked cutover ${options.cutoverId ?? ''} within 15000 ms — it is not the awaiting-user hold; settle the transaction with \`abort-cutover --state-dir ${stateDir}\` or \`restore-previous --state-dir ${stateDir}\`, or stop that watchdog and retry\n`)
+                  return 1
+                }
+                waitedForWatchdog = true
+                io.stdout(`watchdog ${existing} released the parked cutover — resuming\n`)
+              } else if (options.foreground) {
               // Foreground = an external supervisor (launchd KeepAlive) runs
               // THIS process. Exiting 0 here would read as an intentional stop
               // under `KeepAlive SuccessfulExit: false`, so the job would go
@@ -2337,8 +2414,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
           return 1
         }
         if (options.cutoverId === undefined && transaction?.receipt.phase === 'awaiting-user') {
-          io.stderr(`supervise: cutover ${transaction.receipt.id} settled awaiting-user while this supervisor waited; refusing to restart the rejected target (receipt ${stateFile(stateDir, 'launchCutover')})\n`)
-          return 0
+          // Settled into awaiting-user while this supervisor waited behind the
+          // old owner: park exactly like the entry check above instead of
+          // booting the rejected target — or exiting and leaving no consumer.
+          parkedCutover = true
         }
         io.stdout('launch state refreshed after wait — using the durable selected specification\n')
       }
@@ -2414,6 +2493,11 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         // adoption; the detached form waits for the current owner to exit.
         WD_WAIT_OWNER: options.takeoverFrom !== undefined || !options.foreground ? '1' : '0',
         WD_GUARD: guardInvocation(),
+        // One boot's readiness budget, in the wrapper's whole-seconds unit.
+        // Ceiling: never round a requested budget DOWN into a tighter window.
+        ...(options.bootTimeoutMs !== undefined
+          ? { WD_BOOT_TIMEOUT: String(Math.ceil(options.bootTimeoutMs / 1000)) }
+          : {}),
         ...(options.takeoverFrom !== undefined ? {
           WD_TAKEOVER_FROM: String(options.takeoverFrom),
           WD_TAKEOVER_FROM_START: previousSupervisorStart ?? '',
@@ -2434,10 +2518,17 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
           WD_PREVIOUS_CHILD_START: previousOwnership.childStartToken,
           WD_PREVIOUS_LISTENER_PID: String(previousOwnership.listenerPid),
           WD_PREVIOUS_LISTENER_START: previousOwnership.listenerStartToken,
+          // Parked hold: claim supervision and consume operator control
+          // markers, but never launch — the receipt's selected side was
+          // explicitly rejected and waits for a user decision.
+          ...(parkedCutover ? { WD_CUTOVER_PARKED: '1' } : {}),
           ...(transaction.state.transition === undefined ? {} : {
             WD_TRANSITION_PLAN_SHA256: transaction.state.transition.planSha256,
           }),
         } : {}),
+      }
+      if (parkedCutover && transaction !== null) {
+        io.stdout(`supervise: cutover ${transaction.receipt.id} is waiting for user action — holding the supervision claim WITHOUT launching the rejected ${transaction.state.selected} side (receipt ${stateFile(stateDir, 'launchCutover')}). The operator verbs now have a live consumer: \`abort-cutover --state-dir ${stateDir}\` applies the pre-approved ${transaction.receipt.recovery.policy} policy, \`restore-previous --state-dir ${stateDir}\` restores the complete previous spec. To end the hold without settling: write the stop marker (\`touch ${stateFile(stateDir, 'watchdogStop')}\`). To resume the rejected side: \`supervise --cutover-id ${transaction.receipt.id} --state-dir ${stateDir}\`\n`)
       }
       if (options.foreground) {
         // Run the watchdog inline: the CLI process stays alive as the
@@ -2476,7 +2567,9 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       const claimDeadline = Date.now() + 5_000
       while (Date.now() < claimDeadline && spawnError === undefined) {
         if (liveWatchdogPid(stateDir) === spawnedPid) {
-          io.stdout(`watchdog spawned and ready (pid ${spawnedPid}) — supervises :${spec.port}, log ${logPath}\n`)
+          io.stdout(parkedCutover && transaction !== null
+            ? `watchdog spawned and parked on cutover ${transaction.receipt.id} (pid ${spawnedPid}) — nothing launched; consuming abort-cutover/restore-previous markers; log ${logPath}\n`
+            : `watchdog spawned and ready (pid ${spawnedPid}) — supervises :${spec.port}, log ${logPath}\n`)
           return 0
         }
         try { process.kill(spawnedPid, 0) } catch { break }
@@ -2577,6 +2670,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
           `${JSON.stringify({
             reason: 'scheduled self-restart',
             requestedAt: Date.now(),
+            // A one-boot readiness budget for the respawn: the live watchdog
+            // applies it over its own WD_BOOT_TIMEOUT for boots attempted
+            // while this marker is pending, then falls back to its default.
+            ...(options.bootTimeoutMs === undefined ? {} : { bootTimeoutMs: options.bootTimeoutMs }),
             ...(gate.authorization === undefined ? {} : { authorization: gate.authorization }),
             ...(initiator !== undefined ? { initiator } : {}),
           })}\n`)

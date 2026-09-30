@@ -19,6 +19,13 @@
  *   activation — with the webserver port pinned to 0 (OS-assigned) so the
  *   dry-run never collides with the live instance;
  * - every registered client bundle artifact exists on disk;
+ * - every registered agent preset is USABLE, not merely loaded: preset rows
+ *   mount on the registry's standing scopes beside the profile tree, so a row
+ *   whose module stopped resolving (a folded companion's retired package name,
+ *   a base version predating its ./tool entry) never fails the boot itself —
+ *   it fails every SESSION of that preset later (the picker shows 加载失败,
+ *   resume answers "never started"; 3080, 2026-09-28). The audit reads the
+ *   preset registry's own `broken` diagnostic back from the dry-run boot;
  * - dispose rolls every effect back.
  *
  * Exit codes (the contract the guard consumes):
@@ -458,6 +465,38 @@ function missingClientArtifacts(ctx: unknown): string[] {
   return missing
 }
 
+/** The registry roster row, read structurally — only the audit's two fields. */
+interface AgentPresetAuditRow {
+  id?: unknown
+  broken?: unknown
+}
+
+/**
+ * The preset-roster half of the verdict. A profile can boot clean while one
+ * of its agent presets is BROKEN: preset rows mount on the registry's
+ * standing scopes, not on the profile root the dry-run boots, so a row whose
+ * module stopped resolving never fails the boot — it surfaces later as the
+ * preset picker's 加载失败 badge and `resume failed … never started` on every
+ * session of that preset (3080, 2026-09-28: the dev preset named
+ * `@khorsheed/dsh-worktrees/tool` while the installed worktrees predated the
+ * entry). The registry already computes this verdict: it activates every
+ * registered preset eagerly and records a mount failure as `broken`, and its
+ * `list()` re-audits mounted trees after the loader settles, so rows still
+ * waiting on a host service report their pending reason instead of passing
+ * silently. Fail the dry-run on any broken preset — the restart this gate
+ * protects would serve those broken sessions. A host whose registry face is
+ * absent or list-less degrades to no findings: the audit never invents one.
+ */
+export async function brokenAgentPresets(ctx: unknown): Promise<Array<{ id: string; broken: string }>> {
+  const registry = (ctx as { get?: (key: string) => unknown }).get?.('agentPresets') as { list?: unknown } | undefined
+  if (registry === undefined || typeof registry.list !== 'function') return []
+  const rows = await (registry.list as () => Promise<AgentPresetAuditRow[]>)()
+  return rows.flatMap(row =>
+    row !== null && typeof row === 'object' && typeof row.id === 'string' && typeof row.broken === 'string'
+      ? [{ id: row.id, broken: row.broken }]
+      : [])
+}
+
 /**
  * Boot the profile's full tree once, tear it down, and report the verdict on
  * the process streams. No HMR, no user-patch watchers, no signal wiring —
@@ -550,12 +589,22 @@ export async function runPreflight(
     // that point.
     appReady.commit()
     const missing = missingClientArtifacts(ctx)
+    // The registry settles pending rows against the finished loader tree, so
+    // the audit runs after boot completion and before dispose.
+    const brokenPresets = await brokenAgentPresets(ctx)
     // A repeated dispose returns the settled single-shot result when boot
     // already tore the tree down, so this is safe on every path.
     await ctx.fiber.dispose()
-    if (missing.length > 0) {
-      process.stderr.write(`preflight FAIL: profile ${JSON.stringify(profile)} boots but client bundle artifacts are missing or unreadable:\n${
-        missing.map(line => `  - ${line}`).join('\n')}\nrun \`pnpm run build\` before launch\n`)
+    if (missing.length > 0 || brokenPresets.length > 0) {
+      if (missing.length > 0) {
+        process.stderr.write(`preflight FAIL: profile ${JSON.stringify(profile)} boots but client bundle artifacts are missing or unreadable:\n${
+          missing.map(line => `  - ${line}`).join('\n')}\nrun \`pnpm run build\` before launch\n`)
+      }
+      if (brokenPresets.length > 0) {
+        process.stderr.write(`preflight FAIL: profile ${JSON.stringify(profile)} boots but ${brokenPresets.length} agent preset(s) are broken — every session on them fails to resume (the preset picker shows 加载失败):\n${
+          brokenPresets.map(preset => `  - ${preset.id}: ${preset.broken.split('\n').join('\n    ')}`).join('\n')}\n`
+          + 'fix the named row (install the package it names, repoint a folded companion row to the core package\'s ./tool entry, or disable the row) or remove the preset, then re-run preflight\n')
+      }
       return 1
     }
     process.stdout.write(`preflight PASS: profile ${JSON.stringify(profile)} boots clean\n`)

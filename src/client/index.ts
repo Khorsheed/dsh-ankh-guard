@@ -189,6 +189,8 @@ export function apply(_ctx: ClientContext): () => void {
   let timer: ReturnType<typeof setTimeout> | undefined
   let pending = consumeFallbackFragment() ?? readPending()
   let cap: string | undefined
+  /** Consecutive failed ACKs for the current pending handoff. */
+  let ackFailures = 0
   let errorRetryMs = ERROR_RETRY_MIN_MS
   let firstFailureAt: number | undefined
   let request: AbortController | undefined
@@ -248,6 +250,27 @@ export function apply(_ctx: ClientContext): () => void {
             location.replace(returnPath)
             return
           }
+        } else {
+          // A failed ACK can be permanent: the cutover settled without this tab
+          // (operator restore, handoff off, a wedged supervisor) and the server
+          // keeps answering 409 'waiting'/'stale' for a dead cutoverId — the
+          // veil would otherwise stay up forever (observed 2026-09-30). Every
+          // few failures, spend one poll: 'idle' proves nothing is in flight,
+          // so the pending handoff is dead — drop it and let the ordinary
+          // poll loop remove the veil on the next tick.
+          ackFailures += 1
+          if (ackFailures >= 8) {
+            ackFailures = 0
+            const probe = await post({
+              version: 1, operation: 'poll', capability: cap ??= capability(),
+            }, current.signal)
+            if (stale()) return
+            if (probe.ok && (await probe.json() as PollResponse).state === 'idle') {
+              sessionStorage.removeItem(PENDING_KEY)
+              sessionStorage.removeItem(CAPABILITY_KEY)
+              pending = null
+            }
+          }
         }
         errorRetryMs = ERROR_RETRY_MIN_MS
         firstFailureAt = undefined
@@ -301,6 +324,7 @@ export function apply(_ctx: ClientContext): () => void {
         }
         pending = nextPending
         writePending(nextPending)
+        ackFailures = 0
         waitingOverlay()
         location.reload()
         return
@@ -321,6 +345,7 @@ export function apply(_ctx: ClientContext): () => void {
         }
         pending = nextPending
         writePending(nextPending)
+        ackFailures = 0
         waitingOverlay()
         // The bearer remains a local variable for the shortest possible time.
         location.replace(launch.href)

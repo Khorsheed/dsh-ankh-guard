@@ -562,22 +562,57 @@ interface SnapshotDirectoryMetadata {
 
 interface SnapshotCopyContext {
   externalRoot: string
-  /** Canonical path of the source home root; only its direct children are skippable. */
+  /** Canonical path of the source home root; only its direct children are filtered. */
   rootCanonical: string
+  includeTopLevel: ReadonlySet<string>
   destinations: Map<string, string>
   pendingLinks: SnapshotLink[]
   directories: SnapshotDirectoryMetadata[]
   /** Runtime entries (sockets, FIFOs) dropped instead of copied — counted for the caller's log line. */
   skippedRuntimeEntries: number
+  copiedFiles: number
+  copiedBytes: number
+  onProgress?: (progress: SnapshotProgress) => void
 }
 
 /**
- * Top-level home entries that never join a preflight snapshot: scratch is
- * ephemeral by definition, and copying it can push prepare+canary past the
- * credential's freshness window (observed: a 24 GB scratch expired the
- * credential mid-cutover, the target canary then failed and restored).
+ * Top-level home entries the preflight snapshot copies — the ALLOWLIST of
+ * inputs the launcher's boot actually reads: the profile trees, the home-level
+ * patch layer, settings, and the credential/identity stores. Everything else
+ * (plugin data: sessions, state, local-agent sub-homes, tarballs, scratch, …)
+ * is excluded BY DEFAULT, so a newly installed plugin's data directory can
+ * never silently join the copy — this list moves only when the HOST's boot
+ * starts reading a new home input, and a miss fails the dry-run loudly with
+ * the missing path rather than degrading into a slow copy. The denylist this
+ * replaced failed twice the other way: a 24 GB scratch tree expired the
+ * credential mid-cutover (canary failed, restored), and on 2026-09-27 the
+ * local-agent sub-home's absolute links dragged the host checkout's entire
+ * node_modules into a ~4 GB / 848 s prepare.
  */
-const SNAPSHOT_SKIPPED_TOP_LEVEL: ReadonlySet<string> = new Set(['scratch'])
+export const SNAPSHOT_INCLUDED_TOP_LEVEL: readonly string[] = [
+  'profiles',
+  'settings.yaml',
+  'cordis.patch.yml',
+  '.credentials.yaml',
+  '.anonymous-user-id',
+]
+
+/** Copy progress, reported from the file branch of {@link copySnapshotNode}. */
+export interface SnapshotProgress {
+  files: number
+  bytes: number
+  skippedRuntimeEntries: number
+}
+
+export interface PreflightSnapshotOptions {
+  /**
+   * Top-level home entries to copy (default: {@link SNAPSHOT_INCLUDED_TOP_LEVEL}).
+   * `createTransitionPreflightSnapshot` unions its plan's operation roots in.
+   */
+  includeTopLevel?: readonly string[]
+  /** Invoked as the copy advances; the caller throttles its own output. */
+  onProgress?: (progress: SnapshotProgress) => void
+}
 
 function canonicalSnapshotSource(source: string): string {
   try {
@@ -637,7 +672,7 @@ function copySnapshotNode(source: string, destination: string, context: Snapshot
     })
     try {
       for (const name of readdirSync(canonical)) {
-        if (canonical === context.rootCanonical && SNAPSHOT_SKIPPED_TOP_LEVEL.has(name)) continue
+        if (canonical === context.rootCanonical && !context.includeTopLevel.has(name)) continue
         copySnapshotNode(join(canonical, name), join(destination, name), context)
       }
     } catch (error) {
@@ -651,6 +686,13 @@ function copySnapshotNode(source: string, destination: string, context: Snapshot
     copyFileSync(canonical, destination, constants.COPYFILE_FICLONE)
     chmodSync(destination, linkMetadata.mode & 0o7777)
     utimesSync(destination, linkMetadata.atime, linkMetadata.mtime)
+    context.copiedFiles++
+    context.copiedBytes += linkMetadata.size
+    context.onProgress?.({
+      files: context.copiedFiles,
+      bytes: context.copiedBytes,
+      skippedRuntimeEntries: context.skippedRuntimeEntries,
+    })
   } catch (error) {
     throw snapshotCopyError(source, error)
   }
@@ -658,12 +700,19 @@ function copySnapshotNode(source: string, destination: string, context: Snapshot
 
 /**
  * Preserve Node's ancestor node_modules lookup for an external package while
- * avoiding one copy per package link. Other external targets are materialized
- * individually and still deduplicated by canonical path.
+ * avoiding one copy per package link. The anchor is the package's OWN parent
+ * node_modules — the LAST node_modules segment in the resolved target: pnpm
+ * store links resolve to …/.pnpm/<name>@<version>/node_modules/<name>, where
+ * that parent already holds the package's dependency siblings, so the lookup
+ * survives at the tightest scope. Anchoring the FIRST segment instead dragged
+ * the whole multi-GB store root into the snapshot (observed 2026-09-27: 32
+ * profile links pulled in the host checkout's entire root node_modules).
+ * Other external targets are materialized individually and still deduplicated
+ * by canonical path.
  */
 function externalMaterializationAnchor(target: string): { source: string; destination: string } {
   const parsed = resolve(target).split(sep)
-  const nodeModulesIndex = parsed.indexOf('node_modules')
+  const nodeModulesIndex = parsed.lastIndexOf('node_modules')
   if (nodeModulesIndex >= 0) {
     const prefix = parsed.slice(0, nodeModulesIndex + 1).join(sep) || sep
     return { source: prefix, destination: 'node_modules' }
@@ -749,17 +798,21 @@ function finalizeSnapshotDirectories(context: SnapshotCopyContext): void {
 }
 
 /**
- * Clone a live home while retaining a contained package-link graph. Internal
- * links are rebuilt against copied nodes; external targets are deduplicated in
- * a snapshot-owned materialization area. No retained link resolves outside the
- * snapshot root, so writes through pnpm/Cordis links cannot reach live bytes.
- * Runtime entries without copyable content (sockets, FIFOs — and links to
- * them) are skipped and counted, never copied; the top-level scratch/ tree is
- * excluded for size. Device nodes still fail closed.
+ * Clone a live home's BOOT INPUTS while retaining a contained package-link
+ * graph. Only the allowlisted top-level entries are copied (see
+ * {@link SNAPSHOT_INCLUDED_TOP_LEVEL}) — plugin data directories are excluded
+ * by default, so the copy's size is bounded by what the composition's boot
+ * reads, not by whatever the home happens to hold. Internal links are rebuilt
+ * against copied nodes; external targets are deduplicated in a snapshot-owned
+ * materialization area. No retained link resolves outside the snapshot root,
+ * so writes through pnpm/Cordis links cannot reach live bytes. Runtime entries
+ * without copyable content (sockets, FIFOs — and links to them) are skipped
+ * and counted, never copied. Device nodes still fail closed.
  * @param sourceHome - Live dsh home to read.
- * @returns Isolated home, an idempotent cleanup callback, and the count of skipped runtime entries.
+ * @param options - Include-list override and progress callback.
+ * @returns Isolated home, an idempotent cleanup callback, and copy statistics.
  */
-export function createPreflightSnapshot(sourceHome: string): { home: string; root: string; skippedRuntimeEntries: number; cleanup(): void } {
+export function createPreflightSnapshot(sourceHome: string, options: PreflightSnapshotOptions = {}): { home: string; root: string; skippedRuntimeEntries: number; copiedFiles: number; copiedBytes: number; cleanup(): void } {
   const root = mkdtempSync(join(tmpdir(), 'ankh-transition-preflight-'))
   const home = join(root, 'home')
   try {
@@ -768,31 +821,48 @@ export function createPreflightSnapshot(sourceHome: string): { home: string; roo
     const context: SnapshotCopyContext = {
       externalRoot: join(root, 'materialized'),
       rootCanonical: source,
+      includeTopLevel: new Set(options.includeTopLevel ?? SNAPSHOT_INCLUDED_TOP_LEVEL),
       destinations: new Map(),
       pendingLinks: [],
       directories: [],
       skippedRuntimeEntries: 0,
+      copiedFiles: 0,
+      copiedBytes: 0,
+      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
     }
     copySnapshotNode(source, home, context)
     resolveSnapshotLinks(context)
     assertSnapshotLinksContained(root, realpathSync(root))
     finalizeSnapshotDirectories(context)
-    return { home, root, skippedRuntimeEntries: context.skippedRuntimeEntries, cleanup: () => { rmSync(root, { recursive: true, force: true }) } }
+    return {
+      home,
+      root,
+      skippedRuntimeEntries: context.skippedRuntimeEntries,
+      copiedFiles: context.copiedFiles,
+      copiedBytes: context.copiedBytes,
+      cleanup: () => { rmSync(root, { recursive: true, force: true }) },
+    }
   } catch (error) {
     rmSync(root, { recursive: true, force: true })
     throw error
   }
 }
 
-export function createTransitionPreflightSnapshot(plan: TransitionPlan): { home: string; cleanup(): void } {
-  const snapshot = createPreflightSnapshot(plan.home)
+export function createTransitionPreflightSnapshot(plan: TransitionPlan, options: PreflightSnapshotOptions = {}): { home: string; root: string; skippedRuntimeEntries: number; copiedFiles: number; copiedBytes: number; cleanup(): void } {
+  // A transition rehearses the plan's exact operation paths, so their
+  // top-level roots join the copy even when they are not boot inputs.
+  const operationRoots = plan.operations.map(operation => operation.path.split(sep)[0]!)
+  const snapshot = createPreflightSnapshot(plan.home, {
+    ...options,
+    includeTopLevel: [...new Set([...(options.includeTopLevel ?? SNAPSHOT_INCLUDED_TOP_LEVEL), ...operationRoots])],
+  })
   try {
     const stateDir = join(snapshot.root, 'guard-state')
     mkdirSync(stateDir, { recursive: true, mode: 0o700 })
     const rebound: TransitionPlan = { ...plan, home: snapshot.home }
     const reference = prepareTransition(rebound, snapshot.home, stateDir, 'preflight')
     applyTransition(reference, snapshot.home, stateDir, 'preflight')
-    return { home: snapshot.home, cleanup: snapshot.cleanup }
+    return snapshot
   } catch (error) {
     snapshot.cleanup()
     throw error

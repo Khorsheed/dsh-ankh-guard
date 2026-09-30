@@ -48,6 +48,11 @@
 #   WD_CUTOVER_ID=ID   durable launch-cutover receipt transaction
 #   WD_CUTOVER_POLICY= restore-previous or wait-for-user (approved pre-stop)
 #   WD_CUTOVER_DELAY_SECONDS=N grace after supervisor claim before old-child stop
+#   WD_CUTOVER_PARKED=1 hold the supervision claim while the receipt sits in
+#                      awaiting-user: never launch the rejected side, consume
+#                      abort/restore control markers, exit on watchdog-stop,
+#                      and release the claim when a --cutover-id resume flips
+#                      the receipt out of awaiting-user
 #   WD_PREVIOUS_CHILD_*=PID/start token authoritative old supervisor child root
 #   WD_PREVIOUS_LISTENER_*=PID/start token listener inside that old child tree
 #   WD_READY_STABILITY_SECONDS=N unchanged child/listener proof window (default 3)
@@ -61,7 +66,9 @@
 #   WD_TEST_BREAK=1    launch a command that always fails (give-up testing)
 #
 # Markers under the state directory (written by the app or the agent):
-#   restart-requested.json  -> intentional restart: respawn + canary + clear
+#   restart-requested.json  -> intentional restart: respawn + canary + clear;
+#                      an optional integer bootTimeoutMs field overrides
+#                      WD_BOOT_TIMEOUT for boots attempted while it is pending
 #   watchdog-stop           -> exit the watchdog without respawn
 set -u
 
@@ -217,6 +224,19 @@ cutover_control_action() {
     process.stdout.write(restore === "restore-previous" || legacy === "restore-previous"
       ? "restore-previous" : read(abortFile) || legacy)
   ' "$CONTROL_RESTORE_FILE" "$CONTROL_ABORT_FILE" "$CONTROL_FILE" "$CUTOVER_ID" 2>/dev/null
+}
+
+# The durable receipt's current phase, empty when unreadable. The parked hold
+# treats an unreadable receipt as still parked (hold, never flap): only a
+# cleanly read non-awaiting-user phase releases the claim.
+cutover_receipt_phase() {
+  node -e '
+    const fs = require("fs")
+    try {
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+      if (typeof value?.phase === "string") process.stdout.write(value.phase)
+    } catch {}
+  ' "$STATE_DIR/launch-cutover.json" 2>/dev/null
 }
 
 # The host owns the shape of its per-process launch URL. Discovery is generic:
@@ -1239,6 +1259,57 @@ if [ -n "${ANKH_GUARD_TEST_RUN_DIR:-}" ]; then wd_sleep 0.01; fi
 test_event_self "${ANKH_GUARD_TEST_PROCESS_ROLE:-watchdog}" keepalive-first-tick
 test_event_self "${ANKH_GUARD_TEST_PROCESS_ROLE:-watchdog}" ready
 
+# Parked awaiting-user hold (WD_CUTOVER_PARKED=1, spawned by a bare `supervise`
+# that found the receipt waiting for a user decision): the selected side was
+# explicitly rejected, so NOTHING is launched here. The hold keeps exactly one
+# live consumer for the operator control verbs — without it, a supervisor chain
+# that died mid-cutover wedges the transaction: abort-cutover/restore-previous
+# refuse with "no live watchdog", and a bare supervise used to exit 0.
+if [ "${WD_CUTOVER_PARKED:-0}" = "1" ]; then
+  wd_log "launch cutover $CUTOVER_ID is awaiting user action — holding the supervision claim WITHOUT launching the rejected $CUTOVER_ROLE side; settle: abort-cutover / restore-previous; exit: the watchdog-stop marker; resume the rejected side: supervise --cutover-id $CUTOVER_ID"
+  while true; do
+    # Same ownership discipline as the main loop: self-heal a deleted claim,
+    # yield to a different live owner.
+    if [ "$SUPERVISE" = "1" ]; then
+      if [ ! -f "$PIDFILE" ]; then (set -C; echo $$ > "$PIDFILE") 2>/dev/null || true; fi
+      pidowner=$(cat "$PIDFILE" 2>/dev/null)
+      if [ -n "$pidowner" ] && [ "$pidowner" != "$$" ] && kill -0 "$pidowner" 2>/dev/null; then
+        wd_log "pidfile now owned by live pid $pidowner — yielding the parked hold"
+        yielded=1
+        exit 75
+      fi
+    fi
+    # Deliberate stop: exit without respawn or settlement, exactly like the
+    # main loop's stop-marker path.
+    if [ -f "$STOP_MARKER" ]; then
+      wd_log "stop marker present — exiting the parked hold"
+      rm -f "$STOP_MARKER" "$PIDFILE"
+      exit 0
+    fi
+    # Operator control before the release check: a restore decision consumes
+    # the marker and breaks into the ordinary cutover resume path below, which
+    # boots the previous complete launch specification.
+    if handle_cutover_control; then
+      if [ "$control_result" = "restore" ]; then
+        wd_log "operator control selected the previous complete launch specification"
+        break
+      fi
+      wd_log "operator control consumed; cutover $CUTOVER_ID remains parked awaiting user action"
+      continue
+    fi
+    # A `supervise --cutover-id` resume records driver-started, flipping the
+    # receipt out of awaiting-user — this hold's release signal. Exit non-zero
+    # like a yield so an external supervisor (launchd/systemd) restarts its
+    # stable launcher, which then waits behind the resuming chain.
+    phase=$(cutover_receipt_phase)
+    if [ -n "$phase" ] && [ "$phase" != "awaiting-user" ]; then
+      wd_log "cutover $CUTOVER_ID left awaiting-user (phase $phase) — releasing the claim for the resuming supervisor"
+      exit 75
+    fi
+    wd_sleep 1
+  done
+fi
+
 write_cutover_restart_marker() {
   node -e '
     const fs = require("fs")
@@ -1250,6 +1321,21 @@ write_cutover_restart_marker() {
       ...(initiator === "" ? {} : { initiator }),
     }) + "\n")
   ' "$RESTART_MARKER" "$CUTOVER_ID" "${WD_INITIATOR:-}"
+}
+
+# A scheduled exit may carry a one-boot readiness budget (schedule-exit
+# --boot-timeout-ms), recorded in the restart marker as whole milliseconds.
+# Validate before trusting: an unreadable or out-of-shape marker changes
+# nothing — the watchdog's own WD_BOOT_TIMEOUT stays in effect.
+restart_marker_boot_timeout() {
+  node -e '
+    const fs = require("fs")
+    try {
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+      const ms = value?.bootTimeoutMs
+      if (Number.isInteger(ms) && ms >= 1000) process.stdout.write(String(Math.ceil(ms / 1000)))
+    } catch {}
+  ' "$RESTART_MARKER" 2>/dev/null
 }
 
 consume_takeover_control() {
@@ -1460,9 +1546,19 @@ while true; do
   current_listener_start=''
   # Boot window: transport-up is not enough. A protected root can answer 401;
   # ready_probe completes the process's announced launch-URL cookie exchange.
+  # The budget is the watchdog's own WD_BOOT_TIMEOUT unless the pending restart
+  # marker carries a one-boot override (schedule-exit --boot-timeout-ms).
+  attempt_boot_timeout=$BOOT_TIMEOUT
+  if [ -f "$RESTART_MARKER" ]; then
+    marker_boot_timeout=$(restart_marker_boot_timeout)
+    case "$marker_boot_timeout" in
+      ''|*[!0-9]*) ;;
+      *) attempt_boot_timeout=$marker_boot_timeout ;;
+    esac
+  fi
   up=0
-  readiness_failure_detail="readiness not proven within ${BOOT_TIMEOUT}s"
-  boot_limit=$(( $(date +%s) + BOOT_TIMEOUT ))
+  readiness_failure_detail="readiness not proven within ${attempt_boot_timeout}s"
+  boot_limit=$(( $(date +%s) + attempt_boot_timeout ))
   while [ "$(date +%s)" -lt "$boot_limit" ]; do
     if [ -n "$(cutover_control_action)" ]; then
       readiness_failure_detail="operator control interrupted readiness"
@@ -1499,8 +1595,15 @@ while true; do
     redact_launch_urls_in_output
     # Mirror the captured output into the watchdog log: with plain redirection
     # (see the launch site) the attempt log is the only place the failure was
-    # written, and the watchdog log is where an operator looks first.
-    sed 's/^/[instance] /' "$ATTEMPT_LOG" 2>/dev/null
+    # written, and the watchdog log is where an operator looks first. An EMPTY
+    # attempt log is itself the signal — "the instance never wrote a line" is
+    # what distinguished a dead-on-arrival boot from a noisy one in the
+    # 2026-09-30 launchd incident, and mirroring nothing hid it for an hour.
+    if [ -s "$ATTEMPT_LOG" ]; then
+      sed 's/^/[instance] /' "$ATTEMPT_LOG" 2>/dev/null
+    else
+      wd_log "attempt $current_attempt produced no output — the instance never wrote a line (captured log $ATTEMPT_LOG is empty)"
+    fi
 
     if [ -n "$CUTOVER_ID" ] && [ -n "$(cutover_control_action)" ]; then
       failures=$((failures + 1))

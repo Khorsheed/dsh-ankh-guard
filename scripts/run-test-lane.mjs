@@ -23,6 +23,7 @@ const pureSpecs = [
   'tests/browser-handoff.spec.ts',
   'tests/deployment-proof.spec.ts',
   'tests/patch.spec.ts',
+  'tests/preflight-preset-audit.spec.ts',
   'tests/preset-derive.spec.ts',
   'tests/preset-registry-probe.spec.ts',
   'tests/restart-request.spec.ts',
@@ -59,8 +60,8 @@ const tasks = lane === 'unit' ? unitTasks : lane === 'integration' ? integration
 // the expected count follows the same shared probes instead of hardcoding a
 // deployment-machine count.
 const lifecycleDriftExpected = 14 + (driftTripwireRunnable() ? 1 : 0) + (driftBuiltCliAvailable() ? 1 : 0)
-const inventory = { pure: 63, 'self-unit': 21, 'supervise-1-of-4': 15, 'supervise-2-of-4': 10,
-  'supervise-3-of-4': 15, 'supervise-4-of-4': 12, 'self-process': 68, 'lifecycle-drift': lifecycleDriftExpected }
+const inventory = { pure: 71, 'self-unit': 21, 'supervise-1-of-4': 17, 'supervise-2-of-4': 10,
+  'supervise-3-of-4': 17, 'supervise-4-of-4': 13, 'self-process': 71, 'lifecycle-drift': lifecycleDriftExpected }
 for (const task of tasks) task.expected = inventory[task.name]
 const artifacts = mkdtempSync(join(tmpdir(), 'ankh-test-results-'))
 process.stdout.write(`ankh-guard test artifacts: ${artifacts}\n`)

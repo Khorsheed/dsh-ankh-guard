@@ -23,6 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { composePreflightPatches, resolveHarnessRoot, runPreflight } from '../src/preflight-runner.ts'
+import { SNAPSHOT_INCLUDED_TOP_LEVEL } from '../src/transition.ts'
 import { driftBuiltCliAvailable, driftTripwireRunnable } from './preflight-environment.mjs'
 
 const exec = promisify(execFile)
@@ -38,14 +39,14 @@ async function run(executable: string, args: string[], options: ExecFileOptions)
 
 // Snapshotting the real dependency graph is deliberately synchronous product
 // code. Exercise the freshly built implementation off Vitest's RPC event loop.
-async function snapshotOffThread(home: string): Promise<{ home: string; root: string }> {
+async function snapshotOffThread(home: string, options?: { includeTopLevel: readonly string[] }): Promise<{ home: string; root: string }> {
   const worker = new Worker(`
     const { parentPort, workerData } = require('node:worker_threads');
     import(workerData.module).then(({ createPreflightSnapshot }) => {
-      const snapshot = createPreflightSnapshot(workerData.home);
+      const snapshot = createPreflightSnapshot(workerData.home, workerData.options);
       parentPort.postMessage({ home: snapshot.home, root: snapshot.root });
     });
-  `, { eval: true, workerData: { home, module: new URL('../lib/types/transition.js', import.meta.url).href } })
+  `, { eval: true, workerData: { home, options, module: new URL('../lib/types/transition.js', import.meta.url).href } })
   return new Promise((resolve, reject) => {
     let result: { home: string; root: string } | undefined
     let failure: Error | undefined
@@ -201,7 +202,9 @@ describe('preflight composition drift tripwire', () => {
       expect(lstatSync(join(runtimePackage, 'node_modules', '@fixture', 'cordis-plugin')).isSymbolicLink()).toBe(true)
       expect(lstatSync(join(pluginPackage, 'node_modules', '@fixture', 'cordis-runtime')).isSymbolicLink()).toBe(true)
 
-      snapshot = await snapshotOffThread(generatedHome)
+      // The fixture graph is home data, not a boot input: name it explicitly
+      // alongside the default boot-input allowlist.
+      snapshot = await snapshotOffThread(generatedHome, { includeTopLevel: [...SNAPSHOT_INCLUDED_TOP_LEVEL, 'pnpm-cordis-cycle'] })
       const copiedGraph = join(snapshot.home, 'pnpm-cordis-cycle')
       const copiedCordisLink = join(snapshot.home, 'profiles', 'node_modules', '@deepseek-ai', 'cordis')
       const copiedRuntimeLink = join(copiedGraph, 'node_modules', '@fixture', 'cordis-runtime')

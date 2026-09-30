@@ -35,7 +35,7 @@ import {
   recordCutoverEvent, selectedLaunchSpec, summarizeLaunchState, writeStableLaunchSpec,
   type LaunchSpec,
 } from '../src/launch-spec.ts'
-import { envInternals, preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
+import { envInternals, guardInvocation, parse, preflightInternals, resolveHarnessRoot, resolvePreflightBin, resolveRunnerCommand, resolveWdHome, runCli, type CliIo } from '../src/cli.ts'
 import {
   clearCredential, emptyState, loadState, recordCredential, setCheckpoint,
   verifyCredential, type GuardState,
@@ -863,7 +863,10 @@ describe('CLI', () => {
       scope: 'target build+test', revision: currentHead(repo)!, command: 'pnpm test',
     }, Date.now())
     markLiveWatchdog(stateDir)
-    symlinkSync('missing-target', join(home, 'dangling'))
+    // A dangling link only reaches the snapshot when it lives inside the
+    // copied boot inputs — profiles/ is on the default allowlist.
+    mkdirSync(join(home, 'profiles'), { recursive: true })
+    symlinkSync('missing-target', join(home, 'profiles', 'dangling'))
     stubSandboxProbe(false)
 
     const result = io()
@@ -1465,6 +1468,57 @@ tryListen();
     } finally {
       await killListener(port)
     }
+  })
+
+  it('guardInvocation renders an absolute node executable that runs under a launchd-minimal PATH', async () => {
+    // The watchdog runs under whatever PATH spawned it; a launcher chain
+    // (launchd/systemd) has a minimal PATH without homebrew, and a bare `node`
+    // there made every guard invocation the watchdog issued (canary,
+    // record-proven-deployment, cutover events) fail with command-not-found —
+    // the 2026-09-30 launchd incident. The prefix must carry the absolute
+    // process.execPath, and the whole invocation must run with everything
+    // stripped down to the system PATH.
+    const invocation = guardInvocation()
+    expect(invocation.startsWith(process.execPath)).toBe(true)
+    expect(invocation).not.toMatch(/(^|\s)node(\s|$)/)
+    const stateDir = tmpDir('guard-invocation-')
+    const child = spawn(invocation, ['status', '--state-dir', stateDir], {
+      shell: true,
+      env: { PATH: '/usr/bin:/bin' },
+    })
+    const code = await new Promise<number | null>((resolvePromise) => {
+      child.once('close', exitCode => resolvePromise(exitCode))
+    })
+    expect(code).toBe(0)
+  }, 30_000)
+
+  it('parse validates --boot-timeout-ms as whole seconds with a sane floor', () => {
+    const ok = parse(['schedule-exit', '--delay-ms', '1000', '--boot-timeout-ms', '42000'])
+    expect('error' in ok ? ok.error : ok.options.bootTimeoutMs).toBe(42000)
+    for (const bad of ['999', '12.5', 'soon']) {
+      const parsed = parse(['schedule-exit', '--delay-ms', '1000', '--boot-timeout-ms', bad])
+      expect('error' in parsed && parsed.error).toContain('--boot-timeout-ms must be an integer >= 1000')
+    }
+  })
+
+  it('schedule-exit records --boot-timeout-ms in the restart marker for the respawn boot window', async () => {
+    const stateDir = tmpDir('guard-schedule-boot-timeout-')
+    const repo = makeRepo()
+    const port = await freePort()
+    expect(await runCli([
+      'record', 'build', '--trust-command', '--command', 'test fixture', '--state-dir', stateDir, '--repo', repo,
+    ], io().io)).toBe(0)
+    markLiveWatchdog(stateDir)
+    stubPreflight('true')
+    // A long delay: the exit agent must not fire inside the test — only the
+    // marker write is under assertion.
+    expect(await runCli([
+      'schedule-exit', '--port', String(port), '--delay-ms', '60000', '--boot-timeout-ms', '42000',
+      '--state-dir', stateDir, '--repo', repo,
+    ], io().io)).toBe(0)
+    const marker = JSON.parse(readFileSync(join(stateDir, STATE_FILES.restartRequested), 'utf8'))
+    expect(marker.bootTimeoutMs).toBe(42000)
+    expect(marker.reason).toBe('scheduled self-restart')
   })
 })
 
@@ -3210,6 +3264,225 @@ setTimeout(() => process.exit(23), 1800)
       env.restore()
     }
   }, 40_000)
+
+  it('a bare supervise on an awaiting-user cutover holds the claim without launching, and abort-cutover settles it through the approved policy', async () => {
+    // The 2026-09-30 wedge: the supervisor chain died mid-cutover with the
+    // receipt parked in awaiting-user; a bare supervise printed a refusal and
+    // EXITED, so abort-cutover/restore-previous had no live consumer. The bare
+    // supervise must instead park a consumer that never boots the rejected
+    // side and settles the transaction the moment the operator decides.
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    mkdirSync(stateDir, { recursive: true })
+    const previousStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('previous-after-parked-abort')).listen(${port},'127.0.0.1')"`
+    const targetStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('rejected-parked-target')).listen(${port},'127.0.0.1')"`
+    const previous: LaunchSpec = {
+      version: 1, command: previousStart, port, home: env.home,
+      credentialRepo: repo, harnessRoot: join(env.home, 'harness-root'), profile: 'web',
+    }
+    const cutoverId = 'parked-hold-cutover'
+    try {
+      prepareLaunchCutover(stateDir, {
+        id: cutoverId, previous, target: { ...previous, command: targetStart },
+        recoveryPolicy: 'restore-previous', browserHandoff: 'off',
+        previousSupervisorPid: 999_998, previousSupervisorStartToken: 'gone-supervisor',
+        previousOwnership: fakeOwnership(999_999), now: NOW,
+      })
+      recordCutoverEvent(stateDir, cutoverId, 'awaiting-user', ['target failed twice; waiting for user'], NOW + 1)
+      recordCredential(stateDir, {
+        scope: 'build+test', revision: currentHead(repo)!, command: 'test fixture',
+      }, Date.now())
+
+      const sup = io()
+      expect(await runCli(['supervise', '--state-dir', stateDir, '--repo', repo], sup.io)).toBe(0)
+      const guidance = sup.out.join('')
+      expect(guidance).toContain('waiting for user action')
+      expect(guidance).toContain(`supervise --cutover-id ${cutoverId}`)
+      expect(guidance).toContain('watchdog-stop')
+      expect(guidance).toContain(`abort-cutover --state-dir ${stateDir}`)
+      expect(guidance).toContain('parked on cutover')
+
+      // The hold is live (a pidfile owner exists) but NOTHING was launched:
+      // the rejected target must not bind the port or even attempt a boot.
+      await new Promise(resolve => setTimeout(resolve, 2_000))
+      expect(await portListening(port)).toBe(false)
+      const parkedLog = readFileSync(join(stateDir, STATE_FILES.watchdogLog), 'utf8')
+      expect(parkedLog).toContain('awaiting user action — holding the supervision claim WITHOUT launching')
+      expect(parkedLog).not.toContain('starting instance')
+
+      // The wedge's second half: abort-cutover now has a live consumer.
+      const abort = io()
+      expect(await runCli(['abort-cutover', '--state-dir', stateDir], abort.io)).toBe(0)
+      expect(abort.out.join('')).toContain('abort requested')
+
+      // The approved policy is restore-previous: the hold boots the complete
+      // previous spec and the transaction settles as restored.
+      await waitForCondition('the parked cutover restores previous after abort',
+        () => readCutoverReceipt(stateDir)?.phase === 'restored', 45_000, 200)
+      expect(await fetchBody(port)).toBe('previous-after-parked-abort')
+      const receipt = readCutoverReceipt(stateDir)
+      expect(receipt).toMatchObject({
+        phase: 'restored',
+        recovery: { policy: 'restore-previous', result: 'restored' },
+      })
+      expect(receipt?.events.some(event => event.kind === 'control-requested' && event.detail === 'abort')).toBe(true)
+      expect(readCutoverControl(stateDir)).toBeNull()
+      expect(readLaunchState(stateDir)).toMatchObject({ mode: 'stable', active: { command: previousStart } })
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 75_000)
+
+  it('supervise --cutover-id resumes a parked awaiting-user cutover once the hold releases its claim', async () => {
+    // The explicit resume: the driver-started event flips the receipt out of
+    // awaiting-user, the parked hold releases the pidfile, and the resuming
+    // chain boots the selected side — no chain-killing archaeology.
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    mkdirSync(stateDir, { recursive: true })
+    const previousStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('previous-never-booted')).listen(${port},'127.0.0.1')"`
+    const targetStart = `"${process.execPath}" -e "require('http').createServer((q,s)=>s.end('resumed-target')).listen(${port},'127.0.0.1')"`
+    const previous: LaunchSpec = {
+      version: 1, command: previousStart, port, home: env.home,
+      credentialRepo: repo, harnessRoot: join(env.home, 'harness-root'), profile: 'web',
+    }
+    const cutoverId = 'parked-resume-cutover'
+    try {
+      prepareLaunchCutover(stateDir, {
+        id: cutoverId, previous, target: { ...previous, command: targetStart },
+        recoveryPolicy: 'wait-for-user', browserHandoff: 'off',
+        previousSupervisorPid: 999_998, previousSupervisorStartToken: 'gone-supervisor',
+        previousOwnership: fakeOwnership(999_999), now: NOW,
+      })
+      recordCutoverEvent(stateDir, cutoverId, 'awaiting-user', ['target failed twice; waiting for user'], NOW + 1)
+      recordCredential(stateDir, {
+        scope: 'build+test', revision: currentHead(repo)!, command: 'test fixture',
+      }, Date.now())
+
+      expect(await runCli(['supervise', '--state-dir', stateDir, '--repo', repo], io().io)).toBe(0)
+      await waitForCondition('the parked hold claims supervision', () => {
+        const pidfile = join(stateDir, STATE_FILES.watchdogPid)
+        return existsSync(pidfile) && readFileSync(pidfile, 'utf8').trim() !== ''
+      }, 10_000, 100)
+      expect(await portListening(port)).toBe(false)
+
+      const resume = io()
+      expect(await runCli(['supervise', '--cutover-id', cutoverId, '--state-dir', stateDir, '--repo', repo], resume.io)).toBe(0)
+      expect(resume.out.join('')).toContain('released the parked cutover — resuming')
+
+      await waitForCondition('the resumed cutover boots the selected target',
+        () => readCutoverReceipt(stateDir)?.phase === 'ready', 45_000, 200)
+      expect(await fetchBody(port)).toBe('resumed-target')
+      expect(readLaunchState(stateDir)).toMatchObject({ mode: 'stable', active: { command: targetStart } })
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 75_000)
+
+  it('supervise --boot-timeout-ms threads the readiness budget to the watchdog boot window', async () => {
+    // The readiness budget used to be env-only (WD_BOOT_TIMEOUT, 60 s); a slow
+    // host needed it on the verb. 2000 ms lands in the wrapper as 2 s.
+    const env = supervisedEnv()
+    const repo = makeRepo()
+    const stateDir = join(env.home, 'state')
+    const port = await freePort()
+    const neverListens = `"${process.execPath}" -e "setInterval(()=>{},1000)"`
+    try {
+      expect(await runCli([
+        'supervise', '--port', String(port), '--start', neverListens,
+        '--boot-timeout-ms', '2000', '--state-dir', stateDir, '--repo', repo,
+      ], io().io)).toBe(0)
+      await waitForCondition('the first failed boot inside the threaded budget', () => {
+        const log = join(stateDir, STATE_FILES.watchdogLog)
+        return existsSync(log) && readFileSync(log, 'utf8').includes('readiness not proven within 2s')
+      }, 30_000, 200)
+    } finally {
+      env.stop()
+      await killListener(port)
+      env.restore()
+    }
+  }, 45_000)
+
+  it('an empty boot-attempt log mirrors an explicit no-output line into the watchdog log', async () => {
+    // A boot that dies before writing anything produced a zero-byte attempt
+    // log, and the failure path mirrored NOTHING into the main log — the
+    // strongest signal ("the instance never wrote a line") stayed invisible.
+    const home = tmpDir('guard-empty-attempt-')
+    const repo = makeRepo()
+    const stateDir = join(home, 'state')
+    mkdirSync(join(home, 'home'), { recursive: true })
+    mkdirSync(stateDir, { recursive: true })
+    const port = await freePort()
+    const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
+    let output = ''
+    const watchdog = spawn('bash', [script, '--supervise'], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: watchdogEnv({
+        WD_HOME: home,
+        WD_STATE_DIR: stateDir,
+        WD_PORT: String(port),
+        WD_REPO: repo,
+        WD_TEST_BREAK: '1',
+      }),
+    })
+    watchdog.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    watchdog.stderr.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    try {
+      // WD_TEST_BREAK exits the attempt without a single output line.
+      await waitForCondition('the explicit empty-attempt mirror line',
+        () => output.includes('attempt 1 produced no output'), 30_000)
+      expect(output).toContain('the instance never wrote a line')
+    } finally {
+      await killListener(port)
+    }
+  }, 45_000)
+
+  it('a restart marker bootTimeoutMs overrides the boot window for the respawn', async () => {
+    // schedule-exit --boot-timeout-ms reaches the ALREADY-RUNNING watchdog
+    // through the restart marker: the respawn's boot window honors it while
+    // the marker is pending instead of the watchdog's own budget.
+    const home = tmpDir('guard-marker-boot-timeout-')
+    const repo = makeRepo()
+    const stateDir = join(home, 'state')
+    mkdirSync(join(home, 'home'), { recursive: true })
+    mkdirSync(stateDir, { recursive: true })
+    const port = await freePort()
+    writeFileSync(join(stateDir, STATE_FILES.restartRequested),
+      `${JSON.stringify({ reason: 'scheduled self-restart', requestedAt: Date.now(), bootTimeoutMs: 5000 })}\n`)
+    const script = fileURLToPath(new URL('../scripts/dsh-watchdog.sh', import.meta.url))
+    let output = ''
+    // No WD_BOOT_TIMEOUT: the watchdog default is 60 s, so a 5 s failure line
+    // can only come from the marker.
+    const watchdog = spawn('bash', [script, '--supervise'], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: watchdogEnv({
+        WD_HOME: home,
+        WD_STATE_DIR: stateDir,
+        WD_PORT: String(port),
+        WD_REPO: repo,
+        WD_START: `"${process.execPath}" -e "setInterval(()=>{},1000)"`,
+      }),
+    })
+    watchdog.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    watchdog.stderr.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    try {
+      await waitForCondition('the boot failure inside the marker budget',
+        () => output.includes('readiness not proven within 5s'), 30_000)
+      expect(output).not.toContain('readiness not proven within 60s')
+    } finally {
+      await killListener(port)
+    }
+  }, 45_000)
 
   it('a foreground supervisor waiting behind a cutover reloads restored previous state before takeover', async () => {
     const env = supervisedEnv()

@@ -158,6 +158,37 @@ describe('browser handoff client lifecycle', () => {
     dispose()
   })
 
+  it('drops a pending handoff whose cutover settled without this tab (the veil never sticks)', async () => {
+    vi.stubGlobal('location', {
+      hash: '',
+      href: 'http://127.0.0.1:3080/session/one',
+      origin: 'http://127.0.0.1:3080',
+      reload: vi.fn(),
+      replace: vi.fn(),
+    })
+    sessionStorage.setItem(PENDING_KEY, JSON.stringify({
+      version: 1, cutoverId: 'cutover-settled-elsewhere', channel: 'original-tab',
+      authentication: 'existing-cookie', capability: 'a'.repeat(43),
+    }))
+    // The server settled the cutover without this tab (operator restore,
+    // handoff off, wedged supervisor): ACKs fail permanently (409 waiting/
+    // stale). Every 8th failure the loop spends one poll — idle proves the
+    // handoff is dead, so the pending entry is dropped and the veil lifted.
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { operation: string }
+      return body.operation === 'ack' ? response(409, { state: 'waiting' }) : response(200, { state: 'idle' })
+    }))
+
+    const dispose = apply({} as never)
+    await vi.waitFor(() => {
+      expect(sessionStorage.getItem(PENDING_KEY)).toBeNull()
+    }, { timeout: 10_000 })
+    await vi.waitFor(() => {
+      expect(document.getElementById('ankh-guard-browser-handoff')).toBeNull()
+    })
+    dispose()
+  })
+
   it('learns the serving boot id from idle and carries it on the next poll', async () => {
     vi.stubGlobal('location', {
       hash: '',

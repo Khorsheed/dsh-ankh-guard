@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   applyTransition, createPreflightSnapshot, createTransitionPreflightSnapshot, prepareTransition,
   readTransitionRecord, rollbackTransition, validateTransitionPlan,
+  SNAPSHOT_INCLUDED_TOP_LEVEL,
+  type SnapshotProgress,
   type TransitionPlan,
 } from '../src/transition.ts'
 
@@ -256,7 +258,7 @@ describe('filesystem transition', () => {
     symlinkSync('../external.txt', join(home, 'external-link'))
     symlinkSync('../external.txt', join(home, 'external-link-again'))
 
-    const snapshot = createPreflightSnapshot(home)
+    const snapshot = createPreflightSnapshot(home, { includeTopLevel: ['internal.txt', 'internal-link', 'external-link', 'external-link-again'] })
     try {
       expect(lstatSync(join(snapshot.home, 'internal-link')).isSymbolicLink()).toBe(true)
       expect(lstatSync(join(snapshot.home, 'external-link')).isSymbolicLink()).toBe(true)
@@ -279,7 +281,7 @@ describe('filesystem transition', () => {
     mkdirSync(home)
     symlinkSync('.', join(home, 'loop'))
 
-    const snapshot = createPreflightSnapshot(home)
+    const snapshot = createPreflightSnapshot(home, { includeTopLevel: ['loop'] })
     try {
       expect(lstatSync(join(snapshot.home, 'loop')).isSymbolicLink()).toBe(true)
       expect(realpathSync(join(snapshot.home, 'loop'))).toBe(realpathSync(snapshot.home))
@@ -290,10 +292,10 @@ describe('filesystem transition', () => {
     const danglingHome = join(root, 'dangling-home')
     mkdirSync(danglingHome)
     symlinkSync('missing', join(danglingHome, 'dangling'))
-    expect(() => createPreflightSnapshot(danglingHome)).toThrow(/could not safely copy/)
+    expect(() => createPreflightSnapshot(danglingHome, { includeTopLevel: ['dangling'] })).toThrow(/could not safely copy/)
   })
 
-  it('skips runtime entries (sockets, FIFOs, links to them) instead of refusing, and excludes top-level scratch', async () => {
+  it('skips runtime entries (sockets, FIFOs, links to them) instead of refusing, and drops non-included top-level entries', async () => {
     const mkfifo = ['/usr/bin/mkfifo', '/bin/mkfifo'].find(existsSync)
     if (mkfifo === undefined) return
     const root = temporaryDirectory('ankh-snapshot-runtime-')
@@ -312,7 +314,9 @@ describe('filesystem transition', () => {
     cleanups.push(() => { server.close() })
     symlinkSync('member-bridge.sock', join(home, 'bridge-link'))
 
-    const snapshot = createPreflightSnapshot(home)
+    // 'scratch' is deliberately absent from the include list: non-boot entries
+    // are excluded by default now, not by name.
+    const snapshot = createPreflightSnapshot(home, { includeTopLevel: ['config.yaml', 'pipe', 'member-bridge.sock', 'bridge-link'] })
     try {
       expect(existsSync(join(snapshot.home, 'member-bridge.sock'))).toBe(false)
       expect(existsSync(join(snapshot.home, 'pipe'))).toBe(false)
@@ -320,6 +324,79 @@ describe('filesystem transition', () => {
       expect(existsSync(join(snapshot.home, 'scratch'))).toBe(false)
       expect(readFileSync(join(snapshot.home, 'config.yaml'), 'utf8')).toBe('live')
       expect(snapshot.skippedRuntimeEntries).toBe(3)
+    } finally {
+      snapshot.cleanup()
+    }
+  })
+
+  it('copies only the allowlisted boot inputs by default — plugin data never silently joins', () => {
+    const root = temporaryDirectory('ankh-snapshot-allowlist-')
+    const home = join(root, 'home')
+    mkdirSync(join(home, 'profiles', 'web'), { recursive: true })
+    writeFileSync(join(home, 'profiles', 'web', 'cordis.patch.yml'), '[]\n')
+    for (const name of SNAPSHOT_INCLUDED_TOP_LEVEL.filter(n => n !== 'profiles')) {
+      writeFileSync(join(home, name), `${name}\n`)
+    }
+    mkdirSync(join(home, 'sessions'), { recursive: true })
+    writeFileSync(join(home, 'sessions', 'history.jsonl'), 'data')
+    mkdirSync(join(home, 'local-agent', 'dsh'), { recursive: true })
+    writeFileSync(join(home, 'local-agent', 'dsh', 'state.json'), '{}')
+    mkdirSync(join(home, 'scratch'), { recursive: true })
+    writeFileSync(join(home, 'scratch', 'heavy.bin'), 'ephemeral')
+
+    const snapshot = createPreflightSnapshot(home)
+    try {
+      expect(readFileSync(join(snapshot.home, 'profiles', 'web', 'cordis.patch.yml'), 'utf8')).toBe('[]\n')
+      for (const name of SNAPSHOT_INCLUDED_TOP_LEVEL.filter(n => n !== 'profiles')) {
+        expect(readFileSync(join(snapshot.home, name), 'utf8')).toBe(`${name}\n`)
+      }
+      expect(existsSync(join(snapshot.home, 'sessions'))).toBe(false)
+      expect(existsSync(join(snapshot.home, 'local-agent'))).toBe(false)
+      expect(existsSync(join(snapshot.home, 'scratch'))).toBe(false)
+    } finally {
+      snapshot.cleanup()
+    }
+  })
+
+  it('anchors an external store link at the package\'s own parent node_modules, not the store root', () => {
+    const root = temporaryDirectory('ankh-snapshot-anchor-')
+    const home = join(root, 'home')
+    const store = join(root, 'host', 'node_modules')
+    mkdirSync(join(store, '.pnpm', 'foo@1.0.0', 'node_modules', 'foo'), { recursive: true })
+    writeFileSync(join(store, '.pnpm', 'foo@1.0.0', 'node_modules', 'foo', 'index.js'), 'foo')
+    mkdirSync(join(store, '.pnpm', 'bar@2.0.0', 'node_modules', 'bar'), { recursive: true })
+    writeFileSync(join(store, '.pnpm', 'bar@2.0.0', 'node_modules', 'bar', 'index.js'), 'bar')
+    writeFileSync(join(store, 'root-only.txt'), 'reachable only through the store root')
+    mkdirSync(join(home, 'profiles', 'web', 'node_modules'), { recursive: true })
+    symlinkSync(join(store, '.pnpm', 'foo@1.0.0', 'node_modules', 'foo'), join(home, 'profiles', 'web', 'node_modules', 'foo'), 'dir')
+
+    const snapshot = createPreflightSnapshot(home)
+    try {
+      expect(readFileSync(join(snapshot.home, 'profiles', 'web', 'node_modules', 'foo', 'index.js'), 'utf8')).toBe('foo')
+      expect(realpathSync(join(snapshot.home, 'profiles', 'web', 'node_modules', 'foo')).startsWith(realpathSync(snapshot.root))).toBe(true)
+      // The store root was NOT dragged in: no unlinked sibling anywhere in the snapshot.
+      expect(execFileSync('find', [snapshot.root, '-name', 'bar*'], { encoding: 'utf8' }).trim()).toBe('')
+      expect(execFileSync('find', [snapshot.root, '-name', 'root-only.txt'], { encoding: 'utf8' }).trim()).toBe('')
+    } finally {
+      snapshot.cleanup()
+    }
+  })
+
+  it('reports copy progress as files land and returns final counts', () => {
+    const root = temporaryDirectory('ankh-snapshot-progress-')
+    const home = join(root, 'home')
+    mkdirSync(join(home, 'profiles'), { recursive: true })
+    writeFileSync(join(home, 'profiles', 'a.txt'), 'aa')
+    writeFileSync(join(home, 'profiles', 'b.txt'), 'bbb')
+    writeFileSync(join(home, 'settings.yaml'), 'c')
+
+    const events: SnapshotProgress[] = []
+    const snapshot = createPreflightSnapshot(home, { onProgress: (progress) => events.push(progress) })
+    try {
+      expect(events.map(event => event.files)).toEqual([1, 2, 3])
+      expect(events.at(-1)).toEqual({ files: 3, bytes: 6, skippedRuntimeEntries: 0 })
+      expect(snapshot.copiedFiles).toBe(3)
+      expect(snapshot.copiedBytes).toBe(6)
     } finally {
       snapshot.cleanup()
     }
